@@ -5,6 +5,7 @@ import AppKit
 struct ContentView: View {
     @ObservedObject var state: AppState
     @ObservedObject private var profileStore: ProfileStore
+    @ObservedObject private var coreAudio: CoreAudioManager
     @State private var selection: String
     @State private var renameProfileID: UUID?
     @State private var renameDraft = ""
@@ -13,6 +14,7 @@ struct ContentView: View {
     init(state: AppState) {
         self.state = state
         self._profileStore = ObservedObject(wrappedValue: state.profiles)
+        self._coreAudio = ObservedObject(wrappedValue: state.coreAudio)
         let saved = UserDefaults.standard.string(forKey: "lastSidebarSelection")
         let restored: String
         if saved == "setup" {
@@ -91,7 +93,11 @@ struct ContentView: View {
                 SetupView(state: state)
             } else if let id = UUID(uuidString: selection),
                       let index = profileStore.profiles.firstIndex(where: { $0.id == id }) {
-                ProfileEditorView(state: state, profile: $profileStore.profiles[index])
+                ProfileEditorView(
+                    state: state,
+                    coreAudio: coreAudio,
+                    profile: $profileStore.profiles[index]
+                )
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "slider.horizontal.3").font(.largeTitle)
@@ -167,7 +173,7 @@ struct SetupView: View {
                 dependencyCard(
                     title: "BlackHole 2ch",
                     status: dependencies.blackHoleStatus,
-                    detail: "The official BlackHole package requires macOS administrator approval. CamillaEQApp keeps its virtual volume at 1.0.",
+                    detail: "The official BlackHole package requires macOS administrator approval. Install it from the official website if authorization is not granted.",
                     action: { Task { await dependencies.installBlackHole() } }
                 )
 
@@ -280,6 +286,7 @@ struct SetupView: View {
 
 struct ProfileEditorView: View {
     @ObservedObject var state: AppState
+    @ObservedObject var coreAudio: CoreAudioManager
     @Binding var profile: DeviceProfile
     @State private var parsedForGraph = ParsedEQ()
     @State private var preampDB = 0.0
@@ -314,6 +321,11 @@ struct ProfileEditorView: View {
                             .contentShape(Rectangle())
                             .onTapGesture { beginProfileRename() }
                             .help("Click to rename this profile")
+                    }
+                    if coreAudio.device(uid: profile.outputDeviceUID) == nil {
+                        Label("Disconnected", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption.bold())
+                            .foregroundStyle(.orange)
                     }
                     Spacer()
                     Toggle("System-wide EQ", isOn: Binding(
@@ -528,11 +540,11 @@ struct ProfileEditorView: View {
                                 }
                             }
                         )) {
-                            if state.coreAudio.device(uid: profile.outputDeviceUID) == nil {
+                            if coreAudio.device(uid: profile.outputDeviceUID) == nil {
                                 Text("\(profile.outputDeviceName) (Disconnected)")
                                     .tag(profile.outputDeviceUID)
                             }
-                            ForEach(state.coreAudio.outputDevices.filter { $0.name != AudioDeviceInfo.blackHoleName }) { device in
+                            ForEach(coreAudio.outputDevices.filter { $0.name != AudioDeviceInfo.blackHoleName }) { device in
                                 Text(device.name).tag(device.id)
                             }
                         }.labelsHidden().frame(maxWidth: 320)

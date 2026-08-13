@@ -27,8 +27,11 @@ final class LoginItemManager: ObservableObject {
             isEnabled = false
             statusMessage = "CamillaEQApp will not start automatically."
         case .notFound:
+            // Ad-hoc release builds can receive this after an older build's
+            // registration was removed because each rebuild has a new code
+            // hash. The app bundle may still be correctly installed.
             isEnabled = false
-            statusMessage = "The login item is unavailable. Keep the app in a permanent location, such as Applications, and try again."
+            statusMessage = "CamillaEQApp will not start automatically."
         @unknown default:
             isEnabled = false
             statusMessage = "The login-item status could not be determined."
@@ -48,7 +51,16 @@ final class LoginItemManager: ObservableObject {
         do {
             if enabled {
                 try SMAppService.mainApp.register()
-                refresh()
+                switch SMAppService.mainApp.status {
+                case .requiresApproval:
+                    isEnabled = true
+                    requiresApproval = true
+                    statusMessage = "Approval is required in System Settings → General → Login Items."
+                default:
+                    isEnabled = true
+                    requiresApproval = false
+                    statusMessage = "Enabled — CamillaEQApp will start after you sign in."
+                }
             } else {
                 try SMAppService.mainApp.unregister()
                 isEnabled = false

@@ -302,7 +302,14 @@ final class AppState: NSObject, ObservableObject {
             self.suppressedAutoUID = nil
         }
 
-        if let profile = profiles.profiles.first(where: { $0.autoActivate && $0.outputDeviceUID == current }) {
+        // CoreAudio can temporarily keep a removed device's UID as the default
+        // after it is unplugged. Never auto-activate from that stale UID: doing
+        // so retries a missing route every monitor tick.
+        if let profile = profiles.profiles.first(where: {
+            $0.autoActivate
+                && $0.outputDeviceUID == current
+                && coreAudio.device(uid: $0.outputDeviceUID) != nil
+        }) {
             await activate(profile: profile)
             return
         }

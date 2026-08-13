@@ -15,7 +15,7 @@ struct DeviceProfile: Identifiable, Codable, Hashable {
     var outputDeviceName: String
     var autoActivate: Bool = false
     // Optional keeps profiles written by earlier app versions decodable.
-    var autoActivateWhenBlackHoleSelected: Bool? = nil
+    var autoActivateWhenBlackHoleSelected: Bool? = true
     var lockOutputVolume: Bool = false
     var outputVolumeScalar: Double = 0.0625
     var sampleRate: Int = 48_000

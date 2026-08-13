@@ -4,7 +4,9 @@ cd "$(dirname "$0")"
 
 APP_NAME="CamillaEQApp"
 APP_VERSION="0.1.1"
-BUILD_NUMBER="${BUILD_NUMBER:-1}"
+# A changing build number prevents Finder and Login Items from reusing icon
+# metadata cached for an older ad-hoc build with the same public version.
+BUILD_NUMBER="${BUILD_NUMBER:-$(/bin/date -u +%Y%m%d%H%M%S)}"
 BUNDLE_ID="local.camillaeq.app"
 DIST="$PWD/dist"
 APP="$DIST/$APP_NAME.app"
@@ -104,6 +106,10 @@ make_icon 512 icon_512x512.png
 make_icon 1024 icon_512x512@2x.png
 /usr/bin/iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
+if [[ ! -s "$APP/Contents/Resources/AppIcon.icns" ]]; then
+    echo "ERROR: Failed to build AppIcon.icns."
+    exit 1
+fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -114,6 +120,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconName</key><string>AppIcon</string>
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
