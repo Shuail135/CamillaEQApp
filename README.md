@@ -19,6 +19,26 @@ CamillaEQApp gives macOS a proper **system-wide parametric equalizer** with an e
 
 Your EQ applies to audio from the whole Mac. Choose your headphones, speakers, DAC, or audio interface; shape the sound visually or import an Equalizer APO preset; then turn on **System-wide EQ**. CamillaEQApp can remember separate settings for each output device and apply the correct profile automatically when you switch devices.
 
+## Screenshots
+
+### Parametric equalizer
+
+Adjust frequency, gain, Q, and filter type while viewing the combined response curve.
+
+![CamillaEQApp parametric equalizer interface](screenshot/equalizer.png)
+
+### Device profile
+
+Keep separate EQ and routing settings for each pair of headphones, speakers, DAC, or audio interface.
+
+![CamillaEQApp output-device profile example](screenshot/profile_example.png)
+
+### Guided setup
+
+Install and verify CamillaDSP and BlackHole from inside the app.
+
+![CamillaEQApp setup interface](screenshot/setup_interface.png)
+
 
 ## What you can do
 
@@ -68,21 +88,22 @@ Intel Mac users can build the app from source, but the current ready-made GitHub
 
 ### 1. Download the app
 
-Open the repository's **Releases** page and download `CamillaEQApp-v0.1.1.dmg`.
+Open the repository's **Releases** page and download `CamillaEQApp-v0.x.x-app.zip`.
 
 ### 2. Move it to Applications
 
-Open the downloaded DMG, then drag `CamillaEQApp.app` into your Mac's **Applications** folder. You can eject the DMG afterward.
+Double-click the downloaded ZIP if your Mac did not extract it automatically. Then drag `CamillaEQApp.app` into your Mac's **Applications** folder.
 
 ### 3. Open it for the first time
 
-The current release is not notarized by Apple, so a normal double-click may be blocked:
+The current release is not signed with an Apple Developer ID or notarized, so macOS will probably block its first launch:
 
-1. Open the **Applications** folder in Finder.
-2. Right-click `CamillaEQApp` and choose **Open**.
-3. Select **Open** again in the confirmation window.
+1. Try to open `CamillaEQApp` from your Applications folder, then select **Done** when macOS blocks it.
+2. Open **System Settings → Privacy & Security**.
+3. Scroll down to **Security** and select **Open Anyway** beside CamillaEQApp.
+4. Confirm with your password or Touch ID, then select **Open**.
 
-You normally need to do this only once.
+macOS saves the app as an exception, so you normally need to do this only once.
 
 ### 4. Install the audio components
 
@@ -107,16 +128,15 @@ Start playback at a low volume. You should see movement in the level meters and 
 
 | Download | Who it is for |
 | --- | --- |
-| `CamillaEQApp-v0.1.1.dmg` | Most users—open it and move the app to Applications. |
-| `CamillaEQApp-v0.1.1-app.zip` | Users who prefer a ZIP containing only the app. |
-| `CamillaEQApp-v0.1.1-build-folder.zip` | Developers who want the complete generated build folder. |
+| `CamillaEQApp-v0.x.x-app.zip` | Most users—extract it and move the app to Applications. |
+| `CamillaEQApp-v0.x.x-build-folder.zip` | Developers who want the complete generated build folder. |
 | `SHA256SUMS` | Advanced users who want to verify downloaded files. |
 
-A Mac `.app` is actually a folder containing many files, so GitHub cannot offer it as one unwrapped download. The DMG is the simplest way to download it as a normal Mac application.
+A Mac `.app` is actually a folder containing many files, so the release provides it inside a ZIP. Extract the ZIP before moving the app to Applications.
 
 ## Troubleshoot
 
-- **The app will not open:** right-click it in Applications and choose **Open**.
+- **The app will not open:** try once, then use **System Settings → Privacy & Security → Open Anyway**.
 - **BlackHole is missing after installation:** restart your Mac, then reopen CamillaEQApp.
 - **There is no sound:** turn off System-wide EQ, confirm the physical output works normally, then reopen Setup and run **Install / Repair Everything**.
 - **The spectrum does not move:** enable CamillaEQApp under **System Settings → Privacy & Security → Microphone**.
@@ -135,6 +155,11 @@ Filter 4: ON HS Fc 8000 Hz Gain -2.0 dB Q 0.70
 Filter 5: ON HPQ Fc 25 Hz Q 0.70
 Filter 6: ON NO Fc 8000 Hz Q 5.00
 ```
+
+The graphical editor imports and exports `ON` and `OFF` filters. Presets using
+`BW Oct` are converted to the equivalent Q value so they can be edited and
+saved without changing the filter response. Supported graphical filter types
+are `PK`/`PEQ`, `LS`/`LSC`, `HS`/`HSC`, `LP`/`LPQ`, `HP`/`HPQ`, `NO`, and `AP`.
 
 `Device:` is recognized but ignored because device selection belongs to CamillaEQApp profiles. `Channel:` produces a warning because version 0.1.1 applies filters to both stereo channels.
 

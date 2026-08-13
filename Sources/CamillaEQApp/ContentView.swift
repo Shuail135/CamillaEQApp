@@ -141,6 +141,14 @@ struct ContentView: View {
 
 struct SetupView: View {
     @ObservedObject var state: AppState
+    @ObservedObject private var dependencies: DependencyManager
+    @ObservedObject private var loginItem: LoginItemManager
+
+    init(state: AppState) {
+        self.state = state
+        self._dependencies = ObservedObject(wrappedValue: state.dependencies)
+        self._loginItem = ObservedObject(wrappedValue: state.loginItem)
+    }
 
     var body: some View {
         ScrollView {
@@ -151,36 +159,40 @@ struct SetupView: View {
 
                 dependencyCard(
                     title: "CamillaDSP",
-                    status: state.dependencies.camillaDSPStatus,
+                    status: dependencies.camillaDSPStatus,
                     detail: "Installed privately under ~/Library/Application Support/CamillaEQApp/bin.",
-                    action: { Task { await state.dependencies.installCamillaDSP() } }
+                    action: { Task { await dependencies.installCamillaDSP() } }
                 )
 
                 dependencyCard(
                     title: "BlackHole 2ch",
-                    status: state.dependencies.blackHoleStatus,
+                    status: dependencies.blackHoleStatus,
                     detail: "The official BlackHole package requires macOS administrator approval. CamillaEQApp keeps its virtual volume at 1.0.",
-                    action: { Task { await state.dependencies.installBlackHole() } }
+                    action: { Task { await dependencies.installBlackHole() } }
                 )
 
                 HStack {
                     Button("Install / Repair Everything") {
-                        Task { await state.dependencies.installEverything() }
+                        Task { await dependencies.installEverything() }
                     }
                     .buttonStyle(.borderedProminent)
-                    Button("Recheck") { state.dependencies.refresh() }
+                    .disabled(dependencies.setupInProgress)
+                    Button("Recheck") {
+                        Task { await dependencies.recheck() }
+                    }
+                    .disabled(dependencies.setupInProgress)
                 }
 
-                if !state.dependencies.setupMessage.isEmpty {
+                if !dependencies.setupMessage.isEmpty {
                     HStack(spacing: 10) {
-                        if state.dependencies.setupInProgress {
+                        if dependencies.setupInProgress {
                             ProgressView().controlSize(.small)
-                        } else if state.dependencies.setupFailed {
+                        } else if dependencies.setupFailed {
                             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         } else {
                             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                         }
-                        Text(state.dependencies.setupMessage)
+                        Text(dependencies.setupMessage)
                             .font(.callout.weight(.medium))
                     }
                     .padding(12)
@@ -192,28 +204,24 @@ struct SetupView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 10) {
                             Toggle("Start CamillaEQApp when I log in", isOn: Binding(
-                                get: { state.loginItem.isEnabled },
-                                set: { state.loginItem.setEnabled($0) }
+                                get: { loginItem.isEnabled },
+                                set: { loginItem.setEnabled($0) }
                             ))
-                            .disabled(state.loginItem.isUpdating)
+                            .disabled(loginItem.isUpdating)
 
-                            if state.loginItem.isUpdating {
+                            if loginItem.isUpdating {
                                 ProgressView().controlSize(.small)
                             }
                         }
 
-                        Text(state.loginItem.statusMessage)
+                        Text(loginItem.statusMessage)
                             .font(.caption)
-                            .foregroundStyle(state.loginItem.requiresApproval ? .orange : .secondary)
-
-                        Text("This starts the app after you sign in to macOS. Keep the app in a permanent location so macOS can find it.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(loginItem.requiresApproval ? .orange : .secondary)
                     }
                     .padding(6)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .onAppear { state.loginItem.refresh() }
+                .onAppear { loginItem.refresh() }
 
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
@@ -280,6 +288,11 @@ struct ProfileEditorView: View {
     @State private var eqIsSaved = true
     @State private var suppressEQChanges = false
     @State private var liveApplyTask: Task<Void, Never>?
+    @State private var isRenamingProfile = false
+    @State private var renamingProfileID: UUID?
+    @State private var profileNameDraft = ""
+    @State private var focusClearingMonitor: Any?
+    @FocusState private var profileNameFocused: Bool
 
     private var profileIsActive: Bool { state.isActive && state.activeProfileID == profile.id }
 
@@ -287,8 +300,21 @@ struct ProfileEditorView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text(profile.name)
-                        .font(.largeTitle.bold())
+                    if isRenamingProfile {
+                        TextField("Profile name", text: $profileNameDraft)
+                            .font(.largeTitle.bold())
+                            .textFieldStyle(.plain)
+                            .frame(minWidth: 180, maxWidth: 480)
+                            .focused($profileNameFocused)
+                            .onSubmit { commitProfileRename() }
+                            .onExitCommand { cancelProfileRename() }
+                    } else {
+                        Text(profile.name)
+                            .font(.largeTitle.bold())
+                            .contentShape(Rectangle())
+                            .onTapGesture { beginProfileRename() }
+                            .help("Click to rename this profile")
+                    }
                     Spacer()
                     Toggle("System-wide EQ", isOn: Binding(
                         get: { profileIsActive },
@@ -336,7 +362,7 @@ struct ProfileEditorView: View {
                             }
                             .buttonStyle(.plain)
                         }
-                        Text("Supports Equalizer APO text with Preamp and PK/PEQ, LS, HS, LP/LPQ, HP/HPQ, NO, and AP filters, just like the original text editor.")
+                        Text("Supports Equalizer APO Preamp plus ON/OFF PK/PEQ, LS/LSC, HS/HSC, LP/LPQ, HP/HPQ, NO, and AP filters using Q or BW Oct.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         HStack(spacing: 8) {
@@ -394,11 +420,24 @@ struct ProfileEditorView: View {
             }
             .padding(28)
         }
-        .onAppear { loadGraphicEQ() }
-        .onChange(of: profile.id) { _ in loadGraphicEQ() }
+        .onAppear {
+            loadGraphicEQ()
+            installFocusClearingMonitor()
+        }
+        .onChange(of: profile.id) { _ in
+            commitProfileRename()
+            loadGraphicEQ()
+        }
+        .onChange(of: profileNameFocused) { isFocused in
+            if isRenamingProfile && !isFocused { commitProfileRename() }
+        }
         .onChange(of: preampDB) { _ in graphicEQChanged() }
         .onChange(of: graphicBands) { _ in graphicEQChanged() }
-        .onDisappear { liveApplyTask?.cancel() }
+        .onDisappear {
+            commitProfileRename()
+            liveApplyTask?.cancel()
+            removeFocusClearingMonitor()
+        }
         .fileImporter(isPresented: $showTextImporter, allowedContentTypes: [.plainText], allowsMultipleSelection: false) { result in
             do {
                 guard let url = try result.get().first else { return }
@@ -409,6 +448,64 @@ struct ProfileEditorView: View {
                 state.errorMessage = "Could not import Equalizer APO text: \(error.localizedDescription)"
             }
         }
+    }
+
+    private func beginProfileRename() {
+        profileNameDraft = profile.name
+        renamingProfileID = profile.id
+        isRenamingProfile = true
+        DispatchQueue.main.async { profileNameFocused = true }
+    }
+
+    private func commitProfileRename() {
+        guard isRenamingProfile else { return }
+        let trimmedName = profileNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedName.isEmpty,
+           let profileID = renamingProfileID,
+           let index = state.profiles.profiles.firstIndex(where: { $0.id == profileID }) {
+            state.profiles.profiles[index].name = trimmedName
+        }
+        isRenamingProfile = false
+        renamingProfileID = nil
+        profileNameFocused = false
+    }
+
+    private func cancelProfileRename() {
+        isRenamingProfile = false
+        renamingProfileID = nil
+        profileNameFocused = false
+        profileNameDraft = ""
+    }
+
+    private func installFocusClearingMonitor() {
+        guard focusClearingMonitor == nil else { return }
+        focusClearingMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            guard let keyWindow = NSApp.keyWindow,
+                  event.window === keyWindow,
+                  let contentView = keyWindow.contentView else { return event }
+
+            let location = contentView.convert(event.locationInWindow, from: nil)
+            let clickedView = contentView.hitTest(location)
+            if !Self.isTextInput(clickedView) {
+                keyWindow.makeFirstResponder(nil)
+            }
+            return event
+        }
+    }
+
+    private func removeFocusClearingMonitor() {
+        guard let focusClearingMonitor else { return }
+        NSEvent.removeMonitor(focusClearingMonitor)
+        self.focusClearingMonitor = nil
+    }
+
+    private static func isTextInput(_ view: NSView?) -> Bool {
+        var currentView = view
+        while let view = currentView {
+            if view is NSTextField || view is NSTextView { return true }
+            currentView = view.superview
+        }
+        return false
     }
 
     private var routingAndDevice: some View {
@@ -431,6 +528,10 @@ struct ProfileEditorView: View {
                                 }
                             }
                         )) {
+                            if state.coreAudio.device(uid: profile.outputDeviceUID) == nil {
+                                Text("\(profile.outputDeviceName) (Disconnected)")
+                                    .tag(profile.outputDeviceUID)
+                            }
                             ForEach(state.coreAudio.outputDevices.filter { $0.name != AudioDeviceInfo.blackHoleName }) { device in
                                 Text(device.name).tag(device.id)
                             }
@@ -529,6 +630,7 @@ struct ProfileEditorView: View {
 
     private func importAPOText(_ text: String) throws {
         let parsed = try EqualizerAPOParser().parse(text)
+        state.errorMessage = nil
         suppressEQChanges = true
         preampDB = parsed.preampDB
         graphicBands = parsed.bands
@@ -595,6 +697,7 @@ struct ProfileEditorView: View {
         return abs(log(max(band.frequency, 1) / expected)) < 0.015
             && abs((band.gain ?? 0)) < 0.0001
             && abs((band.q ?? 1) - 1) < 0.0001
+            && band.enabled
             && band.kind == expectedKind
     }
 
@@ -639,7 +742,8 @@ struct ProfileEditorView: View {
     private func serializeGraphicEQ() -> String {
         var lines = ["Preamp: \(formatEQNumber(preampDB)) dB"]
         for (index, band) in graphicBands.enumerated() {
-            var line = "Filter \(index + 1): ON \(filterToken(band.kind)) Fc \(formatEQNumber(max(1, band.frequency))) Hz"
+            let stateToken = band.enabled ? "ON" : "OFF"
+            var line = "Filter \(index + 1): \(stateToken) \(filterToken(band.kind)) Fc \(formatEQNumber(max(1, band.frequency))) Hz"
             if usesGain(band.kind) { line += " Gain \(formatEQNumber(band.gain ?? 0)) dB" }
             line += " Q \(formatEQNumber(max(0.05, band.q ?? 0.707)))"
             lines.append(line)

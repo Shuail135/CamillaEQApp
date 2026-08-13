@@ -60,7 +60,8 @@ final class AppState: NSObject, ObservableObject {
         do {
             let parsed = try parser.parse(profile.equalizerAPOText)
             warnings = parsed.warnings
-            validationMessage = "Valid: \(parsed.bands.count) active filters, preamp \(String(format: "%.2f", parsed.preampDB)) dB"
+            let activeFilterCount = parsed.bands.lazy.filter(\.enabled).count
+            validationMessage = "Valid: \(activeFilterCount) active filters, preamp \(String(format: "%.2f", parsed.preampDB)) dB"
             errorMessage = nil
             return parsed
         } catch {
@@ -263,8 +264,24 @@ final class AppState: NSObject, ObservableObject {
     private func monitorRouting() async {
         guard !transitionInProgress else { return }
         coreAudio.refresh()
+        let reboundProfileIDs = profiles.reconcileDevices(coreAudio.outputDevices)
 
         if isActive {
+            if let activeProfileID,
+               reboundProfileIDs.contains(activeProfileID),
+               let reboundProfile = profiles.profiles.first(where: { candidate in
+                   candidate.id == activeProfileID
+               }) {
+                await deactivate(manual: false, restoreOutput: false)
+                await activate(profile: reboundProfile)
+                return
+            }
+            if let activeProfileID,
+               let activeProfile = profiles.profiles.first(where: { $0.id == activeProfileID }),
+               coreAudio.device(uid: activeProfile.outputDeviceUID) == nil {
+                await deactivate(manual: false, restoreOutput: false)
+                return
+            }
             guard let blackHole = coreAudio.blackHole else {
                 await deactivate(manual: false, restoreOutput: false)
                 return

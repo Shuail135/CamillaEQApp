@@ -56,6 +56,34 @@ final class DependencyManager: ObservableObject {
         }
     }
 
+    func recheck() async {
+        guard !setupInProgress else { return }
+        setupFailed = false
+        setupInProgress = true
+        setupMessage = "Checking CamillaDSP and BlackHole 2ch…"
+        camillaDSPStatus = .checking
+        blackHoleStatus = .checking
+        defer { setupInProgress = false }
+
+        for attempt in 0..<8 {
+            refresh()
+            if coreAudio.blackHole != nil { break }
+            if attempt < 7 { try? await Task.sleep(for: .milliseconds(500)) }
+        }
+
+        var missing: [String] = []
+        if case .installed = camillaDSPStatus {} else { missing.append("CamillaDSP") }
+        if case .installed = blackHoleStatus {} else { missing.append("BlackHole 2ch") }
+
+        if missing.isEmpty {
+            setupFailed = false
+            setupMessage = "Setup complete. Both CamillaDSP and BlackHole 2ch are ready."
+        } else {
+            setupFailed = true
+            setupMessage = "Recheck complete. Not detected: " + missing.joined(separator: ", ") + "."
+        }
+    }
+
     func installCamillaDSP() async {
         setupFailed = false
         setupInProgress = true
@@ -120,15 +148,15 @@ final class DependencyManager: ObservableObject {
             let script = "do shell script \(appleScriptQuote(command)) with administrator privileges"
             try run("/usr/bin/osascript", ["-e", script])
 
-            // CoreAudio may need a moment (or in some setups a logout/restart) to expose the new driver.
-            try? await Task.sleep(for: .seconds(2))
-            coreAudio.refresh()
-            if coreAudio.blackHole != nil {
+            // The installer can finish before CoreAudio publishes the new device.
+            // Poll the live device list so setup completes without relaunching the app.
+            if await waitForBlackHole() {
                 blackHoleStatus = .installed(nil)
                 setupMessage = "Dependencies are ready. Add an output profile, then enable System-wide EQ to start audio routing."
             } else {
-                setupMessage = "BlackHole was installed, but macOS must be restarted before audio routing can be activated."
-                blackHoleStatus = .failed("BlackHole installed, but CoreAudio has not exposed it yet. Restart the Mac, then reopen CamillaEQApp.")
+                setupFailed = true
+                setupMessage = "BlackHole was installed, but CoreAudio has not exposed it yet. Restart the Mac, then select Recheck."
+                blackHoleStatus = .failed("BlackHole installed, but CoreAudio has not exposed it yet. Restart the Mac, then select Recheck.")
             }
         } catch {
             setupFailed = true
@@ -160,6 +188,15 @@ final class DependencyManager: ObservableObject {
         let validationURL = supportDirectory.appendingPathComponent("configs/validation.yml")
         try yaml.write(to: validationURL, atomically: true, encoding: .utf8)
         _ = try run(camillaDSPBinary.path, ["--check", validationURL.path])
+    }
+
+    private func waitForBlackHole() async -> Bool {
+        for attempt in 0..<30 {
+            coreAudio.refresh()
+            if coreAudio.blackHole != nil { return true }
+            if attempt < 29 { try? await Task.sleep(for: .milliseconds(500)) }
+        }
+        return false
     }
 
     private func blackHoleCask() async throws -> BlackHoleCask {

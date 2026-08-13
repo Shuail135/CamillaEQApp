@@ -101,29 +101,42 @@ private struct EQBandColumn: View {
             }
             .frame(maxWidth: .infinity)
 
-            Menu {
-                ForEach(EQBand.Kind.allCases, id: \.self) { kind in
-                    Button {
-                        setKind(kind, &band)
-                    } label: {
-                        Text(filterLabel(kind))
+            HStack(spacing: 2) {
+                Button {
+                    band.enabled.toggle()
+                } label: {
+                    Image(systemName: band.enabled ? "power.circle.fill" : "power.circle")
+                        .foregroundStyle(band.enabled ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .frame(width: 18)
+                .help(band.enabled ? "Disable this filter" : "Enable this filter")
+
+                Menu {
+                    ForEach(EQBand.Kind.allCases, id: \.self) { kind in
+                        Button {
+                            setKind(kind, &band)
+                        } label: {
+                            Text(filterLabel(kind))
+                        }
                     }
+                } label: {
+                    HStack(spacing: 3) {
+                        FilterShapeIcon(kind: band.kind)
+                            .frame(width: 20, height: 15)
+                        Text(filterLabel(band.kind))
+                            .font(.caption2)
+                            .lineLimit(1)
+                            .frame(width: 39, alignment: .trailing)
+                    }
+                    .frame(width: 62, height: 24, alignment: .trailing)
                 }
-            } label: {
-                HStack(spacing: 3) {
-                    FilterShapeIcon(kind: band.kind)
-                        .frame(width: 20, height: 15)
-                    Text(filterLabel(band.kind))
-                        .font(.caption2)
-                        .lineLimit(1)
-                        .frame(width: 39, alignment: .trailing)
-                }
-                .frame(width: 62, height: 24, alignment: .trailing)
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.visible)
+                .frame(width: 70, alignment: .center)
+                .help("Filter type")
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.visible)
-            .frame(width: 70, alignment: .center)
-            .help("Filter type")
+            .frame(width: 90)
         }
     }
 

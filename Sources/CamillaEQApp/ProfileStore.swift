@@ -63,6 +63,38 @@ final class ProfileStore: ObservableObject {
         profiles = updated
     }
 
+    // Profiles and EQ data remain saved while hardware is absent. Some audio
+    // drivers return a new CoreAudio UID after reconnecting, so recover the
+    // binding by name only when exactly one connected device matches.
+    func reconcileDevices(_ devices: [AudioDeviceInfo]) -> Set<UUID> {
+        let physicalDevices = devices.filter { $0.name != AudioDeviceInfo.blackHoleName }
+        let connectedUIDs = Set(physicalDevices.map(\.id))
+        var updated = profiles
+        var reboundProfileIDs = Set<UUID>()
+
+        for index in updated.indices where !connectedUIDs.contains(updated[index].outputDeviceUID) {
+            let savedName = updated[index].outputDeviceName
+            let matches = physicalDevices.filter {
+                $0.name.localizedCaseInsensitiveCompare(savedName) == .orderedSame
+            }
+            guard matches.count == 1, let match = matches.first else { continue }
+
+            updated[index].outputDeviceUID = match.id
+            updated[index].outputDeviceName = match.name
+            if updated[index].autoActivate || (updated[index].autoActivateWhenBlackHoleSelected ?? false) {
+                disableAutoActivation(
+                    in: &updated,
+                    outputUID: match.id,
+                    excluding: updated[index].id
+                )
+            }
+            reboundProfileIDs.insert(updated[index].id)
+        }
+
+        if !reboundProfileIDs.isEmpty { profiles = updated }
+        return reboundProfileIDs
+    }
+
     func deleteProfile(id: UUID) {
         profiles.removeAll { $0.id == id }
         if selectedProfileID == id { selectedProfileID = profiles.first?.id }

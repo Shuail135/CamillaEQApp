@@ -14,6 +14,10 @@ let package = Package(
             resources: [
                 .copy("icon.png")
             ]
+        ),
+        .testTarget(
+            name: "CamillaEQAppTests",
+            dependencies: ["CamillaEQApp"]
         )
     ]
 )

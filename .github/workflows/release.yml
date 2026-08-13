@@ -17,6 +17,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Test Equalizer APO imports
+        run: swift test
+
       - name: Build application
         run: ./build-app.sh
 
@@ -34,25 +37,14 @@ jobs:
           version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaEQApp.app/Contents/Info.plist)"
           app_archive="CamillaEQApp-v${version}-app.zip"
           build_archive="CamillaEQApp-v${version}-build-folder.zip"
-          disk_image="CamillaEQApp-v${version}.dmg"
-          dmg_staging="$(mktemp -d "${RUNNER_TEMP}/CamillaEQApp-dmg.XXXXXX")"
 
           ditto -c -k --sequesterRsrc --keepParent \
             dist/CamillaEQApp.app "${app_archive}"
           ditto -c -k --sequesterRsrc --keepParent \
             dist "${build_archive}"
-          cp -R dist/CamillaEQApp.app "${dmg_staging}/"
-          hdiutil create \
-            -volname "CamillaEQApp ${version}" \
-            -srcfolder "${dmg_staging}" \
-            -format UDZO \
-            -ov "${disk_image}"
-          rm -rf "${dmg_staging}"
-
           shasum -a 256 \
             "${app_archive}" \
-            "${build_archive}" \
-            "${disk_image}" > SHA256SUMS
+            "${build_archive}" > SHA256SUMS
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -61,7 +53,6 @@ jobs:
           path: |
             CamillaEQApp-v*-app.zip
             CamillaEQApp-v*-build-folder.zip
-            CamillaEQApp-v*.dmg
             SHA256SUMS
           if-no-files-found: error
 
@@ -85,7 +76,6 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" \
             CamillaEQApp-v*-app.zip \
             CamillaEQApp-v*-build-folder.zip \
-            CamillaEQApp-v*.dmg \
             SHA256SUMS \
             --verify-tag \
             --generate-notes \

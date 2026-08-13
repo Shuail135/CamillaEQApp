@@ -82,39 +82,27 @@ if [[ -n "$RESOURCE_BUNDLE" && -d "$RESOURCE_BUNDLE" ]]; then
 fi
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
 
-# Build a true multi-resolution macOS icon. Constructing the ICNS container
-# directly avoids iconutil failures seen with standalone Command Line Tools.
+# Build the standard macOS iconset, including every Retina representation.
 ICONSET="$DIST/AppIcon.iconset"
 rm -rf "$ICONSET"
 mkdir -p "$ICONSET"
-for SIZE in 16 32 64 128 256 512 1024; do
-    /usr/bin/sips -z "$SIZE" "$SIZE" "$ICON_SOURCE" \
-        --out "$ICONSET/icon_${SIZE}x${SIZE}.png" >/dev/null
-done
-/usr/bin/env LC_ALL=C /usr/bin/perl -e '
-    binmode STDOUT;
-    my @entries;
-    while (@ARGV) {
-        my $type = shift @ARGV;
-        my $path = shift @ARGV;
-        open my $fh, "<", $path or die "$path: $!";
-        binmode $fh;
-        local $/;
-        my $data = <$fh>;
-        close $fh;
-        push @entries, $type . pack("N", length($data) + 8) . $data;
-    }
-    my $body = join("", @entries);
-    print "icns", pack("N", length($body) + 8), $body;
-' \
-    icp4 "$ICONSET/icon_16x16.png" \
-    icp5 "$ICONSET/icon_32x32.png" \
-    icp6 "$ICONSET/icon_64x64.png" \
-    ic07 "$ICONSET/icon_128x128.png" \
-    ic08 "$ICONSET/icon_256x256.png" \
-    ic09 "$ICONSET/icon_512x512.png" \
-    ic10 "$ICONSET/icon_1024x1024.png" \
-    > "$APP/Contents/Resources/AppIcon.icns"
+make_icon() {
+    local pixels="$1"
+    local filename="$2"
+    /usr/bin/sips -z "$pixels" "$pixels" "$ICON_SOURCE" \
+        --out "$ICONSET/$filename" >/dev/null
+}
+make_icon 16 icon_16x16.png
+make_icon 32 icon_16x16@2x.png
+make_icon 32 icon_32x32.png
+make_icon 64 icon_32x32@2x.png
+make_icon 128 icon_128x128.png
+make_icon 256 icon_128x128@2x.png
+make_icon 256 icon_256x256.png
+make_icon 512 icon_256x256@2x.png
+make_icon 512 icon_512x512.png
+make_icon 1024 icon_512x512@2x.png
+/usr/bin/iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
 
 cat > "$APP/Contents/Info.plist" <<PLIST

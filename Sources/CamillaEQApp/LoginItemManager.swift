@@ -37,20 +37,38 @@ final class LoginItemManager: ObservableObject {
 
     func setEnabled(_ enabled: Bool) {
         guard !isUpdating else { return }
+        if enabled && !isInApplicationsFolder {
+            isEnabled = false
+            requiresApproval = false
+            statusMessage = "Move CamillaEQApp to Applications, reopen it there, then enable login startup."
+            return
+        }
         isUpdating = true
 
         do {
             if enabled {
                 try SMAppService.mainApp.register()
+                refresh()
             } else {
                 try SMAppService.mainApp.unregister()
+                isEnabled = false
+                requiresApproval = false
+                statusMessage = "CamillaEQApp will not start automatically."
             }
-            refresh()
         } catch {
             refresh()
             statusMessage = "Could not update the login item: \(error.localizedDescription)"
         }
 
         isUpdating = false
+    }
+
+    private var isInApplicationsFolder: Bool {
+        let appPath = Bundle.main.bundleURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let userApplications = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications", isDirectory: true).path
+        return ["/Applications", userApplications].contains { root in
+            appPath == root || appPath.hasPrefix(root + "/")
+        }
     }
 }

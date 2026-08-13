@@ -13,7 +13,9 @@ struct EqualizerAPOParser {
 
         for (index, rawLine) in lines.enumerated() {
             let lineNumber = index + 1
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmingCharacters = CharacterSet.whitespacesAndNewlines
+                .union(CharacterSet(charactersIn: "\u{FEFF}"))
+            let line = rawLine.trimmingCharacters(in: trimmingCharacters)
             if line.isEmpty || line.hasPrefix("#") { continue }
 
             if line.lowercased().hasPrefix("preamp:") {
@@ -25,9 +27,7 @@ struct EqualizerAPOParser {
             }
 
             if line.lowercased().hasPrefix("filter") {
-                if let band = try parseFilter(line, lineNumber: lineNumber) {
-                    result.bands.append(band)
-                }
+                result.bands.append(try parseFilter(line, lineNumber: lineNumber))
                 continue
             }
 
@@ -47,7 +47,7 @@ struct EqualizerAPOParser {
         return result
     }
 
-    private func parseFilter(_ line: String, lineNumber: Int) throws -> EQBand? {
+    private func parseFilter(_ line: String, lineNumber: Int) throws -> EQBand {
         guard let colon = line.firstIndex(of: ":") else {
             throw ParseError(line: lineNumber, message: "Filter line needs ':'")
         }
@@ -56,8 +56,10 @@ struct EqualizerAPOParser {
         guard tokens.count >= 2 else { throw ParseError(line: lineNumber, message: "Incomplete filter") }
 
         let enabledToken = tokens[0].uppercased()
-        if enabledToken == "OFF" { return nil }
-        guard enabledToken == "ON" else { throw ParseError(line: lineNumber, message: "Expected ON or OFF") }
+        guard enabledToken == "ON" || enabledToken == "OFF" else {
+            throw ParseError(line: lineNumber, message: "Expected ON or OFF")
+        }
+        let enabled = enabledToken == "ON"
 
         let typeToken = tokens[1].uppercased()
         if (typeToken == "LS" || typeToken == "HS"), tokens.count > 2, tokens[2].lowercased().contains("db") {
@@ -67,8 +69,8 @@ struct EqualizerAPOParser {
         let kind: EQBand.Kind
         switch typeToken {
         case "PK", "PEQ": kind = .peaking
-        case "LS": kind = .lowShelf
-        case "HS": kind = .highShelf
+        case "LS", "LSC": kind = .lowShelf
+        case "HS", "HSC": kind = .highShelf
         case "LP", "LPQ": kind = .lowPass
         case "HP", "HPQ": kind = .highPass
         case "NO": kind = .notch
@@ -80,9 +82,19 @@ struct EqualizerAPOParser {
         guard let fc = value(after: "Fc", in: tokens) else {
             throw ParseError(line: lineNumber, message: "Missing Fc")
         }
+        guard fc > 0 else { throw ParseError(line: lineNumber, message: "Fc must be greater than zero") }
         let gain = value(after: "Gain", in: tokens)
-        let q = value(after: "Q", in: tokens)
+        let explicitQ = value(after: "Q", in: tokens)
         let bw = bandwidth(in: tokens)
+        if let explicitQ, explicitQ <= 0 {
+            throw ParseError(line: lineNumber, message: "Q must be greater than zero")
+        }
+        if let bw, bw <= 0 {
+            throw ParseError(line: lineNumber, message: "BW Oct must be greater than zero")
+        }
+        // The graphical editor is Q-based. Normalize APO's BW Oct form during
+        // import so displaying or saving the band cannot silently change it.
+        let q = explicitQ ?? bw.map(qFromBandwidth)
 
         switch kind {
         case .peaking:
@@ -96,7 +108,7 @@ struct EqualizerAPOParser {
             break
         }
 
-        return EQBand(kind: kind, frequency: fc, gain: gain, q: q, bandwidth: bw)
+        return EQBand(enabled: enabled, kind: kind, frequency: fc, gain: gain, q: q)
     }
 
     private func value(after key: String, in tokens: [String]) -> Double? {
@@ -114,5 +126,9 @@ struct EqualizerAPOParser {
 
     private func firstNumber(in string: String) -> Double? {
         string.split(whereSeparator: { $0.isWhitespace }).compactMap { Double($0) }.first
+    }
+
+    private func qFromBandwidth(_ bandwidth: Double) -> Double {
+        1.0 / (2.0 * sinh(log(2.0) / 2.0 * bandwidth))
     }
 }
