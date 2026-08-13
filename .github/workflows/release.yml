@@ -1,0 +1,91 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Build application
+        run: ./build-app.sh
+
+      - name: Verify bundle version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaEQApp.app/Contents/Info.plist)"
+          if [[ "${GITHUB_REF_NAME}" != "v${bundle_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match bundle version v${bundle_version}."
+            exit 1
+          fi
+
+      - name: Package application
+        run: |
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaEQApp.app/Contents/Info.plist)"
+          app_archive="CamillaEQApp-v${version}-app.zip"
+          build_archive="CamillaEQApp-v${version}-build-folder.zip"
+          disk_image="CamillaEQApp-v${version}.dmg"
+          dmg_staging="$(mktemp -d "${RUNNER_TEMP}/CamillaEQApp-dmg.XXXXXX")"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/CamillaEQApp.app "${app_archive}"
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist "${build_archive}"
+          cp -R dist/CamillaEQApp.app "${dmg_staging}/"
+          hdiutil create \
+            -volname "CamillaEQApp ${version}" \
+            -srcfolder "${dmg_staging}" \
+            -format UDZO \
+            -ov "${disk_image}"
+          rm -rf "${dmg_staging}"
+
+          shasum -a 256 \
+            "${app_archive}" \
+            "${build_archive}" \
+            "${disk_image}" > SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CamillaEQApp-macos
+          path: |
+            CamillaEQApp-v*-app.zip
+            CamillaEQApp-v*-build-folder.zip
+            CamillaEQApp-v*.dmg
+            SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CamillaEQApp-macos
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            CamillaEQApp-v*-app.zip \
+            CamillaEQApp-v*-build-folder.zip \
+            CamillaEQApp-v*.dmg \
+            SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "CamillaEQApp ${GITHUB_REF_NAME}"

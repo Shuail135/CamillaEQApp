@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Swift Package Manager and Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+*.dSYM/
+
+# Generated application and release output
+dist/
+tmp/
+*.zip
+*.sha256
+
+# Local visual preview (not an application resource)
+Sources/CamillaEQApp/tray-icon-preview.png

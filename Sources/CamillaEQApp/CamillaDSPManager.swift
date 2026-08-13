@@ -1,0 +1,170 @@
+import Foundation
+import Darwin
+
+@MainActor
+final class CamillaDSPManager: ObservableObject {
+    @Published private(set) var isRunning = false
+    @Published private(set) var lastError: String?
+
+    // Keep the app's private engine separate from the conventional CamillaGUI
+    // port (1234), which may already be occupied by a manual/legacy setup.
+    private let controlPort: UInt16
+    let rpc: CamillaRPC
+    private var process: Process?
+    private var inputPipe: Pipe?
+
+    init() {
+        let port = UInt16.random(in: 20_000...49_999)
+        controlPort = port
+        rpc = CamillaRPC(port: port)
+    }
+
+    func start(binary: URL) async throws {
+        if let process, process.isRunning {
+            if !isRunning { try await connectWithRetry() }
+            return
+        }
+
+        terminateStalePrivateEngines(binary: binary)
+
+        let logDirectory = supportDirectory().appendingPathComponent("logs", isDirectory: true)
+        try FileManager.default.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+        let logURL = logDirectory.appendingPathComponent("camilladsp.log")
+        FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: logURL)
+        try handle.seekToEnd()
+
+        let p = Process()
+        p.executableURL = binary
+        p.arguments = ["--address", "127.0.0.1", "--port", String(controlPort), "--wait", "--gain=-20", "--logfile", logURL.path]
+        p.standardOutput = handle
+        p.standardError = handle
+        let pipe = Pipe()
+        p.standardInput = pipe
+        p.terminationHandler = { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.isRunning = false
+            }
+        }
+        try p.run()
+        inputPipe = pipe
+        process = p
+        try await connectWithRetry()
+        isRunning = true
+    }
+
+    func audioInputHandle() throws -> FileHandle {
+        guard let handle = inputPipe?.fileHandleForWriting else { throw CamillaError.inputUnavailable }
+        return handle
+    }
+
+    func apply(yaml: String) async throws {
+        do {
+            let configDirectory = supportDirectory().appendingPathComponent("configs", isDirectory: true)
+            try FileManager.default.createDirectory(at: configDirectory, withIntermediateDirectories: true)
+            try yaml.write(
+                to: configDirectory.appendingPathComponent("active.yml"),
+                atomically: true,
+                encoding: .utf8
+            )
+            try await rpc.setConfig(yaml: yaml)
+            // Startup uses -20 dB as a safety guard. Once a valid config is active,
+            // the Equalizer APO Preamp inside the config becomes the intended headroom.
+            try await rpc.setVolume(0)
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+            throw error
+        }
+    }
+
+    func forceStopAndWait() {
+        guard let childProcess = process else {
+            isRunning = false
+            return
+        }
+
+        try? inputPipe?.fileHandleForWriting.close()
+        inputPipe = nil
+        if childProcess.isRunning {
+            childProcess.terminate()
+            // App termination cannot await an async task. Give only this app's
+            // child process a short grace period, then guarantee it cannot be
+            // orphaned and keep CoreAudio/control ports open after quit.
+            for _ in 0..<10 where childProcess.isRunning {
+                usleep(50_000)
+            }
+            if childProcess.isRunning {
+                kill(childProcess.processIdentifier, SIGKILL)
+            }
+            childProcess.waitUntilExit()
+        }
+        self.process = nil
+        isRunning = false
+    }
+
+    func stop() async {
+        try? inputPipe?.fileHandleForWriting.close()
+        inputPipe = nil
+        await rpc.exit()
+        if let process, process.isRunning {
+            process.terminate()
+            try? await Task.sleep(for: .milliseconds(400))
+            if process.isRunning { process.interrupt() }
+        }
+        process = nil
+        isRunning = false
+    }
+
+    private func connectWithRetry() async throws {
+        var finalError: Error?
+        for _ in 0..<30 {
+            do {
+                try await rpc.connect()
+                return
+            } catch {
+                finalError = error
+                await rpc.disconnect()
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+        }
+        throw finalError ?? CamillaError.connectionTimeout
+    }
+
+    private func terminateStalePrivateEngines(binary: URL) {
+        // Only match CamillaDSP instances launched from this app's private
+        // Application Support binary. Do not touch Homebrew or user-managed
+        // CamillaDSP installations.
+        // Match all historical command-line variants of this exact private
+        // executable. Older app builds used port 1234 and did not pass
+        // --address, so restricting the argument pattern left orphan engines
+        // competing for BlackHole indefinitely.
+        let pattern = "^\(NSRegularExpression.escapedPattern(for: binary.path))( |$)"
+        let killer = Process()
+        killer.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        killer.arguments = ["-TERM", "-f", pattern]
+        killer.standardOutput = FileHandle.nullDevice
+        killer.standardError = FileHandle.nullDevice
+        try? killer.run()
+        killer.waitUntilExit()
+    }
+
+    private func supportDirectory() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("CamillaEQApp", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        return base
+    }
+
+    enum CamillaError: LocalizedError {
+        case connectionTimeout
+        case inputUnavailable
+        var errorDescription: String? {
+            switch self {
+            case .connectionTimeout: return "CamillaDSP did not open its local control socket."
+            case .inputUnavailable: return "CamillaDSP's audio input pipe is unavailable."
+            }
+        }
+    }
+}
