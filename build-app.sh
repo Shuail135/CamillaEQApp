@@ -3,7 +3,18 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="CamillaEQApp"
-APP_VERSION="0.1.1"
+APP_VERSION="${APP_VERSION:-0.1.1}"
+# GitHub Actions exposes the pushed tag through these variables. A release tag
+# such as v0.1.2 therefore produces an app whose bundle version is 0.1.2
+# without requiring a manual source edit for every patch release.
+if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+    if [[ "${GITHUB_REF_NAME:-}" =~ '^v([0-9]+\.[0-9]+\.[0-9]+)$' ]]; then
+        APP_VERSION="${GITHUB_REF_NAME#v}"
+    else
+        echo "ERROR: Release tags must use the format vMAJOR.MINOR.PATCH (for example v0.1.2)."
+        exit 1
+    fi
+fi
 # A changing build number prevents Finder and Login Items from reusing icon
 # metadata cached for an older ad-hoc build with the same public version.
 BUILD_NUMBER="${BUILD_NUMBER:-$(/bin/date -u +%Y%m%d%H%M%S)}"
