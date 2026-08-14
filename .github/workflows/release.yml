@@ -29,7 +29,7 @@ jobs:
       - name: Verify bundle version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaEQApp.app/Contents/Info.plist)"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaApp.app/Contents/Info.plist)"
           if [[ "${GITHUB_REF_NAME}" != "v${bundle_version}" ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match bundle version v${bundle_version}."
             exit 1
@@ -37,12 +37,12 @@ jobs:
 
       - name: Package application
         run: |
-          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaEQApp.app/Contents/Info.plist)"
-          app_archive="CamillaEQApp-v${version}-app.zip"
-          build_archive="CamillaEQApp-v${version}-build-folder.zip"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaApp.app/Contents/Info.plist)"
+          app_archive="CamillaApp-v${version}-app.zip"
+          build_archive="CamillaApp-v${version}-build-folder.zip"
 
           ditto -c -k --sequesterRsrc --keepParent \
-            dist/CamillaEQApp.app "${app_archive}"
+            dist/CamillaApp.app "${app_archive}"
           ditto -c -k --sequesterRsrc --keepParent \
             dist "${build_archive}"
           shasum -a 256 \
@@ -52,10 +52,10 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CamillaEQApp-macos
+          name: CamillaApp-macos
           path: |
-            CamillaEQApp-v*-app.zip
-            CamillaEQApp-v*-build-folder.zip
+            CamillaApp-v*-app.zip
+            CamillaApp-v*-build-folder.zip
             SHA256SUMS
           if-no-files-found: error
 
@@ -69,7 +69,7 @@ jobs:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: CamillaEQApp-macos
+          name: CamillaApp-macos
 
       - name: Publish GitHub release
         env:
@@ -77,9 +77,9 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            CamillaEQApp-v*-app.zip \
-            CamillaEQApp-v*-build-folder.zip \
+            CamillaApp-v*-app.zip \
+            CamillaApp-v*-build-folder.zip \
             SHA256SUMS \
             --verify-tag \
             --generate-notes \
-            --title "CamillaEQApp ${GITHUB_REF_NAME}"
+            --title "CamillaApp ${GITHUB_REF_NAME}"

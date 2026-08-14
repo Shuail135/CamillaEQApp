@@ -1,5 +1,5 @@
 import XCTest
-@testable import CamillaEQApp
+@testable import CamillaApp
 
 final class DeviceProfileMigrationTests: XCTestCase {
     func testLegacyRoutingProfileMigratesToSystemAudioBridge() throws {

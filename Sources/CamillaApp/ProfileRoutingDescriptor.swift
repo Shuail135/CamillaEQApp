@@ -1,7 +1,7 @@
 import Foundation
 
 struct ProfileRoutingDescriptor: Hashable {
-    static let uidPrefix = "local.camillaeq.profile."
+    static let uidPrefix = "local.camilla.profile."
 
     let profileID: UUID
     let uid: String

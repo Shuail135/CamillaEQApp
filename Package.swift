@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "CamillaEQApp",
+    name: "CamillaApp",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "CamillaEQApp", targets: ["CamillaEQApp"])
+        .executable(name: "CamillaApp", targets: ["CamillaApp"])
     ],
     targets: [
         .target(
@@ -18,16 +18,16 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "CamillaEQApp",
+            name: "CamillaApp",
             dependencies: ["SystemAudioBridgeC"],
-            path: "Sources/CamillaEQApp",
+            path: "Sources/CamillaApp",
             resources: [
                 .copy("icon.png")
             ]
         ),
         .testTarget(
-            name: "CamillaEQAppTests",
-            dependencies: ["CamillaEQApp", "SystemAudioBridgeC"]
+            name: "CamillaAppTests",
+            dependencies: ["CamillaApp", "SystemAudioBridgeC"]
         )
     ]
 )

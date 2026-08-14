@@ -162,7 +162,7 @@ final class CamillaDSPManager: ObservableObject {
 
     private func supportDirectory() -> URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CamillaEQApp", isDirectory: true)
+            .appendingPathComponent("CamillaApp", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base
     }

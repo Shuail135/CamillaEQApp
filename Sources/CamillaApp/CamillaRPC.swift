@@ -147,7 +147,7 @@ actor CamillaRPC {
         var errorDescription: String? {
             switch self {
             case .notConnected: return "CamillaDSP websocket is not connected."
-            case .invalidRequest: return "CamillaEQApp attempted to send an invalid command to CamillaDSP."
+            case .invalidRequest: return "CamillaApp attempted to send an invalid command to CamillaDSP."
             case .invalidResponse(let detail): return "CamillaDSP returned an invalid response: \(detail)."
             case .commandFailed(let value): return "CamillaDSP command failed: \(value)"
             }

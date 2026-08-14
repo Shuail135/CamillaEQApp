@@ -2,8 +2,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="CamillaEQApp"
-APP_VERSION="${APP_VERSION:-0.1.1}"
+APP_NAME="CamillaApp"
+APP_VERSION="${APP_VERSION:-0.2.1}"
 # GitHub Actions exposes the pushed tag through these variables. A release tag
 # such as v0.1.2 therefore produces an app whose bundle version is 0.1.2
 # without requiring a manual source edit for every patch release.
@@ -19,11 +19,12 @@ fi
 # metadata cached for an older ad-hoc build with the same public version.
 BUILD_NUMBER="${BUILD_NUMBER:-$(/bin/date -u +%Y%m%d%H%M%S)}"
 BUNDLE_ID="local.camillaeq.app"
+BUNDLE_ID="local.camilla.app"
 DIST="$PWD/dist"
 APP="$DIST/$APP_NAME.app"
 BIN_OUT="$DIST/$APP_NAME"
-SOURCES=(Sources/CamillaEQApp/*.swift)
-ICON_SOURCE="Sources/CamillaEQApp/icon.png"
+SOURCES=(Sources/CamillaApp/*.swift)
+ICON_SOURCE="Sources/CamillaApp/icon.png"
 MIN_MACOS="13.0"
 RESOURCE_BUNDLE=""
 BUNDLED_DRIVER="$PWD/build/driver/SystemAudioBridge.driver"
@@ -159,7 +160,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
-  <key>NSHumanReadableCopyright</key><string>Copyright © 2026 CamillaEQApp contributors. Licensed under GPL-3.0-only.</string>
+  <key>NSHumanReadableCopyright</key><string>Copyright © 2026 CamillaApp contributors. Licensed under GPL-3.0-only.</string>
   <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

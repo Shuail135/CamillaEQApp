@@ -26,7 +26,7 @@ final class DependencyManager: ObservableObject {
 
     var supportDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CamillaEQApp", isDirectory: true)
+            .appendingPathComponent("CamillaApp", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base
     }
@@ -112,7 +112,7 @@ final class DependencyManager: ObservableObject {
             let assetURL = URL(string: "https://github.com/HEnquist/camilladsp/releases/latest/download/\(desired)")!
             let archive = try await download(assetURL, filename: desired)
             defer { try? FileManager.default.removeItem(at: archive) }
-            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("CamillaEQApp-\(UUID().uuidString)")
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("CamillaApp-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: temp) }
             try run("/usr/bin/tar", ["-xzf", archive.path, "-C", temp.path])
@@ -187,7 +187,7 @@ final class DependencyManager: ObservableObject {
 
     func installEverything() async {
         setupInProgress = true
-        setupMessage = "Setting up CamillaEQApp dependencies…"
+        setupMessage = "Setting up CamillaApp dependencies…"
         if case .installed = camillaDSPStatus {} else { await installCamillaDSP() }
         if case .installed = audioDriverStatus {} else { await installAudioDriver() }
         setupInProgress = false
@@ -221,7 +221,7 @@ final class DependencyManager: ObservableObject {
 
     private func download(_ url: URL, filename: String) async throws -> URL {
         var request = URLRequest(url: url)
-        request.setValue("CamillaEQApp", forHTTPHeaderField: "User-Agent")
+        request.setValue("CamillaApp", forHTTPHeaderField: "User-Agent")
         let (temporary, response) = try await URLSession.shared.download(for: request)
         try validate(response: response, source: url)
         let target = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)-\(filename)")
@@ -279,7 +279,7 @@ final class DependencyManager: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .binaryMissing: return "CamillaDSP archive did not contain the camilladsp executable."
-            case .bundledDriverMissing: return "This app bundle does not contain SystemAudioBridge.driver. Reinstall CamillaEQApp."
+            case .bundledDriverMissing: return "This app bundle does not contain SystemAudioBridge.driver. Reinstall CamillaApp."
             case .unsupportedArchitecture(let arch): return "This Mac architecture is not supported: \(arch)."
             case .invalidResponse(let host): return "The download server returned an invalid response (\(host))."
             case .httpFailure(let status, let host): return "The download failed with HTTP \(status) from \(host). Check the internet connection and try again."

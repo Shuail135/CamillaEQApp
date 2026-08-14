@@ -1,5 +1,5 @@
 import XCTest
-@testable import CamillaEQApp
+@testable import CamillaApp
 
 final class EqualizerAPOParserTests: XCTestCase {
     func testImportsEveryGraphicalFilterKindAndPreservesOff() throws {

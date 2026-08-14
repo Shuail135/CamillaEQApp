@@ -18,4 +18,4 @@ tmp/
 *.sha256
 
 # Local visual preview (not an application resource)
-Sources/CamillaEQApp/tray-icon-preview.png
+Sources/CamillaApp/tray-icon-preview.png

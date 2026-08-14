@@ -105,7 +105,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("CamillaEQApp")
+            .navigationTitle("CamillaApp")
         } detail: {
             if selection == "setup" {
                 SetupView(state: state)
@@ -146,7 +146,7 @@ struct ContentView: View {
                 onAdd: addSelectedOutput
             )
         }
-        .alert("CamillaEQApp", isPresented: Binding(
+        .alert("CamillaApp", isPresented: Binding(
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
         )) {
@@ -174,7 +174,7 @@ struct ContentView: View {
             .keyboardShortcut(.defaultAction)
         } message: {
             if let update = updateChecker.availableUpdate {
-                Text("CamillaEQApp \(update.version) is available. You are currently using version \(updateChecker.installedVersion).")
+                Text("CamillaApp \(update.version) is available. You are currently using version \(updateChecker.installedVersion).")
             }
         }
         .alert(item: $updateChecker.notice) { notice in
@@ -194,7 +194,7 @@ struct ContentView: View {
                             .controlSize(.large)
                         Text("Downloading Update…")
                             .font(.headline)
-                        Text("CamillaEQApp will validate the download, then close. Reopen it to use the update.")
+                        Text("CamillaApp will validate the download, then close. Reopen it to use the update.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -334,7 +334,7 @@ struct SetupView: View {
                 dependencyCard(
                     title: "CamillaDSP",
                     status: dependencies.camillaDSPStatus,
-                    detail: "Installed privately under ~/Library/Application Support/CamillaEQApp/bin.",
+                    detail: "Installed privately under ~/Library/Application Support/CamillaApp/bin.",
                     action: { Task { await dependencies.installCamillaDSP() } }
                 )
 
@@ -377,7 +377,7 @@ struct SetupView: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 10) {
-                            Toggle("Start CamillaEQApp when I log in", isOn: Binding(
+                            Toggle("Start CamillaApp when I log in", isOn: Binding(
                                 get: { loginItem.isEnabled },
                                 set: { loginItem.setEnabled($0) }
                             ))

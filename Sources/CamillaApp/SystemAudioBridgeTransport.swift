@@ -196,7 +196,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
             case .invalidChannelCount(let count):
                 return "The driver transport does not support \(count) channels."
             case .couldNotCreateSharedRegion:
-                return "CamillaEQApp could not create the private driver audio transport."
+                return "CamillaApp could not create the private driver audio transport."
             case .coreAudio(let status):
                 if status == kAudioHardwareUnknownPropertyError {
                     return "The installed System Audio Bridge does not support this app's transport protocol (Core Audio \(Self.describe(status))). Use Setup → Install / Repair Everything to replace the driver."

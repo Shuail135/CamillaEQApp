@@ -14,7 +14,7 @@ final class ProfileStore: ObservableObject {
 
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CamillaEQApp", isDirectory: true)
+            .appendingPathComponent("CamillaApp", isDirectory: true)
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         self.url = base.appendingPathComponent("profiles.json")
         load()
