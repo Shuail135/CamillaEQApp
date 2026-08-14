@@ -6,15 +6,19 @@ struct ContentView: View {
     @ObservedObject var state: AppState
     @ObservedObject private var profileStore: ProfileStore
     @ObservedObject private var coreAudio: CoreAudioManager
+    @ObservedObject private var updateChecker: AppUpdateChecker
     @State private var selection: String
     @State private var renameProfileID: UUID?
     @State private var renameDraft = ""
+    @State private var showingOutputPicker = false
+    @State private var pendingOutputUID: String?
     @FocusState private var focusedRenameID: UUID?
 
     init(state: AppState) {
         self.state = state
         self._profileStore = ObservedObject(wrappedValue: state.profiles)
         self._coreAudio = ObservedObject(wrappedValue: state.coreAudio)
+        self._updateChecker = ObservedObject(wrappedValue: state.updateChecker)
         let saved = UserDefaults.standard.string(forKey: "lastSidebarSelection")
         let restored: String
         if saved == "setup" {
@@ -33,10 +37,25 @@ struct ContentView: View {
         NavigationSplitView {
             List(selection: $selection) {
                 Label("Setup", systemImage: "wrench.and.screwdriver").tag("setup")
+
+                Button {
+                    beginAddingOutput()
+                } label: {
+                    Label("Add Output", systemImage: "plus.circle.fill")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(Color.accentColor)
+                }
+                .buttonStyle(.plain)
+
                 Section("Output profiles") {
                     ForEach(profileStore.profiles) { profile in
                         HStack(spacing: 7) {
                             Image(systemName: "speaker.wave.2")
+                                .foregroundStyle(
+                                    state.isActive && state.activeProfileID == profile.id
+                                        ? Color.blue
+                                        : Color.primary
+                                )
                             if renameProfileID == profile.id {
                                 TextField("Profile name", text: $renameDraft)
                                     .textFieldStyle(.roundedBorder)
@@ -49,6 +68,20 @@ struct ContentView: View {
                         }
                         .tag(profile.id.uuidString)
                         .contextMenu {
+                            if state.isActive && state.activeProfileID == profile.id {
+                                Button {
+                                    Task { await state.deactivate(manual: true) }
+                                } label: {
+                                    Label("Deactivate EQ", systemImage: "stop.circle")
+                                }
+                            } else {
+                                Button {
+                                    Task { await state.activate(profile: profile) }
+                                } label: {
+                                    Label("Activate EQ", systemImage: "play.circle")
+                                }
+                            }
+                            Divider()
                             Button("Rename") {
                                 renameProfileID = profile.id
                                 renameDraft = profile.name
@@ -73,21 +106,6 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("CamillaEQApp")
-            .safeAreaInset(edge: .bottom) {
-                Menu {
-                    ForEach(state.coreAudio.outputDevices.filter { $0.name != AudioDeviceInfo.blackHoleName }) { device in
-                        Button(device.name) {
-                            profileStore.addProfile(for: device)
-                            selection = profileStore.selectedProfileID?.uuidString ?? "setup"
-                        }
-                    }
-                } label: {
-                    Label("Add Output Profile", systemImage: "plus")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .padding()
-            }
         } detail: {
             if selection == "setup" {
                 SetupView(state: state)
@@ -117,6 +135,17 @@ struct ContentView: View {
                 commitRename()
             }
         }
+        .sheet(isPresented: $showingOutputPicker) {
+            AddOutputProfileSheet(
+                devices: coreAudio.outputDevices.filter { !$0.isRoutingDevice },
+                selectedUID: $pendingOutputUID,
+                onCancel: {
+                    showingOutputPicker = false
+                    pendingOutputUID = nil
+                },
+                onAdd: addSelectedOutput
+            )
+        }
         .alert("CamillaEQApp", isPresented: Binding(
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
@@ -125,14 +154,64 @@ struct ContentView: View {
         } message: {
             Text(state.errorMessage ?? "")
         }
+        .alert("Update Available", isPresented: Binding(
+            get: { updateChecker.availableUpdate != nil },
+            set: { isPresented in
+                if !isPresented, updateChecker.availableUpdate != nil {
+                    updateChecker.remindLater()
+                }
+            }
+        )) {
+            Button("Skip This Version") {
+                updateChecker.skipAvailableVersion()
+            }
+            Button("Remind Me Later", role: .cancel) {
+                updateChecker.remindLater()
+            }
+            Button("Update") {
+                updateChecker.beginUpdate()
+            }
+            .keyboardShortcut(.defaultAction)
+        } message: {
+            if let update = updateChecker.availableUpdate {
+                Text("CamillaEQApp \(update.version) is available. You are currently using version \(updateChecker.installedVersion).")
+            }
+        }
+        .alert(item: $updateChecker.notice) { notice in
+            Alert(
+                title: Text(notice.title),
+                message: Text(notice.message),
+                dismissButton: .default(Text("OK"))
+            )
+        }
+        .overlay {
+            if updateChecker.isDownloadingUpdate {
+                ZStack {
+                    Color.black.opacity(0.18)
+                        .ignoresSafeArea()
+                    VStack(spacing: 14) {
+                        ProgressView()
+                            .controlSize(.large)
+                        Text("Downloading Update…")
+                            .font(.headline)
+                        Text("CamillaEQApp will validate the download, then close. Reopen it to use the update.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(28)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                    .shadow(radius: 18)
+                }
+            }
+        }
     }
 
     private func commitRename() {
         let name = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if let id = renameProfileID,
            !name.isEmpty,
-           let index = profileStore.profiles.firstIndex(where: { $0.id == id }) {
-            profileStore.profiles[index].name = name
+           profileStore.profiles.contains(where: { $0.id == id }) {
+            state.renameProfile(id: id, to: name)
         }
         renameProfileID = nil
         focusedRenameID = nil
@@ -142,6 +221,97 @@ struct ContentView: View {
         renameProfileID = nil
         focusedRenameID = nil
         renameDraft = ""
+    }
+
+    private func beginAddingOutput() {
+        coreAudio.refresh()
+        let devices = coreAudio.outputDevices.filter { !$0.isRoutingDevice }
+        pendingOutputUID = devices.first(where: { $0.id == coreAudio.defaultOutputUID })?.id
+            ?? devices.first?.id
+        showingOutputPicker = true
+    }
+
+    private func addSelectedOutput() {
+        guard let pendingOutputUID,
+              let device = coreAudio.outputDevices.first(where: {
+                  $0.id == pendingOutputUID && !$0.isRoutingDevice
+              }) else { return }
+        profileStore.addProfile(for: device)
+        selection = profileStore.selectedProfileID?.uuidString ?? "setup"
+        showingOutputPicker = false
+        self.pendingOutputUID = nil
+    }
+}
+
+private struct AddOutputProfileSheet: View {
+    let devices: [AudioDeviceInfo]
+    @Binding var selectedUID: String?
+    let onCancel: () -> Void
+    let onAdd: () -> Void
+
+    private var selectedDevice: AudioDeviceInfo? {
+        devices.first(where: { $0.id == selectedUID })
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text("Add Output Profile")
+                .font(.largeTitle.bold())
+            Text("Choose the physical audio device that this profile will play through.")
+                .foregroundStyle(.secondary)
+
+            GroupBox {
+                if devices.isEmpty {
+                    VStack(spacing: 10) {
+                        Image(systemName: "speaker.slash")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                        Text("No physical audio outputs are connected.")
+                            .font(.headline)
+                        Text("Connect an output device, then try again.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding()
+                } else {
+                    List(selection: $selectedUID) {
+                        ForEach(devices) { device in
+                            HStack(spacing: 12) {
+                                Image(systemName: "speaker.wave.2")
+                                    .frame(width: 24)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(device.name)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                            .tag(device.id)
+                        }
+                    }
+                    .listStyle(.inset)
+                    .scrollContentBackground(.hidden)
+                }
+            } label: {
+                Text("Audio outputs")
+                    .font(.title3.bold())
+            }
+            .frame(maxHeight: .infinity)
+
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Add Profile", action: onAdd)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(selectedDevice == nil)
+            }
+        }
+        .padding(32)
+        .frame(minWidth: 580, idealWidth: 640, minHeight: 440, idealHeight: 500)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 }
 
@@ -160,8 +330,6 @@ struct SetupView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
                 Text("Setup").font(.largeTitle.bold())
-                Text("CamillaEQApp uses CamillaDSP as the hidden DSP engine and BlackHole 2ch as the system-audio loopback. CamillaGUI is not required.")
-                    .foregroundStyle(.secondary)
 
                 dependencyCard(
                     title: "CamillaDSP",
@@ -171,10 +339,10 @@ struct SetupView: View {
                 )
 
                 dependencyCard(
-                    title: "BlackHole 2ch",
-                    status: dependencies.blackHoleStatus,
-                    detail: "The official BlackHole package requires macOS administrator approval. Install it from the official website if authorization is not granted.",
-                    action: { Task { await dependencies.installBlackHole() } }
+                    title: "System Audio Bridge Driver",
+                    status: dependencies.audioDriverStatus,
+                    detail: "Installation asks once for macOS administrator approval.",
+                    action: { Task { await dependencies.installAudioDriver() } }
                 )
 
                 HStack {
@@ -232,7 +400,7 @@ struct SetupView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("First use").font(.title2.bold())
-                    Text("1. Install both dependencies. Installation alone does not change audio routing.\n2. Restart the Mac if BlackHole was just installed.\n3. Add your physical output as a profile from the sidebar.\n4. Adjust the visual equalizer, or import Equalizer APO text from a file or the clipboard.\n5. Turn on System-wide EQ. This starts CamillaDSP, saves configs/active.yml, and routes macOS through BlackHole.\n6. Approve Audio Input / Microphone permission if macOS asks; it is used for BlackHole capture and the live spectrum display.")
+                    Text("1. Select Install / Repair Everything, then approve the macOS administrator prompt.\n2. Restart the Mac only if Setup says the new audio device is not visible yet.\n3. Add your physical output as a profile from the sidebar.\n4. Adjust the visual equalizer, or import Equalizer APO text from a file or the clipboard.\n5. Right-click the profile and select Activate EQ, or enable an activation condition.")
                 }
             }
             .padding(32)
@@ -302,6 +470,10 @@ struct ProfileEditorView: View {
     @FocusState private var profileNameFocused: Bool
 
     private var profileIsActive: Bool { state.isActive && state.activeProfileID == profile.id }
+    private var profileRoutingName: String {
+        ProfileRoutingDescriptor.descriptors(for: state.profiles.profiles)[profile.id]?.name
+            ?? profile.name
+    }
 
     var body: some View {
         ScrollView {
@@ -328,7 +500,7 @@ struct ProfileEditorView: View {
                             .foregroundStyle(.orange)
                     }
                     Spacer()
-                    Toggle("System-wide EQ", isOn: Binding(
+                    Toggle("", isOn: Binding(
                         get: { profileIsActive },
                         set: { newValue in
                             Task {
@@ -337,8 +509,15 @@ struct ProfileEditorView: View {
                             }
                         }
                     ))
+                    .labelsHidden()
                     .toggleStyle(.switch)
+                    .accessibilityLabel("Activate EQ")
+                    .help("Activate or deactivate EQ for this profile")
                 }
+
+                Text("Use the switch above, the profile’s right-click menu, or an activation condition below to activate EQ.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 routingAndDevice
 
@@ -414,6 +593,7 @@ struct ProfileEditorView: View {
                                     GraphicEqualizerBands(
                                         bands: $graphicBands,
                                         spectrum: state.spectrum,
+                                        sampleRate: Double(profile.sampleRate),
                                         setKind: setKind,
                                         columnWidth: columnWidth
                                     )
@@ -474,8 +654,8 @@ struct ProfileEditorView: View {
         let trimmedName = profileNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedName.isEmpty,
            let profileID = renamingProfileID,
-           let index = state.profiles.profiles.firstIndex(where: { $0.id == profileID }) {
-            state.profiles.profiles[index].name = trimmedName
+           state.profiles.profiles.contains(where: { $0.id == profileID }) {
+            state.renameProfile(id: profileID, to: trimmedName)
         }
         isRenamingProfile = false
         renamingProfileID = nil
@@ -526,8 +706,8 @@ struct ProfileEditorView: View {
                 Text("Routing & device behavior").font(.title3.bold())
                 HStack {
                     VStack(alignment: .leading) {
-                        Text("System audio input").font(.caption).foregroundStyle(.secondary)
-                        Text(AudioDeviceInfo.blackHoleName)
+                        Text("System audio route").font(.caption).foregroundStyle(.secondary)
+                        Text(profileRoutingName)
                     }
                     Image(systemName: "arrow.right")
                     VStack(alignment: .leading) {
@@ -544,7 +724,7 @@ struct ProfileEditorView: View {
                                 Text("\(profile.outputDeviceName) (Disconnected)")
                                     .tag(profile.outputDeviceUID)
                             }
-                            ForEach(coreAudio.outputDevices.filter { $0.name != AudioDeviceInfo.blackHoleName }) { device in
+                            ForEach(coreAudio.outputDevices.filter { !$0.isRoutingDevice }) { device in
                                 Text(device.name).tag(device.id)
                             }
                         }.labelsHidden().frame(maxWidth: 320)
@@ -552,19 +732,23 @@ struct ProfileEditorView: View {
                     Spacer()
                     Text(profileIsActive ? "ACTIVE" : "BYPASSED")
                         .font(.caption.bold())
+                        .foregroundStyle(profileIsActive ? Color.green : Color.secondary)
                 }
-                Toggle("Automatically activate when this physical output becomes the macOS default", isOn: Binding(
+                Toggle("Activate EQ when \(profile.outputDeviceName) is selected as the macOS audio output", isOn: Binding(
                     get: { profile.autoActivate },
                     set: { enabled in
                         state.profiles.setAutoActivate(profileID: profile.id, enabled: enabled)
                     }
                 ))
-                Toggle("Automatically activate when BlackHole is selected and this physical output is connected", isOn: Binding(
-                    get: { profile.autoActivateWhenBlackHoleSelected ?? false },
+                Toggle("Activate EQ when \(profileRoutingName) is selected as the macOS audio output", isOn: Binding(
+                    get: { profile.autoActivateWhenProfileDeviceSelected },
                     set: { enabled in
-                        state.profiles.setAutoActivateWhenBlackHoleSelected(profileID: profile.id, enabled: enabled)
+                        state.profiles.setAutoActivateWhenProfileDeviceSelected(profileID: profile.id, enabled: enabled)
                     }
                 ))
+                Text("These conditions activate this profile’s EQ; they do not change its physical audio output.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 HStack {
                     Text("Processing sample rate")
                     Spacer()
@@ -609,7 +793,7 @@ struct ProfileEditorView: View {
         liveApplyTask?.cancel()
         let updatedProfile = profileWithCurrentEQ()
         liveApplyTask = Task {
-            try? await Task.sleep(for: .milliseconds(180))
+            try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled else { return }
             await state.apply(profile: updatedProfile)
         }
@@ -855,7 +1039,7 @@ private struct LiveSpectrumPanels: View {
         HStack(alignment: .top, spacing: 16) {
             GroupBox {
                 VStack(alignment: .leading) {
-                    Text("Audio Input Spectrum").font(.headline)
+                    Text("Pre-EQ Spectrum").font(.headline)
                     LineGraph(
                         points: inputPoints,
                         xRange: 20...20_000,

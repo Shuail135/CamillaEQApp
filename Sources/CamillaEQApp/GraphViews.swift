@@ -3,6 +3,7 @@ import SwiftUI
 struct GraphicEqualizerBands: View {
     @Binding var bands: [EQBand]
     @ObservedObject var spectrum: SpectrumAnalyzer
+    let sampleRate: Double
     let setKind: (EQBand.Kind, inout EQBand) -> Void
     let columnWidth: CGFloat
 
@@ -22,6 +23,7 @@ struct GraphicEqualizerBands: View {
                 EQBandColumn(
                     band: $bands[index],
                     audioDB: audioLevel(at: bands[index].frequency),
+                    responseDB: responseGain(at: bands[index].frequency),
                     setKind: setKind
                 )
                 .frame(width: columnWidth)
@@ -40,11 +42,20 @@ struct GraphicEqualizerBands: View {
         }
         return nearest?.db ?? -100
     }
+
+    private func responseGain(at frequency: Double) -> Double {
+        EQResponseCalculator().gainDB(
+            at: frequency,
+            parsed: ParsedEQ(preampDB: 0, bands: bands, warnings: []),
+            sampleRate: sampleRate
+        )
+    }
 }
 
 private struct EQBandColumn: View {
     @Binding var band: EQBand
     let audioDB: Double
+    let responseDB: Double
     let setKind: (EQBand.Kind, inout EQBand) -> Void
     private let fieldWidth: CGFloat = 68
 
@@ -68,6 +79,7 @@ private struct EQBandColumn: View {
                     set: { band.gain = usesGain(band.kind) ? $0 : nil }
                 ),
                 audioDB: audioDB,
+                responseDB: responseDB,
                 gainEnabled: usesGain(band.kind)
             )
             .frame(width: 80, height: 220)
@@ -160,29 +172,52 @@ private struct EQBandColumn: View {
 private struct VerticalEQSlider: View {
     @Binding var gain: Double
     let audioDB: Double
+    let responseDB: Double
     let gainEnabled: Bool
     private let gainRange = -12.0...12.0
+    private let visualizerRange = -72.0...0.0
 
     var body: some View {
         GeometryReader { geometry in
             let track = CGRect(x: (geometry.size.width - 7) / 2, y: 8, width: 7, height: geometry.size.height - 16)
-            let audioAmount = min(1, max(0, (audioDB + 100) / 100))
+            let preEQAmount = audioAmount(audioDB)
+            let postEQAmount = audioAmount(audioDB + responseDB)
+            let changeBottom = min(preEQAmount, postEQAmount)
+            let changeHeight = track.height * abs(postEQAmount - preEQAmount)
             let thumbY = gainY(gain, track: track)
             ZStack(alignment: .bottom) {
                 Capsule().fill(Color.secondary.opacity(0.18))
                     .frame(width: track.width, height: track.height)
                     .position(x: track.midX, y: track.midY)
                 Capsule()
+                    .fill(Color.green.opacity(0.18))
+                    .frame(width: track.width, height: track.height * preEQAmount)
+                    .position(x: track.midX, y: track.maxY - track.height * preEQAmount / 2)
+                Capsule()
                     .fill(
                         LinearGradient(
-                            colors: [.green.opacity(0.35), .green.opacity(0.88)],
+                            colors: [.green.opacity(0.48), .green],
                             startPoint: .bottom,
                             endPoint: .top
                         )
                     )
-                    .frame(width: track.width, height: track.height * audioAmount)
-                    .position(x: track.midX, y: track.maxY - track.height * audioAmount / 2)
-                    .animation(.linear(duration: 0.07), value: audioDB)
+                    .frame(width: track.width, height: track.height * postEQAmount)
+                    .position(x: track.midX, y: track.maxY - track.height * postEQAmount / 2)
+                if changeHeight > 0.5 {
+                    RoundedRectangle(cornerRadius: 3)
+                        .fill(responseDB >= 0 ? Color.blue.opacity(0.88) : Color.orange.opacity(0.88))
+                        .frame(width: track.width, height: max(2, changeHeight))
+                        .position(
+                            x: track.midX,
+                            y: track.maxY - track.height * changeBottom - max(2, changeHeight) / 2
+                        )
+                }
+                if abs(responseDB) >= 0.25, preEQAmount > 0 {
+                    Capsule()
+                        .fill(Color.primary.opacity(0.72))
+                        .frame(width: 13, height: 1.5)
+                        .position(x: track.midX, y: track.maxY - track.height * preEQAmount)
+                }
                 Circle()
                     .fill(gainEnabled ? Color(nsColor: .controlBackgroundColor) : Color.secondary.opacity(0.7))
                     .overlay(Circle().stroke(gainEnabled ? Color.primary.opacity(0.75) : Color.secondary, lineWidth: 1.5))
@@ -190,8 +225,11 @@ private struct VerticalEQSlider: View {
                     .shadow(color: .black.opacity(0.2), radius: 1.5, y: 1)
                     .position(x: track.midX, y: thumbY)
             }
+            .animation(.linear(duration: 0.08), value: audioDB)
+            .animation(.easeOut(duration: 0.12), value: responseDB)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             .contentShape(Rectangle())
+            .help("Green is the estimated post-EQ level. Blue shows boost; orange shows cut; the small marker is the pre-EQ level.")
             .gesture(
                 DragGesture(minimumDistance: 0).onChanged { value in
                     guard gainEnabled else { return }
@@ -201,6 +239,11 @@ private struct VerticalEQSlider: View {
                 }
             )
         }
+    }
+
+    private func audioAmount(_ db: Double) -> Double {
+        min(1, max(0, (db - visualizerRange.lowerBound) /
+            (visualizerRange.upperBound - visualizerRange.lowerBound)))
     }
 
     private func gainY(_ value: Double, track: CGRect) -> Double {

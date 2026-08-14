@@ -8,8 +8,18 @@ let package = Package(
         .executable(name: "CamillaEQApp", targets: ["CamillaEQApp"])
     ],
     targets: [
+        .target(
+            name: "SystemAudioBridgeC",
+            path: "Sources/SystemAudioBridgeC",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("CoreAudio"),
+                .linkedFramework("CoreFoundation")
+            ]
+        ),
         .executableTarget(
             name: "CamillaEQApp",
+            dependencies: ["SystemAudioBridgeC"],
             path: "Sources/CamillaEQApp",
             resources: [
                 .copy("icon.png")
@@ -17,7 +27,7 @@ let package = Package(
         ),
         .testTarget(
             name: "CamillaEQAppTests",
-            dependencies: ["CamillaEQApp"]
+            dependencies: ["CamillaEQApp", "SystemAudioBridgeC"]
         )
     ]
 )

@@ -12,9 +12,12 @@ DerivedData/
 
 # Generated application and release output
 dist/
+build/
 tmp/
 *.zip
 *.sha256
 
 # Local visual preview (not an application resource)
 Sources/CamillaEQApp/tray-icon-preview.png
+
+Tests/

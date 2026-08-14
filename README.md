@@ -5,11 +5,11 @@
 <h1 align="center">CamillaEQApp</h1>
 
 <p align="center">
-  A native macOS app for system-wide parametric EQ with frequency, gain, and Q controls. Powered by CamillaDSP and BlackHole.
+  A native macOS app for system-wide parametric EQ with frequency, gain, and Q controls. Powered by CamillaDSP.
 </p>
 
 <p align="center">
-  <img alt="Version 0.1.1" src="https://img.shields.io/badge/version-0.1.1-blue">
+  <img alt="Version 0.1.3" src="https://img.shields.io/badge/version-0.1.3-blue">
   <img alt="macOS 13 or newer" src="https://img.shields.io/badge/macOS-13%2B-black">
   <img alt="Swift 5.9" src="https://img.shields.io/badge/Swift-5.9-orange">
   <a href="LICENSE"><img alt="GPL 3.0 only" src="https://img.shields.io/badge/license-GPL--3.0--only-green"></a>
@@ -35,7 +35,7 @@ Keep separate EQ and routing settings for each pair of headphones, speakers, DAC
 
 ### Guided setup
 
-Install and verify CamillaDSP and BlackHole from inside the app.
+Install and verify CamillaDSP and the bundled System Audio Bridge driver from inside the app.
 
 ![CamillaEQApp setup interface](screenshot/setup_interface.png)
 
@@ -50,7 +50,7 @@ Install and verify CamillaDSP and BlackHole from inside the app.
 - **See what is playing:** view a live frequency spectrum and input/output level meters.
 - **Run quietly in the background:** reopen the app from its duck icon in the menu bar.
 - **Start at login:** optionally launch CamillaEQApp when you sign in to your Mac.
-- **Set up required components:** install CamillaDSP and BlackHole from the app's Setup page.
+- **Set up required components:** install CamillaDSP and the bundled audio driver from the app's Setup page.
 
 CamillaEQApp uses one active sound profile at a time. You can save as many profiles as you want, but your Mac's audio only passes through one EQ at once.
 
@@ -59,28 +59,22 @@ CamillaEQApp uses one active sound profile at a time. You can save as many profi
 CamillaEQApp safely sends your Mac's audio through the equalizer before it reaches your headphones or speakers:
 
 ```text
-macOS applications
-        │
-        ▼
-BlackHole 2ch ─────► live spectrum
-        │
-        ▼
-CamillaDSP
-        │
-        ▼
-Selected physical output
+Audio from Mac apps
+        ↓
+Selected profile audio device
+        ↓
+CamillaEQApp + CamillaDSP
+  • applies the EQ
+  • displays the live spectrum
+        ↓
+Headphones, speakers, or DAC
 ```
-
-BlackHole carries the Mac's audio into CamillaEQApp, and CamillaDSP applies your EQ settings. CamillaEQApp manages this connection for you—you do not need to open CamillaDSP, CamillaGUI, Audio MIDI Setup, or Terminal during normal use.
 
 When you turn EQ off, CamillaEQApp stops processing and returns audio to the physical output.
 
 ## Prerequisite
 
-- MacOS 13 Ventura or newer.
-
-
-During setup, macOS asks for **Audio Input** or **Microphone** permission. CamillaEQApp needs this permission to receive audio from BlackHole and draw the live spectrum; it does not use your Mac's built-in microphone for the EQ route.
+- macOS 13 Ventura or newer.
 
 Intel Mac users can build the app from source, but the current ready-made GitHub download is for Apple silicon. Windows and Linux are not supported.
 
@@ -109,7 +103,7 @@ macOS saves the app as an exception, so you normally need to do this only once.
 
 1. In CamillaEQApp, choose **Setup** in the sidebar.
 2. Select **Install / Repair Everything**.
-3. Enter your administrator password when macOS opens the BlackHole installer.
+3. Enter your administrator password when macOS installs the bundled System Audio Bridge driver.
 4. Restart your Mac if the app asks you to do so.
 5. Reopen CamillaEQApp after restarting.
 
@@ -119,8 +113,7 @@ macOS saves the app as an exception, so you normally need to do this only once.
 2. Choose the headphones, speakers, DAC, or audio interface you want to use.
 3. Adjust the graphical equalizer, paste an Equalizer APO preset, or import a `.txt` preset.
 4. Leave the sample rate at `48 kHz` unless you know your device needs another value.
-5. Save your changes and turn on **System-wide EQ**.
-6. Allow Audio Input/Microphone access when macOS asks.
+5. Save your changes and activate the profile.
 
 Start playback at a low volume. You should see movement in the level meters and live spectrum when everything is working.
 
@@ -137,10 +130,27 @@ A Mac `.app` is actually a folder containing many files, so the release provides
 ## Troubleshoot
 
 - **The app will not open:** try once, then use **System Settings → Privacy & Security → Open Anyway**.
-- **BlackHole is missing after installation:** restart your Mac, then reopen CamillaEQApp.
-- **There is no sound:** turn off System-wide EQ, confirm the physical output works normally, then reopen Setup and run **Install / Repair Everything**.
-- **The spectrum does not move:** enable CamillaEQApp under **System Settings → Privacy & Security → Microphone**.
+- **System Audio Bridge is missing after installation:** restart your Mac, then reopen CamillaEQApp.
+- **System Audio Bridge is still listed, a renamed profile leaves a grey duplicate, or profile devices have no volume control:** open **Setup** and repair the audio driver. Driver `0.1.1` or newer is required for immediate profile-name/device-list refresh, hiding, and active-device volume control.
+- **There is no sound:** deactivate the profile, confirm the physical output works normally, then reopen Setup and run **Install / Repair Everything**.
+- **The spectrum does not move:** run **Validate Setup**, confirm System Audio Bridge is installed, and reactivate the profile. Confirm that the app reports it as active.
 - **The duck menu-bar icon is hidden:** your menu bar may be full. Temporarily close another menu-bar app; when the duck appears, hold **Command** and drag it farther left.
+
+# System Audio Bridge v0.1.1
+
+System Audio Bridge is CamillaEQApp's output-only Core Audio driver. When an EQ
+profile is activated, macOS sends system audio to a virtual output named after
+that profile. The driver passes the audio to CamillaEQApp, CamillaDSP applies
+the profile's filters, and the processed result is played through the physical
+output selected in the profile.
+
+Profile audio devices shown in the macOS output list act as selectors. Choosing
+one tells CamillaEQApp which profile to activate. The temporary selector is then
+replaced by the active bridge using the same profile name, which keeps the audio
+route clear and preserves the normal macOS volume controls.
+
+Only one profile processes system audio at a time. Other checked profiles can
+remain available in the macOS output list, ready to be selected when needed.
 
 ## Equalizer APO syntax v1.0
 
@@ -180,30 +190,31 @@ The finished bundle is written to `dist/CamillaEQApp.app`. You can also open `Pa
 
 ## Current limitations
 
-- Stereo processing only.
-- The automated release currently contains an Apple Silicon executable rather than a universal binary.
-- Bluetooth, AirPods, aggregate-device, and sample-rate transitions may behave differently across hardware.
-- CoreAudio routing is monitored once per second rather than through persistent property listeners.
-- BlackHole installation remains a privileged system change and requires normal macOS approval.
+- The shipped processing profile is stereo; the driver transport is versioned and has capacity for up to 32 channels for future layouts.
 - Releases are not yet Developer ID signed or notarized.
 - CamillaEQApp does not detect or disable unrelated system-EQ applications.
 
 ## Roadmap
 
-- Universal Apple Silicon and Intel release archives.
-- Developer ID signing and notarization.
-- Stable CoreAudio property listeners.
+- Output Group.
+- Input-device (microphone) EQ.
+- Separate L/R EQ.
 - Per-channel Equalizer APO `Channel:` support.
 - Profile import and export.
-- Better spectrum smoothing and hold controls.
+- Simpler equalizer controls (bass, mids, and treble).
 - Menu-bar quick controls.
+- 5.1 and 7.1 processing.
+- Individual app volume control.
+- Dynamic Loudness
+- Clipping protection
+- Headphone Crossfeed
 
 ## Third-party software
 
-CamillaEQApp downloads dependencies from their official upstream locations at setup time; they are not embedded in the application or release archive.
+CamillaEQApp downloads CamillaDSP from its official upstream location during setup. The System Audio Bridge driver is embedded in the application and built from the source in this repository.
 
 - [CamillaDSP](https://github.com/HEnquist/camilladsp) — GPL-3.0 or MPL-2.0 for the macOS build used here.
-- [BlackHole](https://github.com/ExistentialAudio/BlackHole) — GPL-3.0.
+- System Audio Bridge is derived from [BlackHole](https://github.com/ExistentialAudio/BlackHole) — GPL-3.0.
 
 See [THIRD_PARTY.md](THIRD_PARTY.md) for details. Review upstream terms again before changing how dependencies are acquired or distributed.
 

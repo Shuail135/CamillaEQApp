@@ -4,33 +4,30 @@ import CoreAudio
 @MainActor
 final class SystemVolumeBridge {
     private weak var coreAudio: CoreAudioManager?
-    private weak var spectrum: SpectrumAnalyzer?
-    private var blackHoleUID: String?
+    private var routingUID: String?
     private var physicalUID: String?
-    private var blackHoleID: AudioDeviceID?
+    private var routingID: AudioDeviceID?
     private var volumeListener: AudioObjectPropertyListenerBlock?
     private var muteListener: AudioObjectPropertyListenerBlock?
     private var rampTask: Task<Void, Never>?
     private var onVolume: ((Double) -> Void)?
 
     func start(
-        blackHole: AudioDeviceInfo,
+        routingDevice: AudioDeviceInfo,
         physicalUID: String,
         coreAudio: CoreAudioManager,
-        spectrum: SpectrumAnalyzer,
         onVolume: @escaping (Double) -> Void
     ) {
         stop()
         self.coreAudio = coreAudio
-        self.spectrum = spectrum
-        self.blackHoleUID = blackHole.id
+        self.routingUID = routingDevice.id
         self.physicalUID = physicalUID
-        self.blackHoleID = blackHole.objectID
+        self.routingID = routingDevice.objectID
         self.onVolume = onVolume
 
         let initialVolume = coreAudio.volume(uid: physicalUID) ?? 1
-        try? coreAudio.setVolume(uid: blackHole.id, scalar: initialVolume)
-        coreAudio.setMuted(uid: blackHole.id, muted: coreAudio.isMuted(uid: physicalUID) ?? false)
+        try? coreAudio.setVolume(uid: routingDevice.id, scalar: initialVolume)
+        coreAudio.setMuted(uid: routingDevice.id, muted: coreAudio.isMuted(uid: physicalUID) ?? false)
         synchronize()
 
         let volumeBlock: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -44,26 +41,25 @@ final class SystemVolumeBridge {
 
         var volumeAddress = Self.volumeAddress
         var muteAddress = Self.muteAddress
-        _ = AudioObjectAddPropertyListenerBlock(blackHole.objectID, &volumeAddress, .main, volumeBlock)
-        _ = AudioObjectAddPropertyListenerBlock(blackHole.objectID, &muteAddress, .main, muteBlock)
+        _ = AudioObjectAddPropertyListenerBlock(routingDevice.objectID, &volumeAddress, .main, volumeBlock)
+        _ = AudioObjectAddPropertyListenerBlock(routingDevice.objectID, &muteAddress, .main, muteBlock)
     }
 
     func stop() {
         rampTask?.cancel()
         rampTask = nil
-        if let id = blackHoleID, let block = volumeListener {
+        if let id = routingID, let block = volumeListener {
             var address = Self.volumeAddress
             _ = AudioObjectRemovePropertyListenerBlock(id, &address, .main, block)
         }
-        if let id = blackHoleID, let block = muteListener {
+        if let id = routingID, let block = muteListener {
             var address = Self.muteAddress
             _ = AudioObjectRemovePropertyListenerBlock(id, &address, .main, block)
         }
-        spectrum?.setInputCompensation(decibels: 0)
         volumeListener = nil
         muteListener = nil
-        blackHoleID = nil
-        blackHoleUID = nil
+        routingID = nil
+        routingUID = nil
         physicalUID = nil
         onVolume = nil
     }
@@ -71,24 +67,22 @@ final class SystemVolumeBridge {
     func setVolume(_ scalar: Float32, physicalUID requestedUID: String) -> Bool {
         guard requestedUID == physicalUID,
               let coreAudio,
-              let blackHoleUID else { return false }
-        try? coreAudio.setVolume(uid: blackHoleUID, scalar: scalar)
+              let routingUID else { return false }
+        try? coreAudio.setVolume(uid: routingUID, scalar: scalar)
         synchronize()
         return true
     }
 
     private func synchronize() {
-        guard let coreAudio, let blackHoleUID, let physicalUID,
-              let target = coreAudio.volume(uid: blackHoleUID) else { return }
-        let attenuation = Double(coreAudio.volumeDecibels(uid: blackHoleUID) ?? 0)
-        spectrum?.setInputCompensation(decibels: -attenuation)
+        guard let coreAudio, let routingUID, let physicalUID,
+              let target = coreAudio.volume(uid: routingUID) else { return }
         onVolume?(Double(target))
         rampPhysicalVolume(to: target, uid: physicalUID)
     }
 
     private func synchronizeMute() {
-        guard let coreAudio, let blackHoleUID, let physicalUID,
-              let muted = coreAudio.isMuted(uid: blackHoleUID) else { return }
+        guard let coreAudio, let routingUID, let physicalUID,
+              let muted = coreAudio.isMuted(uid: routingUID) else { return }
         coreAudio.setMuted(uid: physicalUID, muted: muted)
     }
 

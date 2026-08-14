@@ -4,6 +4,8 @@ actor CamillaRPC {
     private var task: URLSessionWebSocketTask?
     private let session = URLSession(configuration: .default)
     private let url: URL
+    private var requestInProgress = false
+    private var requestWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(port: UInt16) {
         self.url = URL(string: "ws://127.0.0.1:\(port)")!
@@ -29,6 +31,12 @@ actor CamillaRPC {
     }
 
     func request(_ payload: Any) async throws -> [String: Any] {
+        // Actor isolation alone is not enough here: actors are reentrant at
+        // every await. Keep each WebSocket send/receive pair together so a
+        // meter poll cannot consume the response to a state or config command.
+        await acquireRequestSlot()
+        defer { releaseRequestSlot() }
+        try Task.checkCancellation()
         guard let task else { throw RPCError.notConnected }
         // CamillaDSP uses both JSON objects (for commands with values) and
         // top-level JSON strings (for commands such as "GetVersion"). Without
@@ -45,12 +53,30 @@ actor CamillaRPC {
         switch message {
         case .string(let value): responseData = Data(value.utf8)
         case .data(let value): responseData = value
-        @unknown default: throw RPCError.invalidResponse
+        @unknown default: throw RPCError.invalidResponse("unsupported WebSocket message type")
         }
         guard let object = try JSONSerialization.jsonObject(with: responseData) as? [String: Any] else {
-            throw RPCError.invalidResponse
+            throw RPCError.invalidResponse("the reply was not a JSON command object")
         }
         return object
+    }
+
+    private func acquireRequestSlot() async {
+        if !requestInProgress {
+            requestInProgress = true
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            requestWaiters.append(continuation)
+        }
+    }
+
+    private func releaseRequestSlot() {
+        if requestWaiters.isEmpty {
+            requestInProgress = false
+        } else {
+            requestWaiters.removeFirst().resume()
+        }
     }
 
     func setConfig(yaml: String) async throws {
@@ -70,10 +96,9 @@ actor CamillaRPC {
 
     func signalLevels() async throws -> SignalLevels {
         let response = try await request("GetSignalLevels")
-        guard let command = response["GetSignalLevels"] as? [String: Any],
-              String(describing: command["result"] ?? "") == "Ok",
-              let value = command["value"] as? [String: Any] else {
-            throw RPCError.commandFailed("GetSignalLevels")
+        let command = try successfulBody(response, command: "GetSignalLevels")
+        guard let value = command["value"] as? [String: Any] else {
+            throw RPCError.invalidResponse("GetSignalLevels had no level data")
         }
         func doubles(_ any: Any?) -> [Double] {
             if let values = any as? [Double] { return values }
@@ -90,28 +115,40 @@ actor CamillaRPC {
 
     func state() async throws -> String {
         let response = try await request("GetState")
-        guard let command = response["GetState"] as? [String: Any],
-              let value = command["value"] as? String else { throw RPCError.invalidResponse }
+        let command = try successfulBody(response, command: "GetState")
+        guard let value = command["value"] as? String else {
+            throw RPCError.invalidResponse("GetState had no state value")
+        }
         return value
     }
 
     private func ensureOK(_ response: [String: Any], command: String) throws {
-        guard let body = response[command] as? [String: Any] else { throw RPCError.invalidResponse }
+        _ = try successfulBody(response, command: command)
+    }
+
+    private func successfulBody(
+        _ response: [String: Any],
+        command: String
+    ) throws -> [String: Any] {
+        guard let body = response[command] as? [String: Any] else {
+            throw RPCError.invalidResponse("expected a \(command) reply")
+        }
         if String(describing: body["result"] ?? "") != "Ok" {
             throw RPCError.commandFailed(String(describing: body["result"] ?? command))
         }
+        return body
     }
 
     enum RPCError: LocalizedError {
         case notConnected
         case invalidRequest
-        case invalidResponse
+        case invalidResponse(String)
         case commandFailed(String)
         var errorDescription: String? {
             switch self {
             case .notConnected: return "CamillaDSP websocket is not connected."
             case .invalidRequest: return "CamillaEQApp attempted to send an invalid command to CamillaDSP."
-            case .invalidResponse: return "CamillaDSP returned an invalid response."
+            case .invalidResponse(let detail): return "CamillaDSP returned an invalid response: \(detail)."
             case .commandFailed(let value): return "CamillaDSP command failed: \(value)"
             }
         }
@@ -157,7 +194,9 @@ final class MeterModel: ObservableObject {
                 } catch {
                     // A transient websocket miss should not tear down the audio engine.
                 }
-                try? await Task.sleep(for: .milliseconds(60))
+                // Ten polls per second is visually smooth and leaves ample
+                // control-socket capacity for live configuration updates.
+                try? await Task.sleep(for: .milliseconds(100))
             }
         }
     }

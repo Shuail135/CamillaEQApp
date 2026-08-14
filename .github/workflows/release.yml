@@ -20,6 +20,9 @@ jobs:
       - name: Test Equalizer APO imports
         run: swift test
 
+      - name: Test driver transport
+        run: Drivers/SystemAudioBridge/test-transport.sh
+
       - name: Build application
         run: ./build-app.sh
 

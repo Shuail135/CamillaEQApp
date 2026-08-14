@@ -1,0 +1,17 @@
+#!/bin/zsh
+set -euo pipefail
+
+# Remove both pre-rename bundles so Core Audio cannot publish old identities.
+/bin/rm -rf \
+    /Library/Audio/Plug-Ins/HAL/CamillaEQAudio.driver \
+    /Library/Audio/Plug-Ins/HAL/CamillaAudioBridge.driver
+/usr/sbin/chown -R root:wheel /Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver
+/bin/chmod -R go-w /Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver
+/usr/bin/xattr -dr com.apple.quarantine /Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver 2>/dev/null || true
+
+# Ventura reliably reloads HAL plug-ins through launchctl. If an audio client
+# prevents the restart, the driver will become available after the next reboot.
+/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || \
+    /usr/bin/killall coreaudiod 2>/dev/null || true
+
+exit 0

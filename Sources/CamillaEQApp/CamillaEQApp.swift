@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CoreImage
 import Darwin
 
 @main
@@ -20,11 +21,11 @@ struct CamillaEQAppMain: App {
         }
 
         MenuBarExtra {
-            CamillaEQMenuBarView()
+            CamillaEQMenuBarView(state: state)
         } label: {
-            Image(nsImage: AppIcon.image)
+            Image(nsImage: state.isActive ? AppIcon.activeMenuBarImage : AppIcon.inactiveMenuBarImage)
                 .renderingMode(.original)
-                .accessibilityLabel("CamillaEQApp")
+                .accessibilityLabel(state.isActive ? "CamillaEQApp, EQ active" : "CamillaEQApp, EQ inactive")
         }
     }
 }
@@ -55,10 +56,31 @@ private enum AppIcon {
         return NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "CamillaEQApp")
             ?? NSImage()
     }()
+
+    static let activeMenuBarImage: NSImage = {
+        let image = AppIcon.image.copy() as? NSImage ?? AppIcon.image
+        image.size = NSSize(width: 18, height: 18)
+        return image
+    }()
+
+    static let inactiveMenuBarImage: NSImage = {
+        guard let data = AppIcon.image.tiffRepresentation,
+              let source = CIImage(data: data) else {
+            return activeMenuBarImage
+        }
+        let grayscale = source.applyingFilter(
+            "CIColorControls",
+            parameters: [kCIInputSaturationKey: 0.0]
+        )
+        let image = NSImage(size: NSSize(width: 18, height: 18))
+        image.addRepresentation(NSCIImageRep(ciImage: grayscale))
+        return image
+    }()
 }
 
 private struct CamillaEQMenuBarView: View {
     @Environment(\.openWindow) private var openWindow
+    @ObservedObject var state: AppState
 
     var body: some View {
         Button("Show CamillaEQApp") {
@@ -68,6 +90,7 @@ private struct CamillaEQMenuBarView: View {
                 NSApp.activate(ignoringOtherApps: true)
                 NSApp.windows.first(where: { $0.title == "CamillaEQApp" })?.makeKeyAndOrderFront(nil)
             }
+            Task { await state.updateChecker.checkAfterReminderIfNeeded() }
         }
         Divider()
         Button("Quit CamillaEQApp") { NSApp.terminate(nil) }

@@ -12,7 +12,7 @@ final class DependencyManager: ObservableObject {
     }
 
     @Published var camillaDSPStatus: Status = .checking
-    @Published var blackHoleStatus: Status = .checking
+    @Published var audioDriverStatus: Status = .checking
     @Published var setupMessage: String = ""
     @Published var setupInProgress = false
     @Published var setupFailed = false
@@ -50,9 +50,17 @@ final class DependencyManager: ObservableObject {
             camillaDSPStatus = .missing
         }
         coreAudio.refresh()
-        blackHoleStatus = coreAudio.blackHole == nil ? .missing : .installed(nil)
-        if case .installed = camillaDSPStatus, case .installed = blackHoleStatus, setupMessage.isEmpty {
-            setupMessage = "Dependencies are ready. Add an output profile, then enable System-wide EQ to start audio routing."
+        if coreAudio.isSystemAudioBridgePresentationSupported {
+            let version = coreAudio.installedSystemAudioBridgeVersion ?? "unknown"
+            audioDriverStatus = .installed("System Audio Bridge \(version)")
+        } else if coreAudio.systemAudioBridge != nil {
+            let version = coreAudio.installedSystemAudioBridgeVersion ?? "unknown"
+            audioDriverStatus = .failed("Driver \(version) is outdated; select Install / Repair Everything.")
+        } else {
+            audioDriverStatus = .missing
+        }
+        if case .installed = camillaDSPStatus, case .installed = audioDriverStatus, setupMessage.isEmpty {
+            setupMessage = "Dependencies are ready."
         }
     }
 
@@ -60,24 +68,24 @@ final class DependencyManager: ObservableObject {
         guard !setupInProgress else { return }
         setupFailed = false
         setupInProgress = true
-        setupMessage = "Checking CamillaDSP and BlackHole 2ch…"
+        setupMessage = "Checking CamillaDSP and the system-audio routing driver…"
         camillaDSPStatus = .checking
-        blackHoleStatus = .checking
+        audioDriverStatus = .checking
         defer { setupInProgress = false }
 
         for attempt in 0..<8 {
             refresh()
-            if coreAudio.blackHole != nil { break }
+            if coreAudio.isSystemAudioBridgePresentationSupported { break }
             if attempt < 7 { try? await Task.sleep(for: .milliseconds(500)) }
         }
 
         var missing: [String] = []
         if case .installed = camillaDSPStatus {} else { missing.append("CamillaDSP") }
-        if case .installed = blackHoleStatus {} else { missing.append("BlackHole 2ch") }
+        if case .installed = audioDriverStatus {} else { missing.append("System Audio Bridge") }
 
         if missing.isEmpty {
             setupFailed = false
-            setupMessage = "Setup complete. Both CamillaDSP and BlackHole 2ch are ready."
+            setupMessage = "Setup complete. CamillaDSP and the audio routing driver are ready."
         } else {
             setupFailed = true
             setupMessage = "Recheck complete. Not detected: " + missing.joined(separator: ", ") + "."
@@ -115,7 +123,7 @@ final class DependencyManager: ObservableObject {
             try FileManager.default.copyItem(at: binary, to: camillaDSPBinary)
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: camillaDSPBinary.path)
             _ = try? run("/usr/bin/xattr", ["-d", "com.apple.quarantine", camillaDSPBinary.path])
-            setupMessage = "CamillaDSP is installed and verified. Add an output profile, then enable System-wide EQ to create and start the active configuration."
+            setupMessage = "CamillaDSP is installed and verified."
             refresh()
         } catch {
             setupFailed = true
@@ -124,44 +132,56 @@ final class DependencyManager: ObservableObject {
         }
     }
 
-    func installBlackHole() async {
+    func installAudioDriver() async {
         setupFailed = false
         setupInProgress = true
-        setupMessage = "Installing BlackHole 2ch: retrieving current package information…"
+        setupMessage = "Installing the bundled System Audio Bridge driver…"
         defer { setupInProgress = false }
-        blackHoleStatus = .working("Downloading official BlackHole 2ch installer…")
+        audioDriverStatus = .working("Waiting for macOS administrator approval…")
         do {
-            // BlackHole's GitHub release assets are source archives, not the 2ch
-            // installer. Homebrew's cask metadata points at the publisher-hosted,
-            // current signed package and is also what `brew install blackhole-2ch`
-            // uses.
-            let cask = try await blackHoleCask()
-            guard cask.url.pathExtension.lowercased() == "pkg" else {
-                throw SetupError.invalidInstallerURL(cask.url.absoluteString)
+            guard let bundledDriver = Bundle.main.url(
+                forResource: "SystemAudioBridge",
+                withExtension: "driver",
+                subdirectory: "Drivers"
+            ) else {
+                throw SetupError.bundledDriverMissing
             }
-            let pkg = try await download(cask.url, filename: cask.url.lastPathComponent)
-            defer { try? FileManager.default.removeItem(at: pkg) }
-            _ = try run("/usr/sbin/pkgutil", ["--check-signature", pkg.path])
-            blackHoleStatus = .working("macOS administrator approval is required…")
+            _ = try run("/usr/bin/codesign", ["--verify", "--strict", bundledDriver.path])
 
-            let command = "/usr/sbin/installer -pkg \(shellQuote(pkg.path)) -target /"
+            let destination = "/Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver"
+            let legacyDestinations = [
+                "/Library/Audio/Plug-Ins/HAL/CamillaEQAudio.driver",
+                "/Library/Audio/Plug-Ins/HAL/CamillaAudioBridge.driver"
+            ]
+            let removalTargets = ([destination] + legacyDestinations)
+                .map(shellQuote)
+                .joined(separator: " ")
+            let command = [
+                "/bin/rm -rf \(removalTargets)",
+                "/usr/bin/ditto \(shellQuote(bundledDriver.path)) \(shellQuote(destination))",
+                "/usr/sbin/chown -R root:wheel \(shellQuote(destination))",
+                "/bin/chmod -R go-w \(shellQuote(destination))",
+                "(/usr/bin/xattr -dr com.apple.quarantine \(shellQuote(destination)) || true)",
+                "(/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod || /usr/bin/killall coreaudiod)"
+            ].joined(separator: " && ")
             let script = "do shell script \(appleScriptQuote(command)) with administrator privileges"
             try run("/usr/bin/osascript", ["-e", script])
 
-            // The installer can finish before CoreAudio publishes the new device.
+            // The copy can finish before CoreAudio publishes the new device.
             // Poll the live device list so setup completes without relaunching the app.
-            if await waitForBlackHole() {
-                blackHoleStatus = .installed(nil)
-                setupMessage = "Dependencies are ready. Add an output profile, then enable System-wide EQ to start audio routing."
+            if await waitForAudioDriver() {
+                let version = coreAudio.installedSystemAudioBridgeVersion ?? "unknown"
+                audioDriverStatus = .installed("System Audio Bridge \(version)")
+                setupMessage = "Dependencies are ready."
             } else {
                 setupFailed = true
-                setupMessage = "BlackHole was installed, but CoreAudio has not exposed it yet. Restart the Mac, then select Recheck."
-                blackHoleStatus = .failed("BlackHole installed, but CoreAudio has not exposed it yet. Restart the Mac, then select Recheck.")
+                setupMessage = "System Audio Bridge was installed, but CoreAudio has not exposed it yet. Restart the Mac, then select Recheck."
+                audioDriverStatus = .failed("Installed; restart macOS, then select Recheck.")
             }
         } catch {
             setupFailed = true
-            blackHoleStatus = .failed(error.localizedDescription)
-            setupMessage = "BlackHole installation failed: \(error.localizedDescription)"
+            audioDriverStatus = .failed(error.localizedDescription)
+            setupMessage = "System Audio Bridge installation failed: \(error.localizedDescription)"
         }
     }
 
@@ -169,12 +189,12 @@ final class DependencyManager: ObservableObject {
         setupInProgress = true
         setupMessage = "Setting up CamillaEQApp dependencies…"
         if case .installed = camillaDSPStatus {} else { await installCamillaDSP() }
-        if case .installed = blackHoleStatus {} else { await installBlackHole() }
+        if case .installed = audioDriverStatus {} else { await installAudioDriver() }
         setupInProgress = false
         refresh()
-        if case .installed = camillaDSPStatus, case .installed = blackHoleStatus {
+        if case .installed = camillaDSPStatus, case .installed = audioDriverStatus {
             setupFailed = false
-            setupMessage = "Setup complete. Both CamillaDSP and BlackHole 2ch are ready."
+            setupMessage = "Setup complete. CamillaDSP and System Audio Bridge are ready."
         } else {
             setupFailed = true
         }
@@ -190,22 +210,13 @@ final class DependencyManager: ObservableObject {
         _ = try run(camillaDSPBinary.path, ["--check", validationURL.path])
     }
 
-    private func waitForBlackHole() async -> Bool {
+    private func waitForAudioDriver() async -> Bool {
         for attempt in 0..<30 {
             coreAudio.refresh()
-            if coreAudio.blackHole != nil { return true }
+            if coreAudio.isSystemAudioBridgePresentationSupported { return true }
             if attempt < 29 { try? await Task.sleep(for: .milliseconds(500)) }
         }
         return false
-    }
-
-    private func blackHoleCask() async throws -> BlackHoleCask {
-        let url = URL(string: "https://formulae.brew.sh/api/cask/blackhole-2ch.json")!
-        var request = URLRequest(url: url)
-        request.setValue("CamillaEQApp", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response: response, source: url)
-        return try JSONDecoder().decode(BlackHoleCask.self, from: data)
     }
 
     private func download(_ url: URL, filename: String) async throws -> URL {
@@ -258,20 +269,18 @@ final class DependencyManager: ObservableObject {
     private func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     private func appleScriptQuote(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\"" }
 
-    private struct BlackHoleCask: Decodable { let url: URL }
-
     enum SetupError: LocalizedError {
         case binaryMissing
+        case bundledDriverMissing
         case unsupportedArchitecture(String)
-        case invalidInstallerURL(String)
         case invalidResponse(String)
         case httpFailure(Int, String)
         case commandFailed(String)
         var errorDescription: String? {
             switch self {
             case .binaryMissing: return "CamillaDSP archive did not contain the camilladsp executable."
+            case .bundledDriverMissing: return "This app bundle does not contain SystemAudioBridge.driver. Reinstall CamillaEQApp."
             case .unsupportedArchitecture(let arch): return "This Mac architecture is not supported: \(arch)."
-            case .invalidInstallerURL(let url): return "The BlackHole download metadata did not provide a .pkg installer: \(url)"
             case .invalidResponse(let host): return "The download server returned an invalid response (\(host))."
             case .httpFailure(let status, let host): return "The download failed with HTTP \(status) from \(host). Check the internet connection and try again."
             case .commandFailed(let output): return output.isEmpty ? "Installer command failed." : output

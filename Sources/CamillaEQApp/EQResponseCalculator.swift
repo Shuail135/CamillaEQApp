@@ -13,12 +13,19 @@ struct EQResponseCalculator {
         return (0..<count).map { i in
             let t = Double(i) / Double(max(1, count - 1))
             let f = minF * pow(maxF / minF, t)
-            var db = parsed.preampDB
-            for band in parsed.bands where band.enabled {
-                db += responseDB(band: band, frequency: f, sampleRate: sampleRate)
-            }
-            return EQResponsePoint(frequency: f, gainDB: db)
+            return EQResponsePoint(
+                frequency: f,
+                gainDB: gainDB(at: f, parsed: parsed, sampleRate: sampleRate)
+            )
         }
+    }
+
+    func gainDB(at frequency: Double, parsed: ParsedEQ, sampleRate: Double) -> Double {
+        var db = parsed.preampDB
+        for band in parsed.bands where band.enabled {
+            db += responseDB(band: band, frequency: frequency, sampleRate: sampleRate)
+        }
+        return db
     }
 
     private func responseDB(band: EQBand, frequency f: Double, sampleRate fs: Double) -> Double {

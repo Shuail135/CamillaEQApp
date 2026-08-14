@@ -12,6 +12,7 @@ final class CamillaDSPManager: ObservableObject {
     let rpc: CamillaRPC
     private var process: Process?
     private var inputPipe: Pipe?
+    private var hasAppliedConfig = false
 
     init() {
         let port = UInt16.random(in: 20_000...49_999)
@@ -50,6 +51,7 @@ final class CamillaDSPManager: ObservableObject {
         try p.run()
         inputPipe = pipe
         process = p
+        hasAppliedConfig = false
         try await connectWithRetry()
         isRunning = true
     }
@@ -71,8 +73,13 @@ final class CamillaDSPManager: ObservableObject {
             try await rpc.setConfig(yaml: yaml)
             // Startup uses -20 dB as a safety guard. Once a valid config is active,
             // the Equalizer APO Preamp inside the config becomes the intended headroom.
-            try await rpc.setVolume(0)
+            if !hasAppliedConfig {
+                try await rpc.setVolume(0)
+                hasAppliedConfig = true
+            }
             lastError = nil
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             lastError = error.localizedDescription
             throw error
@@ -81,6 +88,7 @@ final class CamillaDSPManager: ObservableObject {
 
     func forceStopAndWait() {
         guard let childProcess = process else {
+            hasAppliedConfig = false
             isRunning = false
             return
         }
@@ -101,6 +109,7 @@ final class CamillaDSPManager: ObservableObject {
             childProcess.waitUntilExit()
         }
         self.process = nil
+        hasAppliedConfig = false
         isRunning = false
     }
 
@@ -114,6 +123,7 @@ final class CamillaDSPManager: ObservableObject {
             if process.isRunning { process.interrupt() }
         }
         process = nil
+        hasAppliedConfig = false
         isRunning = false
     }
 
@@ -139,7 +149,7 @@ final class CamillaDSPManager: ObservableObject {
         // Match all historical command-line variants of this exact private
         // executable. Older app builds used port 1234 and did not pass
         // --address, so restricting the argument pattern left orphan engines
-        // competing for BlackHole indefinitely.
+        // competing for the routing stream indefinitely.
         let pattern = "^\(NSRegularExpression.escapedPattern(for: binary.path))( |$)"
         let killer = Process()
         killer.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")

@@ -25,6 +25,9 @@ final class ProfileStore: ObservableObject {
             selectedProfileID = profiles.first?.id
         }
         isLoading = false
+        // Persist any legacy routing-device/profile-key migrations performed
+        // while decoding so future launches only use the current schema.
+        save()
     }
 
     var selectedProfile: DeviceProfile? {
@@ -44,11 +47,11 @@ final class ProfileStore: ObservableObject {
     }
 
     func setAutoActivate(profileID: UUID, enabled: Bool) {
-        setAutoActivation(profileID: profileID, enabled: enabled, whenBlackHoleSelected: false)
+        setAutoActivation(profileID: profileID, enabled: enabled, whenRoutingDeviceSelected: false)
     }
 
-    func setAutoActivateWhenBlackHoleSelected(profileID: UUID, enabled: Bool) {
-        setAutoActivation(profileID: profileID, enabled: enabled, whenBlackHoleSelected: true)
+    func setAutoActivateWhenProfileDeviceSelected(profileID: UUID, enabled: Bool) {
+        setAutoActivation(profileID: profileID, enabled: enabled, whenRoutingDeviceSelected: true)
     }
 
     func setOutputDevice(profileID: UUID, device: AudioDeviceInfo) {
@@ -57,7 +60,7 @@ final class ProfileStore: ObservableObject {
         updated[index].outputDeviceUID = device.id
         updated[index].outputDeviceName = device.name
 
-        if updated[index].autoActivate || (updated[index].autoActivateWhenBlackHoleSelected ?? false) {
+        if updated[index].autoActivate {
             disableAutoActivation(in: &updated, outputUID: device.id, excluding: profileID)
         }
         profiles = updated
@@ -67,7 +70,7 @@ final class ProfileStore: ObservableObject {
     // drivers return a new CoreAudio UID after reconnecting, so recover the
     // binding by name only when exactly one connected device matches.
     func reconcileDevices(_ devices: [AudioDeviceInfo]) -> Set<UUID> {
-        let physicalDevices = devices.filter { $0.name != AudioDeviceInfo.blackHoleName }
+        let physicalDevices = devices.filter { !$0.isRoutingDevice }
         let connectedUIDs = Set(physicalDevices.map(\.id))
         var updated = profiles
         var reboundProfileIDs = Set<UUID>()
@@ -81,7 +84,7 @@ final class ProfileStore: ObservableObject {
 
             updated[index].outputDeviceUID = match.id
             updated[index].outputDeviceName = match.name
-            if updated[index].autoActivate || (updated[index].autoActivateWhenBlackHoleSelected ?? false) {
+            if updated[index].autoActivate {
                 disableAutoActivation(
                     in: &updated,
                     outputUID: match.id,
@@ -111,18 +114,19 @@ final class ProfileStore: ObservableObject {
         profiles = normalizedAutoActivation(in: decoded)
     }
 
-    private func setAutoActivation(profileID: UUID, enabled: Bool, whenBlackHoleSelected: Bool) {
+    private func setAutoActivation(profileID: UUID, enabled: Bool, whenRoutingDeviceSelected: Bool) {
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
         var updated = profiles
         if enabled {
-            let outputUID = updated[index].outputDeviceUID
-            disableAutoActivation(in: &updated, outputUID: outputUID, excluding: profileID)
-            updated[index].autoActivate = !whenBlackHoleSelected
-            updated[index].autoActivateWhenBlackHoleSelected = whenBlackHoleSelected
-        } else if whenBlackHoleSelected {
-            updated[index].autoActivateWhenBlackHoleSelected = false
+            if !whenRoutingDeviceSelected {
+                let outputUID = updated[index].outputDeviceUID
+                disableAutoActivation(in: &updated, outputUID: outputUID, excluding: profileID)
+            }
+        }
+        if whenRoutingDeviceSelected {
+            updated[index].autoActivateWhenProfileDeviceSelected = enabled
         } else {
-            updated[index].autoActivate = false
+            updated[index].autoActivate = enabled
         }
         profiles = updated
     }
@@ -131,7 +135,6 @@ final class ProfileStore: ObservableObject {
         for index in profiles.indices
         where profiles[index].id != profileID && profiles[index].outputDeviceUID == outputUID {
             profiles[index].autoActivate = false
-            profiles[index].autoActivateWhenBlackHoleSelected = false
         }
     }
 
@@ -139,15 +142,9 @@ final class ProfileStore: ObservableObject {
         var result = profiles
         var claimedOutputUIDs = Set<String>()
         for index in result.indices {
-            let enabled = result[index].autoActivate || (result[index].autoActivateWhenBlackHoleSelected ?? false)
-            guard enabled else { continue }
-            if claimedOutputUIDs.insert(result[index].outputDeviceUID).inserted {
-                if result[index].autoActivate {
-                    result[index].autoActivateWhenBlackHoleSelected = false
-                }
-            } else {
+            guard result[index].autoActivate else { continue }
+            if !claimedOutputUIDs.insert(result[index].outputDeviceUID).inserted {
                 result[index].autoActivate = false
-                result[index].autoActivateWhenBlackHoleSelected = false
             }
         }
         return result

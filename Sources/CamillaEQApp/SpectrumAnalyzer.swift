@@ -1,17 +1,10 @@
 import Foundation
-import AVFoundation
-import AudioToolbox
 import Accelerate
 
 final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
     @Published var points: [SpectrumPoint] = []
     @Published var status: String = "Analyzer idle"
 
-    private var captureDeviceID: AudioDeviceID?
-    private var captureIOProcID: AudioDeviceIOProcID?
-    private var directSampleRate: Double = 0
-    private var captureUnit: AudioUnit?
-    private var captureFormat: AVAudioFormat?
     private var pipeWriter: AudioPipeWriter?
     private var fftSetup: FFTSetup?
     private let fftSize = 4096
@@ -22,187 +15,44 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
     private let displayBinCount = 180
     private let sampleLock = NSLock()
     private var pendingSamples: [Float] = []
-    private var startupCheck: Task<Void, Never>?
     private var receivedBuffer = false
-    private var inputCompensation: Float = 1
+    private var sourceName = "System Audio Bridge"
 
     deinit {
-        stopCaptureBackends()
         pipeWriter?.stop()
         if let fftSetup { vDSP_destroy_fftsetup(fftSetup) }
     }
 
     @MainActor
-    func waitUntilReceiving(timeout: Duration = .seconds(5)) async -> Bool {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if hasReceivedBuffer() { return true }
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        return hasReceivedBuffer()
-    }
-
-    @MainActor
-    private func requestAudioInputPermission() async -> Bool {
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            return true
-        case .denied, .restricted:
-            return false
-        case .notDetermined:
-            return await withCheckedContinuation { continuation in
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    continuation.resume(returning: granted)
-                }
-            }
-        @unknown default:
-            return false
-        }
-    }
-
-    @MainActor
-    func start(deviceObjectID: UInt32, audioSink: FileHandle) async throws {
+    func startExternal(audioSink: FileHandle, sourceName: String) {
         stop()
-        status = "Requesting Audio Input permission for the live spectrum…"
-        guard await requestAudioInputPermission() else {
-            status = "Audio Input permission denied. Enable CamillaEQApp in System Settings › Privacy & Security › Microphone, then reactivate EQ."
-            throw AnalyzerError.permissionDenied
-        }
-        status = "Attaching analyzer to BlackHole 2ch…"
-        do {
-            let writer = AudioPipeWriter(handle: audioSink)
-            writer.start()
-            pipeWriter = writer
-            if fftSetup == nil { fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) }
-            resetReceivedBuffer()
+        self.sourceName = sourceName
+        let writer = AudioPipeWriter(handle: audioSink)
+        writer.start()
+        pipeWriter = writer
+        if fftSetup == nil { fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) }
+        resetReceivedBuffer()
+        status = "Waiting for audio from \(sourceName)…"
+    }
 
-            do {
-                try startDirectCapture(deviceObjectID: deviceObjectID)
-                status = "Direct BlackHole analyzer started at \(Int(directSampleRate)) Hz; waiting for audio buffers…"
-                scheduleCaptureCheck(deviceObjectID: deviceObjectID, retryAUHAL: true)
-            } catch {
-                try startAUHALCapture(deviceObjectID: deviceObjectID)
-                status = "AUHAL BlackHole analyzer started at \(Int(captureFormat?.sampleRate ?? 0)) Hz; waiting for audio buffers…"
-                scheduleCaptureCheck(deviceObjectID: deviceObjectID, retryAUHAL: false)
+    func ingestExternal(interleaved: [Float], channelCount: Int, sampleRate: Double) {
+        guard channelCount > 0,
+              sampleRate > 0,
+              interleaved.count >= channelCount else { return }
+        let frameCount = interleaved.count / channelCount
+        var mono = [Float](repeating: 0, count: frameCount)
+        for frame in 0..<frameCount {
+            var sum: Float = 0
+            for channel in 0..<channelCount {
+                sum += interleaved[frame * channelCount + channel]
             }
-        } catch {
-            stopCaptureBackends()
-            pipeWriter?.stop()
-            pipeWriter = nil
-            status = "Spectrum analyzer unavailable: \(error.localizedDescription)"
-            throw error
+            mono[frame] = sum / Float(channelCount)
         }
-    }
-
-    private func startDirectCapture(deviceObjectID: UInt32) throws {
-        let deviceID = AudioDeviceID(deviceObjectID)
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyStreamFormat,
-            mScope: kAudioDevicePropertyScopeInput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var format = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        try check(AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &format), "reading BlackHole device format")
-        guard format.mSampleRate > 0,
-              format.mFormatID == kAudioFormatLinearPCM,
-              format.mFormatFlags & kAudioFormatFlagIsFloat != 0,
-              format.mBitsPerChannel == 32 else {
-            throw AnalyzerError.invalidFormat
-        }
-
-        var ioProcID: AudioDeviceIOProcID?
-        let callback: AudioDeviceIOProc = { _, _, inputData, _, _, _, reference in
-            guard let reference else { return noErr }
-            return Unmanaged<SpectrumAnalyzer>.fromOpaque(reference)
-                .takeUnretainedValue()
-                .captureDirect(inputData)
-        }
-        let reference = Unmanaged.passUnretained(self).toOpaque()
-        try check(AudioDeviceCreateIOProcID(deviceID, callback, reference, &ioProcID), "creating direct BlackHole callback")
-        guard let ioProcID else { throw AnalyzerError.coreAudio("creating direct BlackHole callback", -1) }
-        captureDeviceID = deviceID
-        captureIOProcID = ioProcID
-        directSampleRate = format.mSampleRate
-        do {
-            try check(AudioDeviceStart(deviceID, ioProcID), "starting direct BlackHole callback")
-        } catch {
-            _ = AudioDeviceDestroyIOProcID(deviceID, ioProcID)
-            captureDeviceID = nil
-            captureIOProcID = nil
-            directSampleRate = 0
-            throw error
-        }
-    }
-
-    private func startAUHALCapture(deviceObjectID: UInt32) throws {
-        do {
-            var description = AudioComponentDescription(componentType: kAudioUnitType_Output, componentSubType: kAudioUnitSubType_HALOutput, componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0)
-            guard let component = AudioComponentFindNext(nil, &description) else { throw AnalyzerError.coreAudio("finding AUHAL", -1) }
-            var optionalUnit: AudioUnit?
-            try check(AudioComponentInstanceNew(component, &optionalUnit), "creating AUHAL")
-            guard let unit = optionalUnit else { throw AnalyzerError.coreAudio("creating AUHAL", -1) }
-            captureUnit = unit
-
-            var enabled: UInt32 = 1
-            try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enabled, UInt32(MemoryLayout<UInt32>.size)), "enabling input")
-            var disabled: UInt32 = 0
-            try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disabled, UInt32(MemoryLayout<UInt32>.size)), "disabling output")
-            var deviceID = AudioDeviceID(deviceObjectID)
-            try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &deviceID, UInt32(MemoryLayout<AudioDeviceID>.size)), "selecting BlackHole")
-
-            // Bus 1 input scope is the hardware-facing format. Bus 1 output
-            // scope is the client-facing format supplied by AudioUnitRender.
-            var hardwareFormat = AudioStreamBasicDescription()
-            var formatSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-            try check(AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &hardwareFormat, &formatSize), "reading BlackHole hardware format")
-            guard hardwareFormat.mSampleRate > 0, hardwareFormat.mChannelsPerFrame > 0 else { throw AnalyzerError.invalidFormat }
-            var clientFormat = AudioStreamBasicDescription(mSampleRate: hardwareFormat.mSampleRate, mFormatID: kAudioFormatLinearPCM, mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved | kAudioFormatFlagsNativeEndian, mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: min(2, hardwareFormat.mChannelsPerFrame), mBitsPerChannel: 32, mReserved: 0)
-            try check(AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &clientFormat, formatSize), "setting analyzer client format")
-            guard let format = AVAudioFormat(streamDescription: &clientFormat) else { throw AnalyzerError.invalidFormat }
-            captureFormat = format
-
-            var callback = AURenderCallbackStruct(inputProc: { reference, flags, timestamp, _, frameCount, _ in
-                Unmanaged<SpectrumAnalyzer>.fromOpaque(reference).takeUnretainedValue().capture(flags: flags, timestamp: timestamp, frameCount: frameCount)
-            }, inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
-            try check(AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &callback, UInt32(MemoryLayout<AURenderCallbackStruct>.size)), "installing input callback")
-            try check(AudioUnitInitialize(unit), "initializing analyzer")
-            try check(AudioOutputUnitStart(unit), "starting analyzer")
-        } catch {
-            stopCaptureUnit()
-            throw error
-        }
-    }
-
-    @MainActor
-    private func scheduleCaptureCheck(deviceObjectID: UInt32, retryAUHAL: Bool) {
-        startupCheck?.cancel()
-        startupCheck = Task { [weak self] in
-            try? await Task.sleep(for: retryAUHAL ? .milliseconds(1200) : .seconds(3))
-            guard !Task.isCancelled, let self, !self.hasReceivedBuffer() else { return }
-            if retryAUHAL {
-                self.status = "Direct BlackHole capture did not deliver; retrying with AUHAL…"
-                self.stopDirectCapture()
-                do {
-                    try self.startAUHALCapture(deviceObjectID: deviceObjectID)
-                    self.status = "AUHAL fallback started at \(Int(self.captureFormat?.sampleRate ?? 0)) Hz; waiting for audio buffers…"
-                } catch {
-                    self.status = "Both BlackHole capture methods failed: \(error.localizedDescription)"
-                    return
-                }
-                try? await Task.sleep(for: .seconds(3))
-                guard !Task.isCancelled, !self.hasReceivedBuffer() else { return }
-            }
-            self.status = "BlackHole is not delivering audio buffers. Restart macOS after installing BlackHole, then run Validate Setup."
-        }
+        accept(mono: mono, interleaved: interleaved, sampleRate: sampleRate)
     }
 
     @MainActor
     func stop() {
-        startupCheck?.cancel()
-        startupCheck = nil
-        stopCaptureBackends()
         pipeWriter?.stop()
         pipeWriter = nil
         points = []
@@ -214,127 +64,17 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
         status = "Analyzer idle"
     }
 
-    func setInputCompensation(decibels: Double) {
-        sampleLock.lock()
-        inputCompensation = Float(min(1_000, max(1, pow(10, decibels / 20))))
-        sampleLock.unlock()
-    }
-
-    private func capture(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>, timestamp: UnsafePointer<AudioTimeStamp>, frameCount: UInt32) -> OSStatus {
-        guard let unit = captureUnit, let format = captureFormat, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return noErr }
-        buffer.frameLength = frameCount
-        let result = AudioUnitRender(unit, flags, timestamp, 1, frameCount, buffer.mutableAudioBufferList)
-        if result == noErr { append(buffer: buffer) }
-        return result
-    }
-
-    private func captureDirect(_ inputData: UnsafePointer<AudioBufferList>) -> OSStatus {
-        let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputData))
-        guard !buffers.isEmpty else { return noErr }
-
-        let first = buffers[0]
-        let firstChannels = max(1, Int(first.mNumberChannels))
-        let firstSampleCount = Int(first.mDataByteSize) / MemoryLayout<Float>.size
-        let frameCount = firstSampleCount / firstChannels
-        guard frameCount > 0, let firstData = first.mData?.assumingMemoryBound(to: Float.self) else { return noErr }
-
-        var mono = [Float](repeating: 0, count: frameCount)
-        var interleaved = [Float](repeating: 0, count: frameCount * 2)
-        if buffers.count == 1, firstChannels >= 2 {
-            for frame in 0..<frameCount {
-                let left = firstData[frame * firstChannels]
-                let right = firstData[frame * firstChannels + 1]
-                mono[frame] = (left + right) * 0.5
-                interleaved[frame * 2] = left
-                interleaved[frame * 2 + 1] = right
-            }
-        } else {
-            let rightData = buffers.count > 1
-                ? buffers[1].mData?.assumingMemoryBound(to: Float.self)
-                : nil
-            for frame in 0..<frameCount {
-                let left = firstData[frame * firstChannels]
-                let right = rightData?[frame] ?? left
-                mono[frame] = (left + right) * 0.5
-                interleaved[frame * 2] = left
-                interleaved[frame * 2 + 1] = right
-            }
-        }
-        accept(mono: mono, interleaved: interleaved, sampleRate: directSampleRate)
-        return noErr
-    }
-
-    private func stopCaptureBackends() {
-        stopDirectCapture()
-        stopCaptureUnit()
-    }
-
-    private func stopDirectCapture() {
-        if let deviceID = captureDeviceID, let ioProcID = captureIOProcID {
-            AudioDeviceStop(deviceID, ioProcID)
-            AudioDeviceDestroyIOProcID(deviceID, ioProcID)
-        }
-        captureDeviceID = nil
-        captureIOProcID = nil
-        directSampleRate = 0
-    }
-
-    private func stopCaptureUnit() {
-        guard let unit = captureUnit else { return }
-        AudioOutputUnitStop(unit)
-        AudioUnitUninitialize(unit)
-        AudioComponentInstanceDispose(unit)
-        captureUnit = nil
-        captureFormat = nil
-    }
-
-    private func check(_ result: OSStatus, _ operation: String) throws {
-        guard result == noErr else { throw AnalyzerError.coreAudio(operation, result) }
-    }
-
-    private func append(buffer: AVAudioPCMBuffer) {
-        guard let channels = buffer.floatChannelData else { return }
-        let frameCount = Int(buffer.frameLength)
-        guard frameCount > 0 else { return }
-        var mono = [Float](repeating: 0, count: frameCount)
-        let channelCount = max(1, min(Int(buffer.format.channelCount), 2))
-        for channelIndex in 0..<channelCount {
-            vDSP_vadd(mono, 1, channels[channelIndex], 1, &mono, 1, vDSP_Length(frameCount))
-        }
-        var divisor = Float(channelCount)
-        vDSP_vsdiv(mono, 1, &divisor, &mono, 1, vDSP_Length(frameCount))
-
-        // CamillaDSP's Stdin backend expects interleaved raw PCM. Feed it the
-        // exact same frames used for the FFT so visualization and EQ cannot
-        // diverge or compete for BlackHole.
-        var interleaved = [Float](repeating: 0, count: frameCount * 2)
-        let left = channels[0]
-        let right = channels[channelCount > 1 ? 1 : 0]
-        for frame in 0..<frameCount {
-            interleaved[frame * 2] = left[frame]
-            interleaved[frame * 2 + 1] = right[frame]
-        }
-        accept(mono: mono, interleaved: interleaved, sampleRate: buffer.format.sampleRate)
-    }
-
     private func accept(mono: [Float], interleaved: [Float], sampleRate: Double) {
         if markFirstBufferReceived() {
-            Task { @MainActor [weak self] in self?.status = "Live FFT from BlackHole" }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.status = "Live FFT from \(self.sourceName)"
+            }
         }
-        sampleLock.lock()
-        let compensation = inputCompensation
-        sampleLock.unlock()
-        var compensatedMono = mono
-        var compensatedInterleaved = interleaved
-        if compensation != 1 {
-            var factor = compensation
-            vDSP_vsmul(compensatedMono, 1, &factor, &compensatedMono, 1, vDSP_Length(compensatedMono.count))
-            vDSP_vsmul(compensatedInterleaved, 1, &factor, &compensatedInterleaved, 1, vDSP_Length(compensatedInterleaved.count))
-        }
-        compensatedInterleaved.withUnsafeBytes { bytes in pipeWriter?.enqueue(Data(bytes)) }
+        interleaved.withUnsafeBytes { bytes in pipeWriter?.enqueue(Data(bytes)) }
 
         sampleLock.lock()
-        pendingSamples.append(contentsOf: compensatedMono)
+        pendingSamples.append(contentsOf: mono)
         guard pendingSamples.count >= fftSize else {
             sampleLock.unlock()
             return
@@ -458,24 +198,6 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
         sampleLock.unlock()
     }
 
-    private func hasReceivedBuffer() -> Bool {
-        sampleLock.lock()
-        defer { sampleLock.unlock() }
-        return receivedBuffer
-    }
-
-    private enum AnalyzerError: LocalizedError {
-        case permissionDenied
-        case invalidFormat
-        case coreAudio(String, OSStatus)
-        var errorDescription: String? {
-            switch self {
-            case .permissionDenied: return "Audio Input permission is required to receive BlackHole audio."
-            case .invalidFormat: return "BlackHole returned an invalid hardware format."
-            case .coreAudio(let operation, let status): return "CoreAudio failed while \(operation) (\(status))."
-            }
-        }
-    }
 }
 
 private final class AudioPipeWriter: @unchecked Sendable {

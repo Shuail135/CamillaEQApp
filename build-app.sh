@@ -26,6 +26,7 @@ SOURCES=(Sources/CamillaEQApp/*.swift)
 ICON_SOURCE="Sources/CamillaEQApp/icon.png"
 MIN_MACOS="13.0"
 RESOURCE_BUNDLE=""
+BUNDLED_DRIVER="$PWD/build/driver/SystemAudioBridge.driver"
 
 mkdir -p "$DIST"
 
@@ -47,6 +48,7 @@ if [[ "$DEV_DIR" == "/Library/Developer/CommandLineTools"* ]]; then
 
     SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
     SWIFTC="$(/usr/bin/xcrun --find swiftc)"
+    CLANG="$(/usr/bin/xcrun --find clang)"
     ARCH="$(/usr/bin/uname -m)"
 
     case "$ARCH" in
@@ -58,19 +60,33 @@ if [[ "$DEV_DIR" == "/Library/Developer/CommandLineTools"* ]]; then
     esac
 
     TARGET="${ARCH}-apple-macosx${MIN_MACOS}"
+    TRANSPORT_INCLUDE="Sources/SystemAudioBridgeC/include"
+    TRANSPORT_OBJECT="$DIST/SystemAudioBridgeClient.o"
+
+    "$CLANG" \
+        -std=gnu11 \
+        -O2 \
+        -isysroot "$SDK" \
+        -mmacosx-version-min="$MIN_MACOS" \
+        -I "$TRANSPORT_INCLUDE" \
+        -c Sources/SystemAudioBridgeC/SystemAudioBridgeClient.c \
+        -o "$TRANSPORT_OBJECT"
 
     "$SWIFTC" \
         -O \
         -parse-as-library \
         -sdk "$SDK" \
         -target "$TARGET" \
+        -module-cache-path "$DIST/ModuleCache" \
+        -I "$TRANSPORT_INCLUDE" \
         "${SOURCES[@]}" \
+        "$TRANSPORT_OBJECT" \
         -framework SwiftUI \
         -framework AppKit \
-        -framework AVFoundation \
         -framework Accelerate \
         -framework AudioToolbox \
         -framework CoreAudio \
+        -framework CoreImage \
         -framework UniformTypeIdentifiers \
         -framework UserNotifications \
         -framework ServiceManagement \
@@ -85,11 +101,15 @@ else
     RESOURCE_BUNDLE="$BIN_DIR/${APP_NAME}_${APP_NAME}.bundle"
 fi
 
+echo "Building bundled System Audio Bridge driver…"
+SABR_CHANNELS=2 SABR_MIN_MACOS="$MIN_MACOS" Drivers/SystemAudioBridge/build-driver.sh
+
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Drivers"
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 cp "$ICON_SOURCE" "$APP/Contents/Resources/icon.png"
 cp LICENSE THIRD_PARTY.md "$APP/Contents/Resources/"
+/usr/bin/ditto "$BUNDLED_DRIVER" "$APP/Contents/Resources/Drivers/SystemAudioBridge.driver"
 if [[ -n "$RESOURCE_BUNDLE" && -d "$RESOURCE_BUNDLE" ]]; then
     cp -R "$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
 fi
@@ -97,26 +117,30 @@ chmod +x "$APP/Contents/MacOS/$APP_NAME"
 
 # Build the standard macOS iconset, including every Retina representation.
 ICONSET="$DIST/AppIcon.iconset"
-rm -rf "$ICONSET"
-mkdir -p "$ICONSET"
-make_icon() {
-    local pixels="$1"
-    local filename="$2"
-    /usr/bin/sips -z "$pixels" "$pixels" "$ICON_SOURCE" \
-        --out "$ICONSET/$filename" >/dev/null
-}
-make_icon 16 icon_16x16.png
-make_icon 32 icon_16x16@2x.png
-make_icon 32 icon_32x32.png
-make_icon 64 icon_32x32@2x.png
-make_icon 128 icon_128x128.png
-make_icon 256 icon_128x128@2x.png
-make_icon 256 icon_256x256.png
-make_icon 512 icon_256x256@2x.png
-make_icon 512 icon_512x512.png
-make_icon 1024 icon_512x512@2x.png
-/usr/bin/iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
-rm -rf "$ICONSET"
+ICON_CACHE="$DIST/AppIcon.icns"
+if [[ ! -s "$ICON_CACHE" || "$ICON_SOURCE" -nt "$ICON_CACHE" ]]; then
+    rm -rf "$ICONSET"
+    mkdir -p "$ICONSET"
+    make_icon() {
+        local pixels="$1"
+        local filename="$2"
+        /usr/bin/sips -z "$pixels" "$pixels" "$ICON_SOURCE" \
+            --out "$ICONSET/$filename" >/dev/null
+    }
+    make_icon 16 icon_16x16.png
+    make_icon 32 icon_16x16@2x.png
+    make_icon 32 icon_32x32.png
+    make_icon 64 icon_32x32@2x.png
+    make_icon 128 icon_128x128.png
+    make_icon 256 icon_128x128@2x.png
+    make_icon 256 icon_256x256.png
+    make_icon 512 icon_256x256@2x.png
+    make_icon 512 icon_512x512.png
+    make_icon 1024 icon_512x512@2x.png
+    /usr/bin/iconutil -c icns "$ICONSET" -o "$ICON_CACHE"
+    rm -rf "$ICONSET"
+fi
+cp "$ICON_CACHE" "$APP/Contents/Resources/AppIcon.icns"
 if [[ ! -s "$APP/Contents/Resources/AppIcon.icns" ]]; then
     echo "ERROR: Failed to build AppIcon.icns."
     exit 1
@@ -137,7 +161,6 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>NSHumanReadableCopyright</key><string>Copyright © 2026 CamillaEQApp contributors. Licensed under GPL-3.0-only.</string>
   <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
-  <key>NSMicrophoneUsageDescription</key><string>CamillaEQApp uses audio-input access to receive system audio from the BlackHole virtual device and display the live frequency spectrum.</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST

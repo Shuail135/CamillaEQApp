@@ -5,7 +5,12 @@ struct AudioDeviceInfo: Identifiable, Hashable {
     let objectID: UInt32
     let name: String
 
-    static let blackHoleName = "BlackHole 2ch"
+    static let systemAudioBridgeName = "System Audio Bridge"
+    static let systemAudioBridgeUID = "local.systemaudiobridge.device"
+
+    var isRoutingDevice: Bool {
+        id == Self.systemAudioBridgeUID || ProfileRoutingDescriptor.profileID(from: id) != nil
+    }
 }
 
 struct DeviceProfile: Identifiable, Codable, Hashable {
@@ -14,8 +19,7 @@ struct DeviceProfile: Identifiable, Codable, Hashable {
     var outputDeviceUID: String
     var outputDeviceName: String
     var autoActivate: Bool = false
-    // Optional keeps profiles written by earlier app versions decodable.
-    var autoActivateWhenBlackHoleSelected: Bool? = true
+    var autoActivateWhenProfileDeviceSelected: Bool = false
     var lockOutputVolume: Bool = false
     var outputVolumeScalar: Double = 0.0625
     var sampleRate: Int = 48_000
@@ -31,6 +35,86 @@ Filter 6: ON PK Fc 2643 Hz Gain 0.0 dB Q 1.00
 Filter 7: ON PK Fc 6423 Hz Gain 0.0 dB Q 1.00
 Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
 """
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        outputDeviceUID: String,
+        outputDeviceName: String,
+        autoActivate: Bool = false,
+        autoActivateWhenProfileDeviceSelected: Bool = false,
+        lockOutputVolume: Bool = false,
+        outputVolumeScalar: Double = 0.0625,
+        sampleRate: Int = 48_000,
+        chunkSize: Int = 1024,
+        equalizerAPOText: String = DeviceProfile.defaultEqualizerAPOText
+    ) {
+        self.id = id
+        self.name = name
+        self.outputDeviceUID = outputDeviceUID
+        self.outputDeviceName = outputDeviceName
+        self.autoActivate = autoActivate
+        self.autoActivateWhenProfileDeviceSelected = autoActivateWhenProfileDeviceSelected
+        self.lockOutputVolume = lockOutputVolume
+        self.outputVolumeScalar = outputVolumeScalar
+        self.sampleRate = sampleRate
+        self.chunkSize = chunkSize
+        self.equalizerAPOText = equalizerAPOText
+    }
+
+    private static let defaultEqualizerAPOText = """
+Preamp: 0.0 dB
+Filter 1: ON LS Fc 31 Hz Gain 0.0 dB Q 1.00
+Filter 2: ON PK Fc 76 Hz Gain 0.0 dB Q 1.00
+Filter 3: ON PK Fc 184 Hz Gain 0.0 dB Q 1.00
+Filter 4: ON PK Fc 447 Hz Gain 0.0 dB Q 1.00
+Filter 5: ON PK Fc 1087 Hz Gain 0.0 dB Q 1.00
+Filter 6: ON PK Fc 2643 Hz Gain 0.0 dB Q 1.00
+Filter 7: ON PK Fc 6423 Hz Gain 0.0 dB Q 1.00
+Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
+"""
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, outputDeviceUID, outputDeviceName, autoActivate
+        case autoActivateWhenProfileDeviceSelected
+        case lockOutputVolume, outputVolumeScalar, sampleRate, chunkSize, equalizerAPOText
+    }
+
+    private enum LegacyCodingKeys: String, CodingKey {
+        case autoActivateWhenSystemAudioBridgeSelected
+        case autoActivateWhenBlackHoleSelected
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        id = try values.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try values.decode(String.self, forKey: .name)
+        outputDeviceUID = try values.decode(String.self, forKey: .outputDeviceUID)
+        outputDeviceName = try values.decode(String.self, forKey: .outputDeviceName)
+        autoActivate = try values.decodeIfPresent(Bool.self, forKey: .autoActivate) ?? false
+        autoActivateWhenProfileDeviceSelected = try values.decodeIfPresent(
+            Bool.self,
+            forKey: .autoActivateWhenProfileDeviceSelected
+        ) ?? legacy.decodeIfPresent(
+            Bool.self,
+            forKey: .autoActivateWhenSystemAudioBridgeSelected
+        ) ?? legacy.decodeIfPresent(Bool.self, forKey: .autoActivateWhenBlackHoleSelected) ?? false
+        lockOutputVolume = try values.decodeIfPresent(Bool.self, forKey: .lockOutputVolume) ?? false
+        outputVolumeScalar = try values.decodeIfPresent(Double.self, forKey: .outputVolumeScalar) ?? 0.0625
+        sampleRate = try values.decodeIfPresent(Int.self, forKey: .sampleRate) ?? 48_000
+        chunkSize = try values.decodeIfPresent(Int.self, forKey: .chunkSize) ?? 1024
+        equalizerAPOText = try values.decodeIfPresent(String.self, forKey: .equalizerAPOText)
+            ?? Self.defaultEqualizerAPOText
+
+        // One-time migration for profiles created when the routing endpoint
+        // was BlackHole. Runtime device discovery no longer recognizes it.
+        if outputDeviceUID.localizedCaseInsensitiveContains("blackhole") ||
+            outputDeviceName.localizedCaseInsensitiveContains("blackhole") {
+            outputDeviceUID = AudioDeviceInfo.systemAudioBridgeUID
+            outputDeviceName = AudioDeviceInfo.systemAudioBridgeName
+        }
+    }
 }
 
 struct EQBand: Identifiable, Hashable {

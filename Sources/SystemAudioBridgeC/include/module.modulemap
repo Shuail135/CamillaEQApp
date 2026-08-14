@@ -1,0 +1,5 @@
+module SystemAudioBridgeC {
+    header "SystemAudioBridgeClient.h"
+    export *
+    link framework "CoreAudio"
+}
