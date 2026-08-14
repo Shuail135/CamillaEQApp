@@ -29,7 +29,7 @@ jobs:
       - name: Verify bundle version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaApp.app/Contents/Info.plist)"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamiTune.app/Contents/Info.plist)"
           if [[ "${GITHUB_REF_NAME}" != "v${bundle_version}" ]]; then
             echo "Tag ${GITHUB_REF_NAME} does not match bundle version v${bundle_version}."
             exit 1
@@ -37,25 +37,33 @@ jobs:
 
       - name: Package application
         run: |
-          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamillaApp.app/Contents/Info.plist)"
-          app_archive="CamillaApp-v${version}-app.zip"
-          build_archive="CamillaApp-v${version}-build-folder.zip"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/CamiTune.app/Contents/Info.plist)"
+          app_archive="CamiTune-v${version}-app.zip"
+          legacy_app_archive="CamillaApp-v${version}-app.zip"
+          build_archive="CamiTune-v${version}-build-folder.zip"
+          legacy_root="$(mktemp -d)"
 
           ditto -c -k --sequesterRsrc --keepParent \
-            dist/CamillaApp.app "${app_archive}"
+            dist/CamiTune.app "${app_archive}"
+          ditto dist/CamiTune.app "${legacy_root}/CamillaApp.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${legacy_root}/CamillaApp.app" "${legacy_app_archive}"
           ditto -c -k --sequesterRsrc --keepParent \
             dist "${build_archive}"
           shasum -a 256 \
             "${app_archive}" \
+            "${legacy_app_archive}" \
             "${build_archive}" > SHA256SUMS
+          rm -rf "${legacy_root}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CamillaApp-macos
+          name: CamiTune-macos
           path: |
+            CamiTune-v*-app.zip
             CamillaApp-v*-app.zip
-            CamillaApp-v*-build-folder.zip
+            CamiTune-v*-build-folder.zip
             SHA256SUMS
           if-no-files-found: error
 
@@ -69,7 +77,7 @@ jobs:
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: CamillaApp-macos
+          name: CamiTune-macos
 
       - name: Publish GitHub release
         env:
@@ -77,9 +85,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
+            CamiTune-v*-app.zip \
             CamillaApp-v*-app.zip \
-            CamillaApp-v*-build-folder.zip \
+            CamiTune-v*-build-folder.zip \
             SHA256SUMS \
             --verify-tag \
             --generate-notes \
-            --title "CamillaApp ${GITHUB_REF_NAME}"
+            --title "CamiTune ${GITHUB_REF_NAME}"

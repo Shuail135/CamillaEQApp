@@ -215,7 +215,7 @@ private final class AudioPipeWriter: @unchecked Sendable {
 
     func start() {
         let thread = Thread { [weak self] in self?.run() }
-        thread.name = "CamillaApp CamillaDSP PCM Writer"
+        thread.name = "CamiTune CamillaDSP PCM Writer"
         thread.qualityOfService = .userInteractive
         worker = thread
         thread.start()

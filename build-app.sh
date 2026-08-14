@@ -2,7 +2,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="CamillaApp"
+APP_NAME="CamiTune"
+SWIFT_EXECUTABLE_NAME="CamiTune"
+SWIFT_TARGET_NAME="CamiTune"
 APP_VERSION="${APP_VERSION:-0.2.1}"
 # GitHub Actions exposes the pushed tag through these variables. A release tag
 # such as v0.1.2 therefore produces an app whose bundle version is 0.1.2
@@ -22,11 +24,11 @@ BUNDLE_ID="local.camilla.app"
 DIST="$PWD/dist"
 APP="$DIST/$APP_NAME.app"
 BIN_OUT="$DIST/$APP_NAME"
-SOURCES=(Sources/CamillaApp/*.swift)
-ICON_SOURCE="Sources/CamillaApp/icon.png"
+SOURCES=(Sources/CamiTune/*.swift)
+ICON_SOURCE="Sources/CamiTune/icon.png"
 MIN_MACOS="13.0"
 RESOURCE_BUNDLE=""
-BUNDLED_DRIVER="$PWD/build/driver/SystemAudioBridge.driver"
+BUNDLED_DRIVER="$PWD/build/driver/CamillaAudio.driver"
 
 mkdir -p "$DIST"
 
@@ -97,8 +99,8 @@ else
     echo "Using Xcode/SwiftPM build path: $DEV_DIR"
     /usr/bin/env swift build -c release
     BIN_DIR="$(/usr/bin/env swift build -c release --show-bin-path)"
-    BIN="$BIN_DIR/$APP_NAME"
-    RESOURCE_BUNDLE="$BIN_DIR/${APP_NAME}_${APP_NAME}.bundle"
+    BIN="$BIN_DIR/$SWIFT_EXECUTABLE_NAME"
+    RESOURCE_BUNDLE="$BIN_DIR/${SWIFT_TARGET_NAME}_${SWIFT_TARGET_NAME}.bundle"
 fi
 
 echo "Building bundled System Audio Bridge driver…"
@@ -109,7 +111,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Drivers"
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 cp "$ICON_SOURCE" "$APP/Contents/Resources/icon.png"
 cp LICENSE THIRD_PARTY.md "$APP/Contents/Resources/"
-/usr/bin/ditto "$BUNDLED_DRIVER" "$APP/Contents/Resources/Drivers/SystemAudioBridge.driver"
+/usr/bin/ditto "$BUNDLED_DRIVER" "$APP/Contents/Resources/Drivers/CamillaAudio.driver"
 if [[ -n "$RESOURCE_BUNDLE" && -d "$RESOURCE_BUNDLE" ]]; then
     cp -R "$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
 fi
@@ -159,7 +161,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
   <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
-  <key>NSHumanReadableCopyright</key><string>Copyright © 2026 CamillaApp contributors. Licensed under GPL-3.0-only.</string>
+  <key>NSHumanReadableCopyright</key><string>Copyright © 2026 CamiTune contributors. Licensed under GPL-3.0-only.</string>
   <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>

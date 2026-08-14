@@ -7,8 +7,8 @@ BUILD_ROOT="${SABR_BUILD_ROOT:-$REPO_ROOT/build/driver}"
 CHANNELS="${SABR_CHANNELS:-2}"
 MIN_MACOS="${SABR_MIN_MACOS:-13.0}"
 DRIVER_VERSION="${SABR_DRIVER_VERSION:-0.1.0}"
-DRIVER="$BUILD_ROOT/SystemAudioBridge.driver"
-BINARY="$DRIVER/Contents/MacOS/SystemAudioBridge"
+DRIVER="$BUILD_ROOT/CamillaAudio.driver"
+BINARY="$DRIVER/Contents/MacOS/CamillaAudio"
 
 if ! [[ "$CHANNELS" =~ '^[0-9]+$' ]] || (( CHANNELS < 2 || CHANNELS > 32 )); then
     print -u2 "SABR_CHANNELS must be an integer from 2 through 32."
@@ -29,7 +29,7 @@ SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
     -isysroot "$SDK" \
     -mmacosx-version-min="$MIN_MACOS" \
     -DkDriver_Name='"System Audio Bridge"' \
-    -DkPlugIn_BundleID='"local.systemaudiobridge.driver"' \
+    -DkPlugIn_BundleID='"local.camillaaudio.driver"' \
     -DkHas_Driver_Name_Format=false \
     -DkDevice_Name='"System Audio Bridge"' \
     -DkManufacturer_Name='"System Audio Bridge contributors"' \

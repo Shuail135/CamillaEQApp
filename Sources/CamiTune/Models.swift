@@ -1,15 +1,27 @@
 import Foundation
+import CoreAudio
 
 struct AudioDeviceInfo: Identifiable, Hashable {
     let id: String          // CoreAudio UID
     let objectID: UInt32
     let name: String
+    let transportType: UInt32
 
     static let systemAudioBridgeName = "System Audio Bridge"
     static let systemAudioBridgeUID = "local.systemaudiobridge.device"
 
+    init(id: String, objectID: UInt32, name: String, transportType: UInt32 = 0) {
+        self.id = id
+        self.objectID = objectID
+        self.name = name
+        self.transportType = transportType
+    }
+
     var isRoutingDevice: Bool {
-        id == Self.systemAudioBridgeUID || ProfileRoutingDescriptor.profileID(from: id) != nil
+        id == Self.systemAudioBridgeUID ||
+            ProfileRoutingDescriptor.isProfileRoutingUID(id) ||
+            transportType == kAudioDeviceTransportTypeAggregate ||
+            transportType == kAudioDeviceTransportTypeVirtual
     }
 }
 
@@ -18,6 +30,7 @@ struct DeviceProfile: Identifiable, Codable, Hashable {
     var name: String
     var outputDeviceUID: String
     var outputDeviceName: String
+    var isEnabled: Bool = true
     var autoActivate: Bool = false
     var autoActivateWhenProfileDeviceSelected: Bool = false
     var lockOutputVolume: Bool = false
@@ -41,6 +54,7 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         name: String,
         outputDeviceUID: String,
         outputDeviceName: String,
+        isEnabled: Bool = true,
         autoActivate: Bool = false,
         autoActivateWhenProfileDeviceSelected: Bool = false,
         lockOutputVolume: Bool = false,
@@ -53,6 +67,7 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         self.name = name
         self.outputDeviceUID = outputDeviceUID
         self.outputDeviceName = outputDeviceName
+        self.isEnabled = isEnabled
         self.autoActivate = autoActivate
         self.autoActivateWhenProfileDeviceSelected = autoActivateWhenProfileDeviceSelected
         self.lockOutputVolume = lockOutputVolume
@@ -75,7 +90,7 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
 """
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, outputDeviceUID, outputDeviceName, autoActivate
+        case id, name, outputDeviceUID, outputDeviceName, isEnabled, autoActivate
         case autoActivateWhenProfileDeviceSelected
         case lockOutputVolume, outputVolumeScalar, sampleRate, chunkSize, equalizerAPOText
     }
@@ -92,6 +107,7 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         name = try values.decode(String.self, forKey: .name)
         outputDeviceUID = try values.decode(String.self, forKey: .outputDeviceUID)
         outputDeviceName = try values.decode(String.self, forKey: .outputDeviceName)
+        isEnabled = try values.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
         autoActivate = try values.decodeIfPresent(Bool.self, forKey: .autoActivate) ?? false
         autoActivateWhenProfileDeviceSelected = try values.decodeIfPresent(
             Bool.self,

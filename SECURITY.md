@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-CamillaApp is currently maintained as a pre-1.0 project. Security fixes are
+CamiTune is currently maintained as a pre-1.0 project. Security fixes are
 provided for the latest release only. Before reporting a problem, please check
 whether it is still present in the newest release or the current default branch.
 
@@ -12,7 +12,7 @@ whether it is still present in the newest release or the current default branch.
 | Current default branch | Yes |
 | Older releases | No |
 
-CamillaApp supports macOS 13 Ventura and newer. Reports that only affect an
+CamiTune supports macOS 13 Ventura and newer. Reports that only affect an
 unsupported macOS version may not receive a fix.
 
 ## Reporting a vulnerability
@@ -21,13 +21,13 @@ Please do not disclose a suspected vulnerability in a public issue, discussion,
 pull request, or social-media post.
 
 Use the repository's [private vulnerability reporting
-form](https://github.com/Shuail135/CamillaApp/security/advisories/new). If the
+form](https://github.com/Shuail135/CamiTune/security/advisories/new). If the
 form is unavailable, open a public issue containing no security-sensitive
 details and ask the maintainer to arrange a private reporting channel.
 
 Include as much of the following as possible:
 
-- The affected CamillaApp version or commit.
+- The affected CamiTune version or commit.
 - Your Mac model, processor architecture, and macOS version.
 - A clear description of the vulnerability and its potential impact.
 - Reproduction steps or a minimal proof of concept.
@@ -56,7 +56,7 @@ complexity, and maintainer availability; they are not guaranteed.
 
 Security reports may cover:
 
-- The CamillaApp application and its local configuration handling.
+- The CamiTune application and its local configuration handling.
 - The bundled System Audio Bridge Core Audio driver and app-driver transport.
 - Dependency download, verification, installation, and privileged setup flows.
 - Audio routing behavior that crosses an expected privacy or security boundary.
@@ -64,7 +64,7 @@ Security reports may cover:
 Ordinary bugs, feature requests, audio-quality problems, and expected macOS
 Gatekeeper warnings for ad-hoc-signed development builds should use the public
 issue tracker. Vulnerabilities in an upstream dependency should also be reported
-to that upstream project; please report them here as well when CamillaApp's
+to that upstream project; please report them here as well when CamiTune's
 integration makes users exploitable.
 
 ## Safe-harbor intent

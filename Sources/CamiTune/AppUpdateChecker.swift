@@ -64,11 +64,11 @@ final class AppUpdateChecker: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .appIsNotWritable:
-                return "CamillaApp cannot replace the copy at its current location. Move it to a folder where your account can install applications, then try again."
+                return "CamiTune cannot replace the copy at its current location. Move it to a folder where your account can install applications, then try again."
             case .downloadFailed:
                 return "The application archive could not be downloaded from GitHub."
             case .archiveMissing:
-                return "The downloaded release does not contain CamillaApp.app."
+                return "The downloaded release does not contain CamiTune.app."
             case .invalidBundle:
                 return "The downloaded application has an unexpected bundle identifier."
             case .invalidVersion:
@@ -80,7 +80,7 @@ final class AppUpdateChecker: ObservableObject {
     }
 
     private static let latestReleaseURL = URL(
-        string: "https://api.github.com/repos/Shuail135/CamillaApp/releases/latest"
+        string: "https://api.github.com/repos/Shuail135/CamiTune/releases/latest"
     )!
     private static let reminderDelay: TimeInterval = 24 * 60 * 60
     private static let bundleIdentifier = "local.camilla.app"
@@ -143,7 +143,7 @@ final class AppUpdateChecker: ObservableObject {
         guard let preparedUpdate else { return }
         let currentAppURL = Bundle.main.bundleURL.standardizedFileURL
         guard currentAppURL.pathExtension == "app",
-              currentAppURL.lastPathComponent == "CamillaApp.app",
+              ["CamiTune.app", "CamillaApp.app"].contains(currentAppURL.lastPathComponent),
               currentAppURL.path != "/" else { return }
 
         let installer = Process()
@@ -172,7 +172,7 @@ final class AppUpdateChecker: ObservableObject {
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
         request.setValue(
-            "CamillaApp/\(Self.currentVersion)",
+            "CamiTune/\(Self.currentVersion)",
             forHTTPHeaderField: "User-Agent"
         )
 
@@ -215,7 +215,7 @@ final class AppUpdateChecker: ObservableObject {
             var request = URLRequest(url: update.archiveURL)
             request.timeoutInterval = 120
             request.setValue(
-                "CamillaApp/\(Self.currentVersion)",
+                "CamiTune/\(Self.currentVersion)",
                 forHTTPHeaderField: "User-Agent"
             )
             let (temporaryArchive, response) = try await session.download(for: request)
@@ -252,15 +252,11 @@ final class AppUpdateChecker: ObservableObject {
         expectedVersion: String
     ) throws -> URL {
         let fileManager = FileManager.default
-        let updateRoot = fileManager.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        )[0]
-            .appendingPathComponent("CamillaApp", isDirectory: true)
+        let updateRoot = CamiTunePaths.supportDirectory
             .appendingPathComponent("PreparedUpdate", isDirectory: true)
         let archiveURL = updateRoot.appendingPathComponent("update.zip")
         let unpackedURL = updateRoot.appendingPathComponent("Unpacked", isDirectory: true)
-        let appURL = unpackedURL.appendingPathComponent("CamillaApp.app", isDirectory: true)
+        let appURL = unpackedURL.appendingPathComponent("CamiTune.app", isDirectory: true)
 
         if fileManager.fileExists(atPath: updateRoot.path) {
             try fileManager.removeItem(at: updateRoot)
@@ -327,7 +323,7 @@ fi
     }
 
     nonisolated static func archiveName(for version: String) -> String {
-        "CamillaApp-\(normalizedTag(version))-app.zip"
+        "CamiTune-\(normalizedTag(version))-app.zip"
     }
 
     nonisolated static func isVersion(_ candidate: String, newerThan current: String) -> Bool {

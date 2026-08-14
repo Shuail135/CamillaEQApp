@@ -18,20 +18,20 @@ final class LoginItemManager: ObservableObject {
         switch SMAppService.mainApp.status {
         case .enabled:
             isEnabled = true
-            statusMessage = "Enabled — CamillaApp will start after you sign in."
+            statusMessage = "Enabled — CamiTune will start after you log in."
         case .requiresApproval:
             isEnabled = true
             requiresApproval = true
             statusMessage = "Approval is required in System Settings → General → Login Items."
         case .notRegistered:
             isEnabled = false
-            statusMessage = "CamillaApp will not start automatically."
+            statusMessage = "Check this if you want CamiTune will start after you log in."
         case .notFound:
             // Ad-hoc release builds can receive this after an older build's
             // registration was removed because each rebuild has a new code
             // hash. The app bundle may still be correctly installed.
             isEnabled = false
-            statusMessage = "CamillaApp will not start automatically."
+            statusMessage = "CamiTune will not start automatically now."
         @unknown default:
             isEnabled = false
             statusMessage = "The login-item status could not be determined."
@@ -43,7 +43,7 @@ final class LoginItemManager: ObservableObject {
         if enabled && !isInApplicationsFolder {
             isEnabled = false
             requiresApproval = false
-            statusMessage = "Move CamillaApp to Applications, reopen it there, then enable login startup."
+            statusMessage = "Move CamiTune to Applications, reopen it there, then enable login startup."
             return
         }
         isUpdating = true
@@ -59,13 +59,13 @@ final class LoginItemManager: ObservableObject {
                 default:
                     isEnabled = true
                     requiresApproval = false
-                    statusMessage = "Enabled — CamillaApp will start after you sign in."
+                    statusMessage = "Enabled — CamiTune will start after you log in."
                 }
             } else {
                 try SMAppService.mainApp.unregister()
                 isEnabled = false
                 requiresApproval = false
-                statusMessage = "CamillaApp will not start automatically."
+                statusMessage = "CamiTune will not start automatically."
             }
         } catch {
             refresh()

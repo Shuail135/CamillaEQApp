@@ -1,5 +1,6 @@
 import XCTest
-@testable import CamillaApp
+import CoreAudio
+@testable import CamiTune
 
 final class DeviceProfileMigrationTests: XCTestCase {
     func testLegacyRoutingProfileMigratesToSystemAudioBridge() throws {
@@ -50,5 +51,36 @@ final class DeviceProfileMigrationTests: XCTestCase {
         let encoded = String(decoding: try JSONEncoder().encode(profile), as: UTF8.self)
         XCTAssertTrue(encoded.contains("autoActivateWhenProfileDeviceSelected"))
         XCTAssertFalse(encoded.contains("autoActivateWhenSystemAudioBridgeSelected"))
+    }
+
+    func testAggregateAndVirtualDevicesAreRejectedAsPlaybackTargets() {
+        let aggregate = AudioDeviceInfo(
+            id: "third-party-aggregate",
+            objectID: 43,
+            name: "Aggregate Device",
+            transportType: kAudioDeviceTransportTypeAggregate
+        )
+        let virtual = AudioDeviceInfo(
+            id: "third-party-virtual",
+            objectID: 44,
+            name: "Virtual Device",
+            transportType: kAudioDeviceTransportTypeVirtual
+        )
+
+        XCTAssertTrue(aggregate.isRoutingDevice)
+        XCTAssertTrue(virtual.isRoutingDevice)
+    }
+
+    func testMissingProfileEnabledValueMigratesToEnabled() throws {
+        let json = """
+        {
+          "name": "Headphones",
+          "outputDeviceUID": "physical-output",
+          "outputDeviceName": "Headphones"
+        }
+        """
+
+        let profile = try JSONDecoder().decode(DeviceProfile.self, from: Data(json.utf8))
+        XCTAssertTrue(profile.isEnabled)
     }
 }

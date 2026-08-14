@@ -5,13 +5,13 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleExecutable</key>
-    <string>SystemAudioBridge</string>
+    <string>CamillaAudio</string>
     <key>CFBundleIdentifier</key>
-    <string>local.systemaudiobridge.driver</string>
+    <string>local.camillaaudio.driver</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>System Audio Bridge</string>
+    <string>Camilla Audio</string>
     <key>CFBundlePackageType</key>
     <string>BNDL</string>
     <key>CFBundleShortVersionString</key>

@@ -25,13 +25,17 @@ final class DependencyManager: ObservableObject {
     }
 
     var supportDirectory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CamillaApp", isDirectory: true)
+        let base = CamiTunePaths.supportDirectory
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         return base
     }
 
     var camillaDSPBinary: URL { supportDirectory.appendingPathComponent("bin/camilladsp") }
+    private var managedDriverURL: URL {
+        supportDirectory
+            .appendingPathComponent("Drivers", isDirectory: true)
+            .appendingPathComponent("CamillaAudio.driver", isDirectory: true)
+    }
 
     private func createSupportLayout() throws {
         for directory in ["bin", "configs", "coeffs", "logs"] {
@@ -112,7 +116,7 @@ final class DependencyManager: ObservableObject {
             let assetURL = URL(string: "https://github.com/HEnquist/camilladsp/releases/latest/download/\(desired)")!
             let archive = try await download(assetURL, filename: desired)
             defer { try? FileManager.default.removeItem(at: archive) }
-            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("CamillaApp-\(UUID().uuidString)")
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent("CamiTune-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: true)
             defer { try? FileManager.default.removeItem(at: temp) }
             try run("/usr/bin/tar", ["-xzf", archive.path, "-C", temp.path])
@@ -140,7 +144,7 @@ final class DependencyManager: ObservableObject {
         audioDriverStatus = .working("Waiting for macOS administrator approval…")
         do {
             guard let bundledDriver = Bundle.main.url(
-                forResource: "SystemAudioBridge",
+                forResource: "CamillaAudio",
                 withExtension: "driver",
                 subdirectory: "Drivers"
             ) else {
@@ -148,17 +152,33 @@ final class DependencyManager: ObservableObject {
             }
             _ = try run("/usr/bin/codesign", ["--verify", "--strict", bundledDriver.path])
 
-            let destination = "/Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver"
+            // Keep CamiTune's own copy of the driver with the rest of its
+            // managed dependencies. macOS loads HAL drivers from /Library, so
+            // the privileged install below remains necessary, but this copy
+            // gives the app a single owned location for future cleanup.
+            try FileManager.default.createDirectory(
+                at: managedDriverURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if FileManager.default.fileExists(atPath: managedDriverURL.path) {
+                try FileManager.default.removeItem(at: managedDriverURL)
+            }
+            try FileManager.default.copyItem(at: bundledDriver, to: managedDriverURL)
+            _ = try run("/usr/bin/codesign", ["--verify", "--strict", managedDriverURL.path])
+
+            coreAudio.destroyAllProfileRoutingDevices()
+            let destination = "/Library/Audio/Plug-Ins/HAL/CamillaAudio.driver"
             let legacyDestinations = [
                 "/Library/Audio/Plug-Ins/HAL/CamillaEQAudio.driver",
-                "/Library/Audio/Plug-Ins/HAL/CamillaAudioBridge.driver"
+                "/Library/Audio/Plug-Ins/HAL/CamillaAudioBridge.driver",
+                "/Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver"
             ]
             let removalTargets = ([destination] + legacyDestinations)
                 .map(shellQuote)
                 .joined(separator: " ")
             let command = [
                 "/bin/rm -rf \(removalTargets)",
-                "/usr/bin/ditto \(shellQuote(bundledDriver.path)) \(shellQuote(destination))",
+                "/usr/bin/ditto \(shellQuote(managedDriverURL.path)) \(shellQuote(destination))",
                 "/usr/sbin/chown -R root:wheel \(shellQuote(destination))",
                 "/bin/chmod -R go-w \(shellQuote(destination))",
                 "(/usr/bin/xattr -dr com.apple.quarantine \(shellQuote(destination)) || true)",
@@ -187,7 +207,7 @@ final class DependencyManager: ObservableObject {
 
     func installEverything() async {
         setupInProgress = true
-        setupMessage = "Setting up CamillaApp dependencies…"
+        setupMessage = "Setting up CamiTune dependencies…"
         if case .installed = camillaDSPStatus {} else { await installCamillaDSP() }
         if case .installed = audioDriverStatus {} else { await installAudioDriver() }
         setupInProgress = false
@@ -221,7 +241,7 @@ final class DependencyManager: ObservableObject {
 
     private func download(_ url: URL, filename: String) async throws -> URL {
         var request = URLRequest(url: url)
-        request.setValue("CamillaApp", forHTTPHeaderField: "User-Agent")
+        request.setValue("CamiTune", forHTTPHeaderField: "User-Agent")
         let (temporary, response) = try await URLSession.shared.download(for: request)
         try validate(response: response, source: url)
         let target = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)-\(filename)")
@@ -279,7 +299,7 @@ final class DependencyManager: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .binaryMissing: return "CamillaDSP archive did not contain the camilladsp executable."
-            case .bundledDriverMissing: return "This app bundle does not contain SystemAudioBridge.driver. Reinstall CamillaApp."
+            case .bundledDriverMissing: return "This app bundle does not contain CamillaAudio.driver. Reinstall CamiTune."
             case .unsupportedArchitecture(let arch): return "This Mac architecture is not supported: \(arch)."
             case .invalidResponse(let host): return "The download server returned an invalid response (\(host))."
             case .httpFailure(let status, let host): return "The download failed with HTTP \(status) from \(host). Check the internet connection and try again."

@@ -13,8 +13,7 @@ final class ProfileStore: ObservableObject {
     private var isLoading = true
 
     init() {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CamillaApp", isDirectory: true)
+        let base = CamiTunePaths.supportDirectory
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
         self.url = base.appendingPathComponent("profiles.json")
         load()
@@ -36,11 +35,13 @@ final class ProfileStore: ObservableObject {
     }
 
     func addProfile(for device: AudioDeviceInfo) {
+        guard !device.isRoutingDevice else { return }
         let baseName = device.name
         let profile = DeviceProfile(
             name: baseName,
             outputDeviceUID: device.id,
-            outputDeviceName: device.name
+            outputDeviceName: device.name,
+            autoActivate: true
         )
         profiles.append(profile)
         selectedProfileID = profile.id
@@ -54,7 +55,13 @@ final class ProfileStore: ObservableObject {
         setAutoActivation(profileID: profileID, enabled: enabled, whenRoutingDeviceSelected: true)
     }
 
+    func setProfileEnabled(profileID: UUID, enabled: Bool) {
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
+        profiles[index].isEnabled = enabled
+    }
+
     func setOutputDevice(profileID: UUID, device: AudioDeviceInfo) {
+        guard !device.isRoutingDevice else { return }
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
         var updated = profiles
         updated[index].outputDeviceUID = device.id
@@ -118,7 +125,10 @@ final class ProfileStore: ObservableObject {
         guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
         var updated = profiles
         if enabled {
-            if !whenRoutingDeviceSelected {
+            if whenRoutingDeviceSelected {
+                updated[index].autoActivate = false
+            } else {
+                updated[index].autoActivateWhenProfileDeviceSelected = false
                 let outputUID = updated[index].outputDeviceUID
                 disableAutoActivation(in: &updated, outputUID: outputUID, excluding: profileID)
             }
@@ -142,6 +152,12 @@ final class ProfileStore: ObservableObject {
         var result = profiles
         var claimedOutputUIDs = Set<String>()
         for index in result.indices {
+            // The two activation modes describe conflicting behavior for the
+            // original physical output. Preserve the first mode if legacy
+            // data somehow has both enabled.
+            if result[index].autoActivate && result[index].autoActivateWhenProfileDeviceSelected {
+                result[index].autoActivateWhenProfileDeviceSelected = false
+            }
             guard result[index].autoActivate else { continue }
             if !claimedOutputUIDs.insert(result[index].outputDeviceUID).inserted {
                 result[index].autoActivate = false

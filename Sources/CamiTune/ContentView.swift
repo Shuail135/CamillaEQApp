@@ -52,9 +52,7 @@ struct ContentView: View {
                         HStack(spacing: 7) {
                             Image(systemName: "speaker.wave.2")
                                 .foregroundStyle(
-                                    state.isActive && state.activeProfileID == profile.id
-                                        ? Color.blue
-                                        : Color.primary
+                                    profile.isEnabled ? Color.blue : Color.primary
                                 )
                             if renameProfileID == profile.id {
                                 TextField("Profile name", text: $renameDraft)
@@ -68,17 +66,17 @@ struct ContentView: View {
                         }
                         .tag(profile.id.uuidString)
                         .contextMenu {
-                            if state.isActive && state.activeProfileID == profile.id {
+                            if profile.isEnabled {
                                 Button {
-                                    Task { await state.deactivate(manual: true) }
+                                    Task { await state.setProfileEnabled(id: profile.id, enabled: false) }
                                 } label: {
-                                    Label("Deactivate EQ", systemImage: "stop.circle")
+                                    Label("Deactivate Profile", systemImage: "stop.circle")
                                 }
                             } else {
                                 Button {
-                                    Task { await state.activate(profile: profile) }
+                                    Task { await state.setProfileEnabled(id: profile.id, enabled: true) }
                                 } label: {
-                                    Label("Activate EQ", systemImage: "play.circle")
+                                    Label("Activate Profile", systemImage: "play.circle")
                                 }
                             }
                             Divider()
@@ -105,7 +103,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("CamillaApp")
+            .navigationTitle("CamiTune")
         } detail: {
             if selection == "setup" {
                 SetupView(state: state)
@@ -137,7 +135,7 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingOutputPicker) {
             AddOutputProfileSheet(
-                devices: coreAudio.outputDevices.filter { !$0.isRoutingDevice },
+                devices: coreAudio.physicalOutputDevices,
                 selectedUID: $pendingOutputUID,
                 onCancel: {
                     showingOutputPicker = false
@@ -146,7 +144,7 @@ struct ContentView: View {
                 onAdd: addSelectedOutput
             )
         }
-        .alert("CamillaApp", isPresented: Binding(
+        .alert("CamiTune", isPresented: Binding(
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
         )) {
@@ -174,7 +172,7 @@ struct ContentView: View {
             .keyboardShortcut(.defaultAction)
         } message: {
             if let update = updateChecker.availableUpdate {
-                Text("CamillaApp \(update.version) is available. You are currently using version \(updateChecker.installedVersion).")
+                Text("CamiTune \(update.version) is available. You are currently using version \(updateChecker.installedVersion).")
             }
         }
         .alert(item: $updateChecker.notice) { notice in
@@ -194,7 +192,7 @@ struct ContentView: View {
                             .controlSize(.large)
                         Text("Downloading Update…")
                             .font(.headline)
-                        Text("CamillaApp will validate the download, then close. Reopen it to use the update.")
+                        Text("CamiTune will validate the download, then close. Reopen it to use the update.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -225,7 +223,7 @@ struct ContentView: View {
 
     private func beginAddingOutput() {
         coreAudio.refresh()
-        let devices = coreAudio.outputDevices.filter { !$0.isRoutingDevice }
+        let devices = coreAudio.physicalOutputDevices
         pendingOutputUID = devices.first(where: { $0.id == coreAudio.defaultOutputUID })?.id
             ?? devices.first?.id
         showingOutputPicker = true
@@ -233,10 +231,13 @@ struct ContentView: View {
 
     private func addSelectedOutput() {
         guard let pendingOutputUID,
-              let device = coreAudio.outputDevices.first(where: {
-                  $0.id == pendingOutputUID && !$0.isRoutingDevice
+              let device = coreAudio.physicalOutputDevices.first(where: {
+                  $0.id == pendingOutputUID
               }) else { return }
         profileStore.addProfile(for: device)
+        if let profileID = profileStore.selectedProfileID {
+            Task { await state.setAutoActivate(id: profileID, enabled: true) }
+        }
         selection = profileStore.selectedProfileID?.uuidString ?? "setup"
         showingOutputPicker = false
         self.pendingOutputUID = nil
@@ -334,14 +335,14 @@ struct SetupView: View {
                 dependencyCard(
                     title: "CamillaDSP",
                     status: dependencies.camillaDSPStatus,
-                    detail: "Installed privately under ~/Library/Application Support/CamillaApp/bin.",
+                    detail: "Installed under ~/Library/Application Support/CamiTune/bin.",
                     action: { Task { await dependencies.installCamillaDSP() } }
                 )
 
                 dependencyCard(
                     title: "System Audio Bridge Driver",
                     status: dependencies.audioDriverStatus,
-                    detail: "Installation asks once for macOS administrator approval.",
+                    detail: "Installed under ~/Library/Application Support/CamiTune/Driver; Installation asks once for macOS administrator approval.",
                     action: { Task { await dependencies.installAudioDriver() } }
                 )
 
@@ -377,7 +378,7 @@ struct SetupView: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 10) {
-                            Toggle("Start CamillaApp when I log in", isOn: Binding(
+                            Toggle("Start CamiTune when I log in", isOn: Binding(
                                 get: { loginItem.isEnabled },
                                 set: { loginItem.setEnabled($0) }
                             ))
@@ -400,7 +401,7 @@ struct SetupView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("First use").font(.title2.bold())
-                    Text("1. Select Install / Repair Everything, then approve the macOS administrator prompt.\n2. Restart the Mac only if Setup says the new audio device is not visible yet.\n3. Add your physical output as a profile from the sidebar.\n4. Adjust the visual equalizer, or import Equalizer APO text from a file or the clipboard.\n5. Right-click the profile and select Activate EQ, or enable an activation condition.")
+                    Text("1. Select Install / Repair Everything, then approve the macOS administrator prompt.\n2. Restart the Mac only if Setup says the new audio device is not visible yet.\n3. Add your physical output as a profile from the sidebar.\n4. Adjust the visual equalizer, or import Equalizer APO text from a file or the clipboard.\n5. Enable either automatic activation condition for the profile.")
                 }
             }
             .padding(32)
@@ -457,6 +458,8 @@ struct ProfileEditorView: View {
     @ObservedObject var coreAudio: CoreAudioManager
     @Binding var profile: DeviceProfile
     @State private var parsedForGraph = ParsedEQ()
+    @State private var responsePointsForGraph: [EQResponsePoint] = []
+    @State private var filterResponsePointsForGraph: [EQResponsePoint] = []
     @State private var preampDB = 0.0
     @State private var graphicBands: [EQBand] = []
     @State private var showTextImporter = false
@@ -501,21 +504,18 @@ struct ProfileEditorView: View {
                     }
                     Spacer()
                     Toggle("", isOn: Binding(
-                        get: { profileIsActive },
+                        get: { profile.isEnabled },
                         set: { newValue in
-                            Task {
-                                if newValue { await state.activate(profile: profileWithCurrentEQ()) }
-                                else { await state.deactivate(manual: true) }
-                            }
+                            Task { await state.setProfileEnabled(id: profile.id, enabled: newValue) }
                         }
                     ))
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .accessibilityLabel("Activate EQ")
-                    .help("Activate or deactivate EQ for this profile")
+                    .accessibilityLabel("Activate Profile")
+                    .help("Activate or deactivate this profile")
                 }
 
-                Text("Use the switch above, the profile’s right-click menu, or an activation condition below to activate EQ.")
+                Text("The switch activates this profile. Its selected activation conditions decide when the EQ runs.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -530,8 +530,7 @@ struct ProfileEditorView: View {
 
                 LiveSpectrumPanels(
                     spectrum: state.spectrum,
-                    parsedEQ: parsedForGraph,
-                    sampleRate: profile.sampleRate
+                    responsePoints: responsePointsForGraph
                 )
 
                 GroupBox {
@@ -585,20 +584,19 @@ struct ProfileEditorView: View {
                                     (contentWidth - fixedWidth) / CGFloat(max(1, graphicBands.count))
                                 )
 
-                                PersistentHorizontalScrollView(
-                                    contentWidth: contentWidth,
-                                    contentHeight: requiresScrolling ? 386 : 378,
-                                    showsScroller: requiresScrolling
-                                ) {
+                                ScrollView(.horizontal, showsIndicators: requiresScrolling) {
                                     GraphicEqualizerBands(
                                         bands: $graphicBands,
                                         spectrum: state.spectrum,
-                                        sampleRate: Double(profile.sampleRate),
+                                        responsePoints: filterResponsePointsForGraph,
                                         setKind: setKind,
                                         columnWidth: columnWidth
                                     )
                                     .frame(width: contentWidth)
                                     .padding(.bottom, requiresScrolling ? 8 : 0)
+                                }
+                                .transaction { transaction in
+                                    transaction.animation = nil
                                 }
                             }
                             .frame(height: 402)
@@ -628,6 +626,7 @@ struct ProfileEditorView: View {
         .onDisappear {
             commitProfileRename()
             liveApplyTask?.cancel()
+            preserveUnsavedEQDraft()
             removeFocusClearingMonitor()
         }
         .fileImporter(isPresented: $showTextImporter, allowedContentTypes: [.plainText], allowsMultipleSelection: false) { result in
@@ -724,29 +723,34 @@ struct ProfileEditorView: View {
                                 Text("\(profile.outputDeviceName) (Disconnected)")
                                     .tag(profile.outputDeviceUID)
                             }
-                            ForEach(coreAudio.outputDevices.filter { !$0.isRoutingDevice }) { device in
+                            ForEach(coreAudio.physicalOutputDevices) { device in
                                 Text(device.name).tag(device.id)
                             }
                         }.labelsHidden().frame(maxWidth: 320)
                     }
                     Spacer()
-                    Text(profileIsActive ? "ACTIVE" : "BYPASSED")
+                    Text(profileIsActive ? "Activated" : "Not Activated")
                         .font(.caption.bold())
                         .foregroundStyle(profileIsActive ? Color.green : Color.secondary)
                 }
                 Toggle("Activate EQ when \(profile.outputDeviceName) is selected as the macOS audio output", isOn: Binding(
                     get: { profile.autoActivate },
                     set: { enabled in
-                        state.profiles.setAutoActivate(profileID: profile.id, enabled: enabled)
+                        Task { await state.setAutoActivate(id: profile.id, enabled: enabled) }
                     }
                 ))
                 Toggle("Activate EQ when \(profileRoutingName) is selected as the macOS audio output", isOn: Binding(
                     get: { profile.autoActivateWhenProfileDeviceSelected },
                     set: { enabled in
-                        state.profiles.setAutoActivateWhenProfileDeviceSelected(profileID: profile.id, enabled: enabled)
+                        Task {
+                            await state.setAutoActivateWhenProfileDeviceSelected(
+                                id: profile.id,
+                                enabled: enabled
+                            )
+                        }
                     }
                 ))
-                Text("These conditions activate this profile’s EQ; they do not change its physical audio output.")
+                Text("The first condition routes the physical output through CamillaDSP. \n The second keeps the original physical output available for direct audio and activates EQ only when the profile-named output is selected.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 HStack {
@@ -757,6 +761,7 @@ struct ProfileEditorView: View {
                         set: { newRate in
                             guard newRate != profile.sampleRate else { return }
                             profile.sampleRate = newRate
+                            updateGraphResponses()
                             if profileIsActive {
                                 let updatedProfile = profileWithCurrentEQ()
                                 Task { await state.apply(profile: updatedProfile) }
@@ -775,20 +780,25 @@ struct ProfileEditorView: View {
     }
 
     private func loadGraphicEQ() {
-        guard let parsed = try? EqualizerAPOParser().parse(profile.equalizerAPOText) else { return }
+        let draft = state.eqDraft(for: profile.id)
+        let source = draft ?? profile.equalizerAPOText
+        guard let parsed = try? EqualizerAPOParser().parse(source) else { return }
         suppressEQChanges = true
         liveApplyTask?.cancel()
         preampDB = parsed.preampDB
         graphicBands = parsed.bands
         parsedForGraph = parsed
-        eqIsSaved = true
+        updateGraphResponses()
+        eqIsSaved = draft == nil
         DispatchQueue.main.async { suppressEQChanges = false }
     }
 
     private func graphicEQChanged() {
         guard !suppressEQChanges else { return }
         parsedForGraph = ParsedEQ(preampDB: preampDB, bands: graphicBands, warnings: [])
+        updateGraphResponses()
         eqIsSaved = false
+        state.setEQDraft(serializeGraphicEQ(), for: profile.id)
         guard profileIsActive else { return }
         liveApplyTask?.cancel()
         let updatedProfile = profileWithCurrentEQ()
@@ -802,6 +812,7 @@ struct ProfileEditorView: View {
     private func saveGraphicEQ() {
         liveApplyTask?.cancel()
         profile.equalizerAPOText = serializeGraphicEQ()
+        state.clearEQDraft(for: profile.id)
         eqIsSaved = true
         if profileIsActive {
             let updatedProfile = profile
@@ -813,6 +824,11 @@ struct ProfileEditorView: View {
         var updated = profile
         updated.equalizerAPOText = serializeGraphicEQ()
         return updated
+    }
+
+    private func preserveUnsavedEQDraft() {
+        guard !eqIsSaved else { return }
+        state.setEQDraft(serializeGraphicEQ(), for: profile.id)
     }
 
     private func importFromClipboard() {
@@ -831,6 +847,7 @@ struct ProfileEditorView: View {
         preampDB = parsed.preampDB
         graphicBands = parsed.bands
         parsedForGraph = parsed
+        updateGraphResponses()
         eqIsSaved = false
         DispatchQueue.main.async {
             suppressEQChanges = false
@@ -873,6 +890,17 @@ struct ProfileEditorView: View {
             rebuilt[last].kind = .highShelf
         }
         graphicBands = rebuilt
+    }
+
+    private func updateGraphResponses() {
+        let response = EQResponseCalculator().calculate(
+            parsed: parsedForGraph,
+            sampleRate: Double(profile.sampleRate)
+        )
+        responsePointsForGraph = response
+        filterResponsePointsForGraph = response.map {
+            EQResponsePoint(frequency: $0.frequency, gainDB: $0.gainDB - parsedForGraph.preampDB)
+        }
     }
 
     private func distributedFrequencies(count: Int) -> [Double] {
@@ -968,72 +996,9 @@ struct ProfileEditorView: View {
     }
 }
 
-private struct PersistentHorizontalScrollView<Content: View>: NSViewRepresentable {
-    let contentWidth: CGFloat
-    let contentHeight: CGFloat
-    let showsScroller: Bool
-    let content: Content
-
-    init(
-        contentWidth: CGFloat,
-        contentHeight: CGFloat,
-        showsScroller: Bool,
-        @ViewBuilder content: () -> Content
-    ) {
-        self.contentWidth = contentWidth
-        self.contentHeight = contentHeight
-        self.showsScroller = showsScroller
-        self.content = content()
-    }
-
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView(frame: .zero)
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.scrollerStyle = .legacy
-        scrollView.autohidesScrollers = false
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = showsScroller
-
-        let hostingView = NSHostingView(rootView: content)
-        hostingView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
-        scrollView.documentView = hostingView
-        context.coordinator.hostingView = hostingView
-        configureScroller(scrollView)
-        return scrollView
-    }
-
-    func updateNSView(_ scrollView: NSScrollView, context: Context) {
-        context.coordinator.hostingView?.rootView = content
-        context.coordinator.hostingView?.frame.size = CGSize(width: contentWidth, height: contentHeight)
-        scrollView.documentView?.frame.size = CGSize(width: contentWidth, height: contentHeight)
-        configureScroller(scrollView)
-    }
-
-    private func configureScroller(_ scrollView: NSScrollView) {
-        scrollView.scrollerStyle = .legacy
-        scrollView.autohidesScrollers = false
-        scrollView.hasHorizontalScroller = showsScroller
-        scrollView.horizontalScroller?.isHidden = !showsScroller
-        DispatchQueue.main.async {
-            scrollView.scrollerStyle = .legacy
-            scrollView.autohidesScrollers = false
-            scrollView.hasHorizontalScroller = showsScroller
-            scrollView.horizontalScroller?.isHidden = !showsScroller
-        }
-    }
-
-    final class Coordinator {
-        var hostingView: NSHostingView<Content>?
-    }
-}
-
 private struct LiveSpectrumPanels: View {
     @ObservedObject var spectrum: SpectrumAnalyzer
-    let parsedEQ: ParsedEQ
-    let sampleRate: Int
+    let responsePoints: [EQResponsePoint]
 
     var body: some View {
         HStack(alignment: .top, spacing: 16) {
@@ -1075,10 +1040,6 @@ private struct LiveSpectrumPanels: View {
 
     private var inputPoints: [(Double, Double)] {
         spectrum.points.map { ($0.frequency, $0.db) }
-    }
-
-    private var responsePoints: [EQResponsePoint] {
-        EQResponseCalculator().calculate(parsed: parsedEQ, sampleRate: Double(sampleRate))
     }
 
     private var outputPoints: [(Double, Double)] {

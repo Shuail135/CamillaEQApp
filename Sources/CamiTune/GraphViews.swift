@@ -3,7 +3,7 @@ import SwiftUI
 struct GraphicEqualizerBands: View {
     @Binding var bands: [EQBand]
     @ObservedObject var spectrum: SpectrumAnalyzer
-    let sampleRate: Double
+    let responsePoints: [EQResponsePoint]
     let setKind: (EQBand.Kind, inout EQBand) -> Void
     let columnWidth: CGFloat
 
@@ -37,18 +37,42 @@ struct GraphicEqualizerBands: View {
 
     private func audioLevel(at frequency: Double) -> Double {
         guard !spectrum.points.isEmpty else { return -100 }
-        let nearest = spectrum.points.min {
-            abs(log(max($0.frequency, 1) / max(frequency, 1))) < abs(log(max($1.frequency, 1) / max(frequency, 1)))
+        var lower = 0
+        var upper = spectrum.points.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if spectrum.points[middle].frequency < frequency { lower = middle + 1 }
+            else { upper = middle }
         }
-        return nearest?.db ?? -100
+        if lower == 0 { return spectrum.points[0].db }
+        if lower == spectrum.points.count { return spectrum.points[lower - 1].db }
+        let before = spectrum.points[lower - 1]
+        let after = spectrum.points[lower]
+        return logDistance(before.frequency, frequency) <= logDistance(after.frequency, frequency)
+            ? before.db
+            : after.db
     }
 
     private func responseGain(at frequency: Double) -> Double {
-        EQResponseCalculator().gainDB(
-            at: frequency,
-            parsed: ParsedEQ(preampDB: 0, bands: bands, warnings: []),
-            sampleRate: sampleRate
-        )
+        guard !responsePoints.isEmpty else { return 0 }
+        var lower = 0
+        var upper = responsePoints.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if responsePoints[middle].frequency < frequency { lower = middle + 1 }
+            else { upper = middle }
+        }
+        if lower == 0 { return responsePoints[0].gainDB }
+        if lower == responsePoints.count { return responsePoints[lower - 1].gainDB }
+        let before = responsePoints[lower - 1]
+        let after = responsePoints[lower]
+        return logDistance(before.frequency, frequency) <= logDistance(after.frequency, frequency)
+            ? before.gainDB
+            : after.gainDB
+    }
+
+    private func logDistance(_ lhs: Double, _ rhs: Double) -> Double {
+        abs(log(max(lhs, 1) / max(rhs, 1)))
     }
 }
 

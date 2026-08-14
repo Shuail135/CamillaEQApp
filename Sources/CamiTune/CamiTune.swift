@@ -4,12 +4,12 @@ import CoreImage
 import Darwin
 
 @main
-struct CamillaAppMain: App {
-    @NSApplicationDelegateAdaptor(CamillaAppDelegate.self) private var appDelegate
+struct CamiTuneMain: App {
+    @NSApplicationDelegateAdaptor(CamiTuneAppDelegate.self) private var appDelegate
     @StateObject private var state = AppState()
 
     var body: some Scene {
-        WindowGroup("CamillaApp", id: "main") {
+        WindowGroup("CamiTune", id: "main") {
             ContentView(state: state)
         }
         .commands {
@@ -25,7 +25,7 @@ struct CamillaAppMain: App {
         } label: {
             Image(nsImage: state.isActive ? AppIcon.activeMenuBarImage : AppIcon.inactiveMenuBarImage)
                 .renderingMode(.original)
-                .accessibilityLabel(state.isActive ? "CamillaApp, EQ active" : "CamillaApp, EQ inactive")
+                .accessibilityLabel(state.isActive ? "CamiTune, EQ active" : "CamiTune, EQ inactive")
         }
     }
 }
@@ -33,8 +33,9 @@ struct CamillaAppMain: App {
 private enum AppLicense {
     static func show() {
         let alert = NSAlert()
-        alert.messageText = "CamillaApp — GPL-3.0-only"
-        alert.informativeText = "Copyright © 2026 CamillaApp contributors. This program is free software and comes with ABSOLUTELY NO WARRANTY. The complete license and third-party notices are included in the application bundle and source repository."
+        alert.icon = NSApp.applicationIconImage
+        alert.messageText = "CamiTune — GPL-3.0-only"
+        alert.informativeText = "Copyright © 2026 CamiTune contributors. This program is free software and comes with ABSOLUTELY NO WARRANTY. The complete license and third-party notices are included in the application bundle and source repository."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         _ = alert.runModal()
@@ -53,7 +54,7 @@ private enum AppIcon {
            let image = NSImage(contentsOf: url) {
             return image
         }
-        return NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "CamillaApp")
+        return NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "CamiTune")
             ?? NSImage()
     }()
 
@@ -83,22 +84,22 @@ private struct CamillaMenuBarView: View {
     @ObservedObject var state: AppState
 
     var body: some View {
-        Button("Show CamillaApp") {
+        Button("Show CamiTune") {
             NSApp.setActivationPolicy(.regular)
             openWindow(id: "main")
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
-                NSApp.windows.first(where: { $0.title == "CamillaApp" })?.makeKeyAndOrderFront(nil)
+                NSApp.windows.first(where: { $0.title == "CamiTune" })?.makeKeyAndOrderFront(nil)
             }
             Task { await state.updateChecker.checkAfterReminderIfNeeded() }
         }
         Divider()
-        Button("Quit CamillaApp") { NSApp.terminate(nil) }
+        Button("Quit CamiTune") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
     }
 }
 
-final class CamillaAppDelegate: NSObject, NSApplicationDelegate {
+final class CamiTuneAppDelegate: NSObject, NSApplicationDelegate {
     private var closeObserver: NSObjectProtocol?
     private var keyObserver: NSObjectProtocol?
     private var windowDelegateProxies: [ObjectIdentifier: WindowCloseDelegateProxy] = [:]
@@ -107,8 +108,7 @@ final class CamillaAppDelegate: NSObject, NSApplicationDelegate {
     private var rejectedDuplicateInstance = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        let supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CamillaApp", isDirectory: true)
+        let supportDirectory = CamiTunePaths.supportDirectory
         do {
             try FileManager.default.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
             let lockURL = supportDirectory.appendingPathComponent("application.lock")
@@ -140,7 +140,7 @@ final class CamillaAppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] notification in
             guard let window = notification.object as? NSWindow,
-                  window.title == "CamillaApp" else { return }
+                  window.title == "CamiTune" else { return }
             self?.mainWindowDidClose(window)
         }
         keyObserver = NotificationCenter.default.addObserver(
@@ -149,11 +149,11 @@ final class CamillaAppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] notification in
             guard let window = notification.object as? NSWindow,
-                  window.title == "CamillaApp" else { return }
+                  window.title == "CamiTune" else { return }
             NSApp.setActivationPolicy(.regular)
             self?.installCloseDelegate(on: window)
         }
-        for window in NSApp.windows where window.title == "CamillaApp" {
+        for window in NSApp.windows where window.title == "CamiTune" {
             installCloseDelegate(on: window)
         }
     }
@@ -193,7 +193,7 @@ final class CamillaAppDelegate: NSObject, NSApplicationDelegate {
     private func confirmWindowClose() -> Bool {
         guard !UserDefaults.standard.bool(forKey: closeHintKey) else { return true }
         let alert = NSAlert()
-        alert.messageText = "CamillaApp will keep running"
+        alert.messageText = "CamiTune will keep running"
         alert.informativeText = "Closing this window keeps System-wide EQ and audio processing active. Use the menu-bar icon to reopen the app or quit it completely."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "Close Window")

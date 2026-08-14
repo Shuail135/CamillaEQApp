@@ -31,9 +31,9 @@ struct EqualizerAPOParser {
                 continue
             }
 
-            // Device selection belongs to CamillaApp profiles rather than the imported text.
+            // Device selection belongs to CamiTune profiles rather than the imported text.
             if line.lowercased().hasPrefix("device:") {
-                result.warnings.append("Line \(lineNumber): Device: is ignored; choose the macOS output device in the CamillaApp profile.")
+                result.warnings.append("Line \(lineNumber): Device: is ignored; choose the macOS output device in the CamiTune profile.")
                 continue
             }
 

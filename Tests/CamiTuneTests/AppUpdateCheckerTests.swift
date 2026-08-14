@@ -1,5 +1,5 @@
 import XCTest
-@testable import CamillaApp
+@testable import CamiTune
 
 final class AppUpdateCheckerTests: XCTestCase {
     func testDetectsNewerVersion() {
@@ -21,11 +21,11 @@ final class AppUpdateCheckerTests: XCTestCase {
     func testBuildsExpectedReleaseArchiveName() {
         XCTAssertEqual(
             AppUpdateChecker.archiveName(for: "v0.1.2"),
-            "CamillaApp-v0.1.2-app.zip"
+            "CamiTune-v0.1.2-app.zip"
         )
         XCTAssertEqual(
             AppUpdateChecker.archiveName(for: "0.1.2"),
-            "CamillaApp-v0.1.2-app.zip"
+            "CamiTune-v0.1.2-app.zip"
         )
     }
 }

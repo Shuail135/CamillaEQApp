@@ -1,5 +1,5 @@
 import XCTest
-@testable import CamillaApp
+@testable import CamiTune
 
 final class ProfileRoutingDescriptorTests: XCTestCase {
     func testHardwareNameGetsEQSuffix() {
@@ -48,6 +48,35 @@ final class ProfileRoutingDescriptorTests: XCTestCase {
         )
         XCTAssertFalse(profile.autoActivate)
         XCTAssertFalse(profile.autoActivateWhenProfileDeviceSelected)
+        XCTAssertTrue(profile.isEnabled)
+
+    }
+
+    func testDisabledProfileDoesNotPublishForAnActivationCondition() {
+        var profile = DeviceProfile(
+            name: "Gaming",
+            outputDeviceUID: "physical-1",
+            outputDeviceName: "Headphones",
+            isEnabled: false
+        )
+        profile.autoActivateWhenProfileDeviceSelected = true
+        profile.autoActivate = true
+
+        let visible = ProfileRoutingDescriptor.visibleProfileIDs(
+            profiles: [profile],
+            activeProfileID: nil,
+            defaultOutputUID: "physical-1"
+        )
+
+        XCTAssertFalse(visible.contains(profile.id))
+    }
+
+    func testLegacyProfileRoutingUIDIsStillRecognizedForCleanup() {
+        let id = UUID(uuidString: "AAAAAAAA-0000-0000-0000-000000000001")!
+        XCTAssertEqual(
+            ProfileRoutingDescriptor.profileID(from: "local.camillaeq.profile.\(id.uuidString.lowercased())"),
+            id
+        )
     }
 
     func testSeveralSelectedDeviceProfilesCanBeVisibleTogether() {

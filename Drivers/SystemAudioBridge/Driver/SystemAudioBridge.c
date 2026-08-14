@@ -155,7 +155,7 @@ struct ObjectInfo {
 #endif
 
 #ifndef kPlugIn_BundleID
-#define                             kPlugIn_BundleID                    "local.systemaudiobridge.driver"
+#define                             kPlugIn_BundleID                    "local.camillaaudio.driver"
 #endif
 
 #ifndef kPlugIn_Icon
@@ -4264,10 +4264,10 @@ static OSStatus	SystemAudioBridge_SetControlPropertyData(AudioServerPlugInDriver
                         gVolume_Master_Value = theNewVolume;
                         *outNumberPropertiesChanged = 2;
                         outChangedAddresses[0].mSelector = kAudioLevelControlPropertyScalarValue;
-                        outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
+                        outChangedAddresses[0].mScope = (inObjectID == kObjectID_Volume_Output_Master) ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput;
                         outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                         outChangedAddresses[1].mSelector = kAudioLevelControlPropertyDecibelValue;
-                        outChangedAddresses[1].mScope = kAudioObjectPropertyScopeGlobal;
+                        outChangedAddresses[1].mScope = (inObjectID == kObjectID_Volume_Output_Master) ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput;
                         outChangedAddresses[1].mElement = kAudioObjectPropertyElementMain;
                     }
 					pthread_mutex_unlock(&gPlugIn_StateMutex);
@@ -4294,10 +4294,10 @@ static OSStatus	SystemAudioBridge_SetControlPropertyData(AudioServerPlugInDriver
                         gVolume_Master_Value = theNewVolume;
                         *outNumberPropertiesChanged = 2;
                         outChangedAddresses[0].mSelector = kAudioLevelControlPropertyScalarValue;
-                        outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
+                        outChangedAddresses[0].mScope = (inObjectID == kObjectID_Volume_Output_Master) ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput;
                         outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                         outChangedAddresses[1].mSelector = kAudioLevelControlPropertyDecibelValue;
-                        outChangedAddresses[1].mScope = kAudioObjectPropertyScopeGlobal;
+                        outChangedAddresses[1].mScope = (inObjectID == kObjectID_Volume_Output_Master) ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput;
                         outChangedAddresses[1].mElement = kAudioObjectPropertyElementMain;
                     }
 					pthread_mutex_unlock(&gPlugIn_StateMutex);
@@ -4321,7 +4321,7 @@ static OSStatus	SystemAudioBridge_SetControlPropertyData(AudioServerPlugInDriver
                         gMute_Master_Value = *((const UInt32*)inData) != 0;
                         *outNumberPropertiesChanged = 1;
                         outChangedAddresses[0].mSelector = kAudioBooleanControlPropertyValue;
-                        outChangedAddresses[0].mScope = kAudioObjectPropertyScopeGlobal;
+                        outChangedAddresses[0].mScope = (inObjectID == kObjectID_Mute_Output_Master) ? kAudioObjectPropertyScopeOutput : kAudioObjectPropertyScopeInput;
                         outChangedAddresses[0].mElement = kAudioObjectPropertyElementMain;
                     }
 					pthread_mutex_unlock(&gPlugIn_StateMutex);

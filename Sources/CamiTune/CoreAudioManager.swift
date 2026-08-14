@@ -25,8 +25,16 @@ final class CoreAudioManager: ObservableObject {
     deinit { timer?.invalidate() }
 
     func refresh() {
-        outputDevices = enumerateOutputDevices().sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-        defaultOutputUID = defaultOutputDevice().flatMap { deviceUID($0) }
+        let devices = enumerateOutputDevices().sorted {
+            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+        let defaultUID = defaultOutputDevice().flatMap { deviceUID($0) }
+        if outputDevices != devices { outputDevices = devices }
+        if defaultOutputUID != defaultUID { defaultOutputUID = defaultUID }
+    }
+
+    var physicalOutputDevices: [AudioDeviceInfo] {
+        outputDevices.filter { !$0.isRoutingDevice }
     }
 
     var systemAudioBridge: AudioDeviceInfo? {
@@ -39,7 +47,7 @@ final class CoreAudioManager: ObservableObject {
     }
 
     var installedSystemAudioBridgeVersion: String? {
-        let path = "/Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver/Contents/Info.plist"
+        let path = "/Library/Audio/Plug-Ins/HAL/CamillaAudio.driver/Contents/Info.plist"
         guard let dictionary = NSDictionary(contentsOfFile: path) else { return nil }
         return dictionary["CFBundleShortVersionString"] as? String
     }
@@ -170,6 +178,36 @@ final class CoreAudioManager: ObservableObject {
         let status = AudioHardwareDestroyAggregateDevice(device.objectID)
         guard status == noErr || status == kAudioHardwareBadObjectError else {
             throw AudioError.osStatus(status)
+        }
+        refresh()
+    }
+
+    /// Profile-name devices are public Core Audio aggregates so they can be
+    /// selected in Sound Settings. Explicitly destroy every aggregate owned
+    /// by the app at launch and termination so those selectors never outlive
+    /// the app after a normal quit or uninstall.
+    func destroyAllProfileRoutingDevices(fallbackUID: String? = nil) {
+        refresh()
+        var selectors = outputDevices.filter {
+            ProfileRoutingDescriptor.isProfileRoutingUID($0.id)
+        }
+        guard !selectors.isEmpty else { return }
+
+        if let defaultOutputUID,
+           selectors.contains(where: { $0.id == defaultOutputUID }) {
+            let fallback = fallbackUID.flatMap { requested in
+                physicalOutputDevices.first(where: { $0.id == requested })?.id
+            } ?? physicalOutputDevices.first?.id
+            if let fallback { try? setDefaultOutput(uid: fallback) }
+        }
+
+        refresh()
+        selectors = outputDevices.filter {
+            ProfileRoutingDescriptor.isProfileRoutingUID($0.id)
+        }
+        for device in selectors where device.id != defaultOutputUID {
+            let status = AudioHardwareDestroyAggregateDevice(device.objectID)
+            guard status == noErr || status == kAudioHardwareBadObjectError else { continue }
         }
         refresh()
     }
@@ -364,7 +402,12 @@ final class CoreAudioManager: ObservableObject {
 
         return ids.compactMap { id in
             guard hasOutputStreams(id), let uid = deviceUID(id), let name = deviceName(id) else { return nil }
-            return AudioDeviceInfo(id: uid, objectID: id, name: name)
+            return AudioDeviceInfo(
+                id: uid,
+                objectID: id,
+                name: name,
+                transportType: uint32Property(id, selector: kAudioDevicePropertyTransportType) ?? 0
+            )
         }
     }
 
@@ -372,7 +415,12 @@ final class CoreAudioManager: ObservableObject {
         guard let objectID = deviceObjectID(forUID: uid),
               hasOutputStreams(objectID),
               let name = deviceName(objectID) else { return nil }
-        return AudioDeviceInfo(id: uid, objectID: objectID, name: name)
+        return AudioDeviceInfo(
+            id: uid,
+            objectID: objectID,
+            name: name,
+            transportType: uint32Property(objectID, selector: kAudioDevicePropertyTransportType) ?? 0
+        )
     }
 
     private func deviceObjectID(forUID uid: String) -> AudioDeviceID? {
@@ -491,6 +539,21 @@ final class CoreAudioManager: ObservableObject {
         }
         guard status == noErr, let value else { return nil }
         return value.takeUnretainedValue() as String
+    }
+
+    private func uint32Property(_ id: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
+        var address = AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectHasProperty(id, &address) else { return nil }
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value) == noErr else {
+            return nil
+        }
+        return value
     }
 
     enum AudioError: LocalizedError {

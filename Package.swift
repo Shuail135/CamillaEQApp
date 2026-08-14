@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "CamillaApp",
+    name: "CamiTune",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "CamillaApp", targets: ["CamillaApp"])
+        .executable(name: "CamiTune", targets: ["CamiTune"])
     ],
     targets: [
         .target(
@@ -18,16 +18,16 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "CamillaApp",
+            name: "CamiTune",
             dependencies: ["SystemAudioBridgeC"],
-            path: "Sources/CamillaApp",
+            path: "Sources/CamiTune",
             resources: [
                 .copy("icon.png")
             ]
         ),
         .testTarget(
-            name: "CamillaAppTests",
-            dependencies: ["CamillaApp", "SystemAudioBridgeC"]
+            name: "CamiTuneTests",
+            dependencies: ["CamiTune", "SystemAudioBridgeC"]
         )
     ]
 )

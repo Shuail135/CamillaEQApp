@@ -52,7 +52,7 @@ Drivers/SystemAudioBridge/install-driver.sh
 ```
 
 That operation asks for an administrator password, installs only
-`/Library/Audio/Plug-Ins/HAL/SystemAudioBridge.driver`, and reloads Core Audio.
+`/Library/Audio/Plug-Ins/HAL/CamillaAudio.driver`, and reloads Core Audio.
 The corresponding removal script is `uninstall-driver.sh`. Neither operation
 is run as part of a normal build or test.
 

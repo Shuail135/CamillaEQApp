@@ -7,8 +7,8 @@ final class NotificationManager {
         _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
     }
 
-    func activated() { post("CamillaApp activated") }
-    func deactivated() { post("CamillaApp deactivated") }
+    func activated() { post("CamiTune activated") }
+    func deactivated() { post("CamiTune deactivated") }
 
     private func post(_ text: String) {
         let content = UNMutableNotificationContent()

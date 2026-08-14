@@ -2,6 +2,7 @@ import Foundation
 
 struct ProfileRoutingDescriptor: Hashable {
     static let uidPrefix = "local.camilla.profile."
+    private static let legacyUIDPrefixes = ["local.camillaeq.profile."]
 
     let profileID: UUID
     let uid: String
@@ -36,8 +37,14 @@ struct ProfileRoutingDescriptor: Hashable {
     }
 
     static func profileID(from uid: String) -> UUID? {
-        guard uid.hasPrefix(uidPrefix) else { return nil }
-        return UUID(uuidString: String(uid.dropFirst(uidPrefix.count)))
+        for prefix in [uidPrefix] + legacyUIDPrefixes where uid.hasPrefix(prefix) {
+            return UUID(uuidString: String(uid.dropFirst(prefix.count)))
+        }
+        return nil
+    }
+
+    static func isProfileRoutingUID(_ uid: String) -> Bool {
+        ([uidPrefix] + legacyUIDPrefixes).contains { uid.hasPrefix($0) }
     }
 
     static func visibleProfileIDs(
@@ -47,7 +54,7 @@ struct ProfileRoutingDescriptor: Hashable {
         additionallyVisible: Set<UUID> = []
     ) -> Set<UUID> {
         var result = additionallyVisible
-        for profile in profiles {
+        for profile in profiles where profile.isEnabled {
             if profile.autoActivateWhenProfileDeviceSelected ||
                 (profile.autoActivate && defaultOutputUID == profile.outputDeviceUID) {
                 result.insert(profile.id)
@@ -55,7 +62,7 @@ struct ProfileRoutingDescriptor: Hashable {
         }
         if let defaultOutputUID,
            let selectedProfileID = profileID(from: defaultOutputUID),
-           profiles.contains(where: { $0.id == selectedProfileID }) {
+           profiles.contains(where: { $0.id == selectedProfileID && $0.isEnabled }) {
             result.insert(selectedProfileID)
         }
         // The active profile uses the real bridge device so macOS exposes its
