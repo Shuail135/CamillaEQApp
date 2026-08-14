@@ -19,5 +19,3 @@ tmp/
 
 # Local visual preview (not an application resource)
 Sources/CamillaEQApp/tray-icon-preview.png
-
-Tests/
