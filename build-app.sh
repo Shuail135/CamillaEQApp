@@ -18,7 +18,6 @@ fi
 # A changing build number prevents Finder and Login Items from reusing icon
 # metadata cached for an older ad-hoc build with the same public version.
 BUILD_NUMBER="${BUILD_NUMBER:-$(/bin/date -u +%Y%m%d%H%M%S)}"
-BUNDLE_ID="local.camillaeq.app"
 BUNDLE_ID="local.camilla.app"
 DIST="$PWD/dist"
 APP="$DIST/$APP_NAME.app"
