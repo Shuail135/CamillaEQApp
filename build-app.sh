@@ -3,8 +3,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="CamiTune"
-SWIFT_EXECUTABLE_NAME="CamiTune"
-SWIFT_TARGET_NAME="CamiTune"
 APP_VERSION="${APP_VERSION:-0.2.1}"
 # GitHub Actions exposes the pushed tag through these variables. A release tag
 # such as v0.1.2 therefore produces an app whose bundle version is 0.1.2
@@ -27,81 +25,71 @@ BIN_OUT="$DIST/$APP_NAME"
 SOURCES=(Sources/CamiTune/*.swift)
 ICON_SOURCE="Sources/CamiTune/icon.png"
 MIN_MACOS="13.0"
-RESOURCE_BUNDLE=""
 BUNDLED_DRIVER="$PWD/build/driver/CamillaAudio.driver"
 
 mkdir -p "$DIST"
 
 echo "Building $APP_NAME…"
 
-DEV_DIR="$(/usr/bin/xcode-select -p 2>/dev/null || true)"
-
-if [[ -z "$DEV_DIR" ]]; then
-    echo "ERROR: Apple developer tools are not installed."
+# Use this exact direct-compiler build path with both standalone Command Line
+# Tools and full Xcode. This keeps local and GitHub release artifacts identical
+# in structure and avoids a runtime dependency on a SwiftPM resource bundle.
+if ! SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path 2>/dev/null)" ||
+   ! SWIFTC="$(/usr/bin/xcrun --sdk macosx --find swiftc 2>/dev/null)" ||
+   ! CLANG="$(/usr/bin/xcrun --sdk macosx --find clang 2>/dev/null)"; then
+    echo "ERROR: Apple developer tools are not installed or selected."
     echo "Run: xcode-select --install"
     exit 1
 fi
 
-# SwiftPM currently asks xcrun for an Xcode PlatformPath.  The standalone
-# Command Line Tools installation has the macOS SDK but no Xcode .platform
-# directory, so compile this dependency-free app directly with swiftc.
-if [[ "$DEV_DIR" == "/Library/Developer/CommandLineTools"* ]]; then
-    echo "Using standalone Command Line Tools build path."
+ARCH="$(/usr/bin/uname -m)"
+case "$ARCH" in
+    arm64|x86_64) ;;
+    *)
+        echo "ERROR: Unsupported Mac architecture: $ARCH"
+        exit 1
+        ;;
+esac
 
-    SDK="$(/usr/bin/xcrun --sdk macosx --show-sdk-path)"
-    SWIFTC="$(/usr/bin/xcrun --find swiftc)"
-    CLANG="$(/usr/bin/xcrun --find clang)"
-    ARCH="$(/usr/bin/uname -m)"
+TARGET="${ARCH}-apple-macosx${MIN_MACOS}"
+TRANSPORT_INCLUDE="Sources/SystemAudioBridgeC/include"
+TRANSPORT_OBJECT="$DIST/SystemAudioBridgeClient.o"
 
-    case "$ARCH" in
-        arm64|x86_64) ;;
-        *)
-            echo "ERROR: Unsupported Mac architecture: $ARCH"
-            exit 1
-            ;;
-    esac
+echo "Using direct compiler build path."
+echo "Swift compiler: $SWIFTC"
+echo "Target: $TARGET"
 
-    TARGET="${ARCH}-apple-macosx${MIN_MACOS}"
-    TRANSPORT_INCLUDE="Sources/SystemAudioBridgeC/include"
-    TRANSPORT_OBJECT="$DIST/SystemAudioBridgeClient.o"
+"$CLANG" \
+    -std=gnu11 \
+    -O2 \
+    -isysroot "$SDK" \
+    -mmacosx-version-min="$MIN_MACOS" \
+    -I "$TRANSPORT_INCLUDE" \
+    -c Sources/SystemAudioBridgeC/SystemAudioBridgeClient.c \
+    -o "$TRANSPORT_OBJECT"
 
-    "$CLANG" \
-        -std=gnu11 \
-        -O2 \
-        -isysroot "$SDK" \
-        -mmacosx-version-min="$MIN_MACOS" \
-        -I "$TRANSPORT_INCLUDE" \
-        -c Sources/SystemAudioBridgeC/SystemAudioBridgeClient.c \
-        -o "$TRANSPORT_OBJECT"
+"$SWIFTC" \
+    -O \
+    -swift-version 5 \
+    -parse-as-library \
+    -sdk "$SDK" \
+    -target "$TARGET" \
+    -module-cache-path "$DIST/ModuleCache" \
+    -I "$TRANSPORT_INCLUDE" \
+    "${SOURCES[@]}" \
+    "$TRANSPORT_OBJECT" \
+    -framework SwiftUI \
+    -framework AppKit \
+    -framework Accelerate \
+    -framework AudioToolbox \
+    -framework CoreAudio \
+    -framework CoreImage \
+    -framework UniformTypeIdentifiers \
+    -framework UserNotifications \
+    -framework ServiceManagement \
+    -o "$BIN_OUT"
 
-    "$SWIFTC" \
-        -O \
-        -parse-as-library \
-        -sdk "$SDK" \
-        -target "$TARGET" \
-        -module-cache-path "$DIST/ModuleCache" \
-        -I "$TRANSPORT_INCLUDE" \
-        "${SOURCES[@]}" \
-        "$TRANSPORT_OBJECT" \
-        -framework SwiftUI \
-        -framework AppKit \
-        -framework Accelerate \
-        -framework AudioToolbox \
-        -framework CoreAudio \
-        -framework CoreImage \
-        -framework UniformTypeIdentifiers \
-        -framework UserNotifications \
-        -framework ServiceManagement \
-        -o "$BIN_OUT"
-
-    BIN="$BIN_OUT"
-else
-    echo "Using Xcode/SwiftPM build path: $DEV_DIR"
-    /usr/bin/env swift build -c release
-    BIN_DIR="$(/usr/bin/env swift build -c release --show-bin-path)"
-    BIN="$BIN_DIR/$SWIFT_EXECUTABLE_NAME"
-    RESOURCE_BUNDLE="$BIN_DIR/${SWIFT_TARGET_NAME}_${SWIFT_TARGET_NAME}.bundle"
-fi
+BIN="$BIN_OUT"
 
 echo "Building bundled System Audio Bridge driver…"
 SABR_CHANNELS=2 SABR_MIN_MACOS="$MIN_MACOS" Drivers/SystemAudioBridge/build-driver.sh
@@ -112,9 +100,6 @@ cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 cp "$ICON_SOURCE" "$APP/Contents/Resources/icon.png"
 cp LICENSE THIRD_PARTY.md "$APP/Contents/Resources/"
 /usr/bin/ditto "$BUNDLED_DRIVER" "$APP/Contents/Resources/Drivers/CamillaAudio.driver"
-if [[ -n "$RESOURCE_BUNDLE" && -d "$RESOURCE_BUNDLE" ]]; then
-    cp -R "$RESOURCE_BUNDLE" "$APP/Contents/Resources/"
-fi
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
 
 # Build the standard macOS iconset, including every Retina representation.
