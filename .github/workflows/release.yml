@@ -13,7 +13,6 @@ permissions:
 
 jobs:
   build:
-    if: github.ref_type != 'tag'
     runs-on: macos-latest
 
     steps:
@@ -255,6 +254,7 @@ jobs:
 
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
     runs-on: ubuntu-latest
 
     permissions:
@@ -262,59 +262,10 @@ jobs:
       contents: write
 
     steps:
-      - name: Find successful build for tagged commit
-        id: prior-build
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TARGET_SHA: ${{ github.sha }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          artifact_rows="$(
-            gh api --paginate \
-              "repos/${GH_REPO}/actions/artifacts?name=CamiTune-macos&per_page=100" \
-              --jq '.artifacts[] | select(.expired == false) | [.id, .workflow_run.id, .workflow_run.head_sha] | @tsv'
-          )"
-
-          artifact_id=""
-          run_id=""
-
-          while IFS=$'\t' read -r candidate_artifact candidate_run candidate_sha; do
-            [[ -n "${candidate_artifact}" ]] || continue
-            [[ "${candidate_sha}" == "${TARGET_SHA}" ]] || continue
-
-            run_details="$(
-              gh api "repos/${GH_REPO}/actions/runs/${candidate_run}" \
-                --jq '[.conclusion, .event, .head_branch] | @tsv'
-            )"
-            IFS=$'\t' read -r conclusion event head_branch <<< "${run_details}"
-
-            if [[ "${conclusion}" == "success" &&
-                  "${event}" == "push" &&
-                  "${head_branch}" == "main" ]]; then
-              artifact_id="${candidate_artifact}"
-              run_id="${candidate_run}"
-              break
-            fi
-          done <<< "${artifact_rows}"
-
-          if [[ -z "${artifact_id}" || -z "${run_id}" ]]; then
-            echo "::error::No successful main-branch build artifact exists for tagged commit ${TARGET_SHA}."
-            echo "::error::Push the commit to main, wait for its build to pass, then tag that exact commit."
-            exit 1
-          fi
-
-          echo "Reusing artifact ${artifact_id} from workflow run ${run_id}."
-          echo "run_id=${run_id}" >> "${GITHUB_OUTPUT}"
-
-      - name: Download previous build artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RUN_ID: ${{ steps.prior-build.outputs.run_id }}
-        run: gh run download "${RUN_ID}" --repo "${GH_REPO}" --name CamiTune-macos
+      - name: Download tagged build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: CamiTune-macos
 
       - name: Verify release files
         shell: bash
@@ -349,13 +300,12 @@ jobs:
           expected_build="CamiTune-${GITHUB_REF_NAME}-build-folder.zip"
 
           if [[ "${app_archives[0]}" != "${expected_app}" ]]; then
-            echo "::error::Tagged release expects ${expected_app}, but the previous build produced ${app_archives[0]}."
-            echo "::error::Set APP_VERSION to ${GITHUB_REF_NAME#v}, push that change to main, and tag the resulting commit."
+            echo "::error::Tagged build should produce ${expected_app}, but produced ${app_archives[0]}."
             exit 1
           fi
 
           if [[ "${build_archives[0]}" != "${expected_build}" ]]; then
-            echo "::error::Tagged release expects ${expected_build}, but the previous build produced ${build_archives[0]}."
+            echo "::error::Tagged build should produce ${expected_build}, but produced ${build_archives[0]}."
             exit 1
           fi
 
@@ -365,7 +315,7 @@ jobs:
           )"
 
           if [[ -z "${bundle_version}" || "${GITHUB_REF_NAME}" != "v${bundle_version}" ]]; then
-            echo "::error::Tag ${GITHUB_REF_NAME} does not match the reused app bundle version v${bundle_version:-unknown}."
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match the app bundle version v${bundle_version:-unknown}."
             exit 1
           fi
 
