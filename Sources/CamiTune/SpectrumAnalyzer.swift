@@ -2,43 +2,72 @@ import Foundation
 import Accelerate
 
 final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
-    @Published var points: [SpectrumPoint] = []
-    @Published var status: String = "Analyzer idle"
+    @Published private(set) var points: [SpectrumPoint] = []
+    @Published private(set) var status: String = "Analyzer idle"
+    @Published private(set) var activeSession: AudioRuntimeSession?
 
-    private var pipeWriter: AudioPipeWriter?
+    var activeProfileID: UUID? { activeSession?.profileID }
+
     private var fftSetup: FFTSetup?
     private let fftSize = 4096
     private let fftHopSize = 2048
     private let log2n: vDSP_Length = 12
     private var lastPublish = Date.distantPast
+    private var lastPointsPublication = Date.distantPast
     private var smoothedDB: [Double] = []
     private let displayBinCount = 180
-    private let sampleLock = NSLock()
+    private let stateLock = NSLock()
+    private let processingLock = NSLock()
     private var pendingSamples: [Float] = []
     private var receivedBuffer = false
+    private var analysisSessionID: UUID?
     private var sourceName = "System Audio Bridge"
 
     deinit {
-        pipeWriter?.stop()
         if let fftSetup { vDSP_destroy_fftsetup(fftSetup) }
     }
 
     @MainActor
-    func startExternal(audioSink: FileHandle, sourceName: String) {
+    func start(session: AudioRuntimeSession, sourceName: String) {
         stop()
+        stateLock.lock()
+        analysisSessionID = session.id
+        stateLock.unlock()
+        activeSession = session
+        lastPointsPublication = .distantPast
         self.sourceName = sourceName
-        let writer = AudioPipeWriter(handle: audioSink)
-        writer.start()
-        pipeWriter = writer
         if fftSetup == nil { fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) }
         resetReceivedBuffer()
         status = "Waiting for audio from \(sourceName)…"
     }
 
-    func ingestExternal(interleaved: [Float], channelCount: Int, sampleRate: Double) {
+    func ingest(
+        interleaved: [Float],
+        channelCount: Int,
+        sampleRate: Double,
+        session: AudioRuntimeSession
+    ) {
         guard channelCount > 0,
               sampleRate > 0,
               interleaved.count >= channelCount else { return }
+        guard accepts(session: session) else { return }
+        processingLock.lock()
+        defer { processingLock.unlock() }
+        guard accepts(session: session) else { return }
+        analyze(
+            interleaved: interleaved,
+            channelCount: channelCount,
+            sampleRate: sampleRate,
+            session: session
+        )
+    }
+
+    private func analyze(
+        interleaved: [Float],
+        channelCount: Int,
+        sampleRate: Double,
+        session: AudioRuntimeSession
+    ) {
         let frameCount = interleaved.count / channelCount
         var mono = [Float](repeating: 0, count: frameCount)
         for frame in 0..<frameCount {
@@ -48,35 +77,43 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
             }
             mono[frame] = sum / Float(channelCount)
         }
-        accept(mono: mono, interleaved: interleaved, sampleRate: sampleRate)
+        accept(
+            mono: mono,
+            sampleRate: sampleRate,
+            session: session
+        )
     }
 
     @MainActor
     func stop() {
-        pipeWriter?.stop()
-        pipeWriter = nil
+        stateLock.lock()
+        analysisSessionID = nil
+        stateLock.unlock()
+        activeSession = nil
+        lastPointsPublication = .distantPast
         points = []
-        sampleLock.lock()
+        processingLock.lock()
         pendingSamples.removeAll(keepingCapacity: true)
         smoothedDB.removeAll(keepingCapacity: true)
-        receivedBuffer = false
-        sampleLock.unlock()
+        processingLock.unlock()
+        resetReceivedBuffer()
         status = "Analyzer idle"
     }
 
-    private func accept(mono: [Float], interleaved: [Float], sampleRate: Double) {
+    private func accept(
+        mono: [Float],
+        sampleRate: Double,
+        session: AudioRuntimeSession
+    ) {
         if markFirstBufferReceived() {
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                guard let self,
+                      self.activeSession == session else { return }
                 self.status = "Live FFT from \(self.sourceName)"
             }
         }
-        interleaved.withUnsafeBytes { bytes in pipeWriter?.enqueue(Data(bytes)) }
-
-        sampleLock.lock()
         pendingSamples.append(contentsOf: mono)
         guard pendingSamples.count >= fftSize else {
-            sampleLock.unlock()
             return
         }
         let samples = Array(pendingSamples.prefix(fftSize))
@@ -84,11 +121,18 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
         // provides about 23 spectrum frames per second at 48 kHz, making
         // musical changes visible without sacrificing frequency resolution.
         pendingSamples.removeFirst(fftHopSize)
-        sampleLock.unlock()
-        process(samples: samples, sampleRate: sampleRate)
+        process(
+            samples: samples,
+            sampleRate: sampleRate,
+            session: session
+        )
     }
 
-    private func process(samples input: [Float], sampleRate: Double) {
+    private func process(
+        samples input: [Float],
+        sampleRate: Double,
+        session: AudioRuntimeSession
+    ) {
         // Update often enough for continuous motion, while using a slower
         // envelope below so the graph remains useful as an EQ tuning guide.
         // Audio continues to CamillaDSP at full rate.
@@ -177,7 +221,13 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
                     return SpectrumPoint(frequency: frequency, db: db)
                 }
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self, self.activeSession == session else { return }
+                    let now = Date()
+                    guard UIRenderPerformance.allowsSpectrumPublication(
+                        since: self.lastPointsPublication,
+                        now: now
+                    ) else { return }
+                    self.lastPointsPublication = now
                     self.points = mapped
                 }
             }
@@ -185,82 +235,23 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
     }
 
     private func markFirstBufferReceived() -> Bool {
-        sampleLock.lock()
-        defer { sampleLock.unlock() }
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard !receivedBuffer else { return false }
         receivedBuffer = true
         return true
     }
 
     private func resetReceivedBuffer() {
-        sampleLock.lock()
+        stateLock.lock()
         receivedBuffer = false
-        sampleLock.unlock()
+        stateLock.unlock()
     }
 
-}
-
-private final class AudioPipeWriter: @unchecked Sendable {
-    private let handle: FileHandle
-    private let condition = NSCondition()
-    private var buffers: [Data] = []
-    private var queuedBytes = 0
-    private var stopping = false
-    private var worker: Thread?
-    private let maximumQueuedBytes = 4 * 1024 * 1024
-
-    init(handle: FileHandle) {
-        self.handle = handle
+    private func accepts(session: AudioRuntimeSession) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return analysisSessionID == session.id
     }
 
-    func start() {
-        let thread = Thread { [weak self] in self?.run() }
-        thread.name = "CamiTune CamillaDSP PCM Writer"
-        thread.qualityOfService = .userInteractive
-        worker = thread
-        thread.start()
-    }
-
-    func enqueue(_ data: Data) {
-        condition.lock()
-        defer { condition.unlock() }
-        guard !stopping else { return }
-        // Four MiB is over ten seconds at 48 kHz stereo float. Reaching this
-        // means the DSP pipe has stopped; bound memory rather than destabilize
-        // the app. Normal operation keeps this queue near one buffer.
-        guard queuedBytes + data.count <= maximumQueuedBytes else { return }
-        buffers.append(data)
-        queuedBytes += data.count
-        condition.signal()
-    }
-
-    func stop() {
-        condition.lock()
-        stopping = true
-        buffers.removeAll()
-        queuedBytes = 0
-        condition.broadcast()
-        condition.unlock()
-        worker?.cancel()
-        worker = nil
-    }
-
-    private func run() {
-        while !Thread.current.isCancelled {
-            condition.lock()
-            while buffers.isEmpty && !stopping { condition.wait() }
-            if stopping {
-                condition.unlock()
-                return
-            }
-            let data = buffers.removeFirst()
-            queuedBytes -= data.count
-            condition.unlock()
-            do {
-                try handle.write(contentsOf: data)
-            } catch {
-                return
-            }
-        }
-    }
 }

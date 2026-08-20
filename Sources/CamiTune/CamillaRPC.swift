@@ -122,6 +122,21 @@ actor CamillaRPC {
         return value
     }
 
+    func availablePlaybackDevices(backend: String) async throws -> [(identifier: String, name: String)] {
+        let commandName = "GetAvailablePlaybackDevices"
+        let response = try await request([commandName: backend])
+        let command = try successfulBody(response, command: commandName)
+        guard let values = command["value"] as? [[Any]] else {
+            throw RPCError.invalidResponse("\(commandName) had no device list")
+        }
+        return values.compactMap { value in
+            guard value.count == 2,
+                  let identifier = value[0] as? String,
+                  let name = value[1] as? String else { return nil }
+            return (identifier, name)
+        }
+    }
+
     private func ensureOK(_ response: [String: Any], command: String) throws {
         _ = try successfulBody(response, command: command)
     }
@@ -160,43 +175,55 @@ struct SignalLevels {
     var captureRMS: [Double]
     var playbackPeak: [Double]
     var playbackRMS: [Double]
+
+    static let silent = SignalLevels(
+        capturePeak: [-150, -150],
+        captureRMS: [-150, -150],
+        playbackPeak: [-150, -150],
+        playbackRMS: [-150, -150]
+    )
 }
 
 @MainActor
 final class MeterModel: ObservableObject {
-    @Published var capturePeak: [Double] = [-150, -150]
-    @Published var captureRMS: [Double] = [-150, -150]
-    @Published var playbackPeak: [Double] = [-150, -150]
-    @Published var playbackRMS: [Double] = [-150, -150]
+    @Published private(set) var activeSession: AudioRuntimeSession?
+    @Published private(set) var levels = SignalLevels.silent
+
+    var capturePeak: [Double] { levels.capturePeak }
+    var captureRMS: [Double] { levels.captureRMS }
+    var playbackPeak: [Double] { levels.playbackPeak }
+    var playbackRMS: [Double] { levels.playbackRMS }
 
     private var pollingTask: Task<Void, Never>?
     private var hasReceivedLevels = false
 
-    func start(rpc: CamillaRPC) {
+    func start(rpc: CamillaRPC, session: AudioRuntimeSession) {
         stop()
+        activeSession = session
         pollingTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
                     let levels = try await rpc.signalLevels()
-                    guard let self else { return }
+                    guard let self, self.activeSession == session else { return }
                     if self.hasReceivedLevels {
-                        self.capturePeak = self.smooth(current: self.capturePeak, target: levels.capturePeak, attack: 0.72, release: 0.16)
-                        self.captureRMS = self.smooth(current: self.captureRMS, target: levels.captureRMS, attack: 0.42, release: 0.20)
-                        self.playbackPeak = self.smooth(current: self.playbackPeak, target: levels.playbackPeak, attack: 0.72, release: 0.16)
-                        self.playbackRMS = self.smooth(current: self.playbackRMS, target: levels.playbackRMS, attack: 0.42, release: 0.20)
+                        self.levels = SignalLevels(
+                            capturePeak: self.smooth(current: self.capturePeak, target: levels.capturePeak, attack: 0.72, release: 0.16),
+                            captureRMS: self.smooth(current: self.captureRMS, target: levels.captureRMS, attack: 0.42, release: 0.20),
+                            playbackPeak: self.smooth(current: self.playbackPeak, target: levels.playbackPeak, attack: 0.72, release: 0.16),
+                            playbackRMS: self.smooth(current: self.playbackRMS, target: levels.playbackRMS, attack: 0.42, release: 0.20)
+                        )
                     } else {
-                        self.capturePeak = levels.capturePeak
-                        self.captureRMS = levels.captureRMS
-                        self.playbackPeak = levels.playbackPeak
-                        self.playbackRMS = levels.playbackRMS
+                        self.levels = levels
                         self.hasReceivedLevels = true
                     }
                 } catch {
                     // A transient websocket miss should not tear down the audio engine.
                 }
-                // Ten polls per second is visually smooth and leaves ample
-                // control-socket capacity for live configuration updates.
-                try? await Task.sleep(for: .milliseconds(100))
+                // Reduce refresh work during live scrolling and resizing, but
+                // keep the meters moving instead of visibly freezing them.
+                try? await Task.sleep(
+                    for: .milliseconds(UIRenderPerformance.meterPollMilliseconds)
+                )
             }
         }
     }
@@ -204,11 +231,9 @@ final class MeterModel: ObservableObject {
     func stop() {
         pollingTask?.cancel()
         pollingTask = nil
+        activeSession = nil
         hasReceivedLevels = false
-        capturePeak = [-150, -150]
-        captureRMS = [-150, -150]
-        playbackPeak = [-150, -150]
-        playbackRMS = [-150, -150]
+        levels = .silent
     }
 
     private func smooth(

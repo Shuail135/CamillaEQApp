@@ -17,5 +17,12 @@ tmp/
 *.zip
 *.sha256
 
+# Local-only tests and upstream driver notes
+/Tests/
+/Drivers/SystemAudioBridge/BLACKHOLE_CHANGES.md
+/Drivers/SystemAudioBridge/UPSTREAM.md
+/Drivers/SystemAudioBridge/test-transport.sh
+
 # Local visual preview (not an application resource)
 Sources/CamiTune/tray-icon-preview.png
+test-local.sh

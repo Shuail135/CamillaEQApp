@@ -21,8 +21,8 @@ struct ContentView: View {
         self._updateChecker = ObservedObject(wrappedValue: state.updateChecker)
         let saved = UserDefaults.standard.string(forKey: "lastSidebarSelection")
         let restored: String
-        if saved == "setup" {
-            restored = "setup"
+        if let saved, saved == "setup" || saved == "default-profiles" {
+            restored = saved
         } else if let saved,
                   let id = UUID(uuidString: saved),
                   state.profiles.profiles.contains(where: { $0.id == id }) {
@@ -41,11 +41,17 @@ struct ContentView: View {
                 Button {
                     beginAddingOutput()
                 } label: {
-                    Label("Add Output", systemImage: "plus.circle.fill")
+                    HStack(spacing: 7) {
+                        Image(systemName: "plus.circle.fill").frame(width: 18)
+                        Text("Add Output")
+                    }
                         .fontWeight(.semibold)
                         .foregroundStyle(Color.accentColor)
                 }
                 .buttonStyle(.plain)
+
+                Label("Default Profiles", systemImage: "speaker.wave.2.fill")
+                    .tag("default-profiles")
 
                 Section("Output profiles") {
                     ForEach(profileStore.profiles) { profile in
@@ -107,6 +113,8 @@ struct ContentView: View {
         } detail: {
             if selection == "setup" {
                 SetupView(state: state)
+            } else if selection == "default-profiles" {
+                DefaultProfilesView(state: state)
             } else if let id = UUID(uuidString: selection),
                       let index = profileStore.profiles.firstIndex(where: { $0.id == id }) {
                 ProfileEditorView(
@@ -114,6 +122,7 @@ struct ContentView: View {
                     coreAudio: coreAudio,
                     profile: $profileStore.profiles[index]
                 )
+                .id(id)
             } else {
                 VStack(spacing: 10) {
                     Image(systemName: "slider.horizontal.3").font(.largeTitle)
@@ -235,9 +244,6 @@ struct ContentView: View {
                   $0.id == pendingOutputUID
               }) else { return }
         profileStore.addProfile(for: device)
-        if let profileID = profileStore.selectedProfileID {
-            Task { await state.setAutoActivate(id: profileID, enabled: true) }
-        }
         selection = profileStore.selectedProfileID?.uuidString ?? "setup"
         showingOutputPicker = false
         self.pendingOutputUID = nil
@@ -335,7 +341,7 @@ struct SetupView: View {
                 dependencyCard(
                     title: "CamillaDSP",
                     status: dependencies.camillaDSPStatus,
-                    detail: "Installed under ~/Library/Application Support/CamiTune/bin.",
+                    detail: "UID-capable build bundled with CamiTune; installed under ~/Library/Application Support/CamiTune/bin.",
                     action: { Task { await dependencies.installCamillaDSP() } }
                 )
 
@@ -401,7 +407,7 @@ struct SetupView: View {
                 Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text("First use").font(.title2.bold())
-                    Text("1. Select Install / Repair Everything, then approve the macOS administrator prompt.\n2. Restart the Mac only if Setup says the new audio device is not visible yet.\n3. Add your physical output as a profile from the sidebar.\n4. Adjust the visual equalizer, or import Equalizer APO text from a file or the clipboard.\n5. Enable either automatic activation condition for the profile.")
+                    Text("1. Select Install / Repair Everything, then approve the macOS administrator prompt.\n2. Restart the Mac only if Setup says the new audio device is not visible yet.\n3. Add your physical output as a profile from the sidebar.\n4. Select Default Profiles in the sidebar to choose which profile starts with each physical output.\n5. Adjust the visual equalizer, or import Equalizer APO text from a file or the clipboard.")
                 }
             }
             .padding(32)
@@ -453,6 +459,107 @@ struct SetupView: View {
     }
 }
 
+struct DefaultProfilesView: View {
+    @ObservedObject var state: AppState
+    @ObservedObject private var profileStore: ProfileStore
+    @ObservedObject private var coreAudio: CoreAudioManager
+
+    init(state: AppState) {
+        self.state = state
+        self._profileStore = ObservedObject(wrappedValue: state.profiles)
+        self._coreAudio = ObservedObject(wrappedValue: state.coreAudio)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Default Profiles").font(.largeTitle.bold())
+            Text("Choose the profile that starts when each physical output is selected in macOS. Only one profile can be the hardware default; other profiles can still use their profile-named audio devices.")
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            if knownPhysicalOutputs.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "speaker.slash").font(.largeTitle)
+                    Text("No Physical Outputs").font(.title2.bold())
+                    Text("Add an output profile in the main CamiTune window first.")
+                }
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(knownPhysicalOutputs) { device in
+                            GroupBox {
+                                HStack(alignment: .center, spacing: 18) {
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text(device.name).font(.headline)
+                                        Text(device.uid)
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    Spacer()
+                                    Picker("Starts profile", selection: automaticProfileBinding(for: device)) {
+                                        Text("None").tag(UUID?.none)
+                                        ForEach(profiles(for: device.uid)) { profile in
+                                            Text(profile.isEnabled ? profile.name : "\(profile.name) (Disabled)")
+                                                .tag(Optional(profile.id))
+                                        }
+                                    }
+                                    .frame(width: 280)
+                                }
+                                .padding(6)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var knownPhysicalOutputs: [PhysicalOutputIdentity] {
+        var devicesByUID: [String: PhysicalOutputIdentity] = [:]
+        for selection in profileStore.physicalDeviceDefaults {
+            devicesByUID[selection.physicalDevice.uid] = selection.physicalDevice
+        }
+        for profile in profileStore.profiles where devicesByUID[profile.outputDeviceUID] == nil {
+            devicesByUID[profile.outputDeviceUID] = profile.outputDevice
+        }
+        for device in coreAudio.physicalOutputDevices {
+            devicesByUID[device.id] = PhysicalOutputIdentity(uid: device.id, name: device.name)
+        }
+        return devicesByUID.values.sorted {
+            if $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedSame {
+                return $0.uid < $1.uid
+            }
+            return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private func profiles(for physicalDeviceUID: String) -> [DeviceProfile] {
+        profileStore.profiles
+            .filter { $0.outputDeviceUID == physicalDeviceUID }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func automaticProfileBinding(for device: PhysicalOutputIdentity) -> Binding<UUID?> {
+        Binding(
+            get: {
+                let profileID = profileStore.automaticProfileID(forPhysicalDeviceUID: device.uid)
+                return profiles(for: device.uid).contains(where: { $0.id == profileID }) ? profileID : nil
+            },
+            set: { profileID in
+                Task {
+                    await state.setAutomaticProfile(for: device, profileID: profileID)
+                }
+            }
+        )
+    }
+}
+
 struct ProfileEditorView: View {
     @ObservedObject var state: AppState
     @ObservedObject var coreAudio: CoreAudioManager
@@ -476,6 +583,12 @@ struct ProfileEditorView: View {
     private var profileRoutingName: String {
         ProfileRoutingDescriptor.descriptors(for: state.profiles.profiles)[profile.id]?.name
             ?? profile.name
+    }
+
+    private enum AutomaticActivationChoice: Hashable {
+        case physicalOutput
+        case profileAudioDevice
+        case manual
     }
 
     var body: some View {
@@ -511,8 +624,8 @@ struct ProfileEditorView: View {
                     ))
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .accessibilityLabel("Activate Profile")
-                    .help("Activate or deactivate this profile")
+                    .accessibilityLabel("Enable Profile")
+                    .help("Make this profile available for activation")
                 }
 
                 Text("The switch activates this profile. Its selected activation conditions decide when the EQ runs.")
@@ -524,12 +637,13 @@ struct ProfileEditorView: View {
                 GroupBox {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Audio levels").font(.title3.bold())
-                        SignalMetersView(meters: state.meters)
+                        SignalMetersView(meters: state.meters, profileID: profile.id)
                     }.padding(6)
                 }
 
                 LiveSpectrumPanels(
                     spectrum: state.spectrum,
+                    profileID: profile.id,
                     responsePoints: responsePointsForGraph
                 )
 
@@ -573,31 +687,24 @@ struct ProfileEditorView: View {
                         }
 
                         if !graphicBands.isEmpty {
-                            GeometryReader { viewport in
-                                let minimumColumnWidth = 96.0
-                                let fixedWidth = 48.0 + CGFloat(max(0, graphicBands.count - 1)) * 5
-                                let minimumContentWidth = fixedWidth + CGFloat(graphicBands.count) * minimumColumnWidth
-                                let requiresScrolling = minimumContentWidth > viewport.size.width + 1
-                                let contentWidth = max(viewport.size.width, minimumContentWidth)
-                                let columnWidth = max(
-                                    minimumColumnWidth,
-                                    (contentWidth - fixedWidth) / CGFloat(max(1, graphicBands.count))
+                            let columnWidth = 96.0
+                            let fixedWidth = 48.0 + CGFloat(max(0, graphicBands.count - 1)) * 5
+                            let contentWidth = fixedWidth + CGFloat(graphicBands.count) * columnWidth
+                            ScrollView(.horizontal, showsIndicators: true) {
+                                GraphicEqualizerBands(
+                                    bands: $graphicBands,
+                                    spectrum: state.spectrum,
+                                    profileID: profile.id,
+                                    responsePoints: filterResponsePointsForGraph,
+                                    setKind: setKind,
+                                    columnWidth: columnWidth
                                 )
-
-                                ScrollView(.horizontal, showsIndicators: requiresScrolling) {
-                                    GraphicEqualizerBands(
-                                        bands: $graphicBands,
-                                        spectrum: state.spectrum,
-                                        responsePoints: filterResponsePointsForGraph,
-                                        setKind: setKind,
-                                        columnWidth: columnWidth
-                                    )
-                                    .frame(width: contentWidth)
-                                    .padding(.bottom, requiresScrolling ? 8 : 0)
-                                }
-                                .transaction { transaction in
-                                    transaction.animation = nil
-                                }
+                                .frame(width: contentWidth, alignment: .leading)
+                                .padding(.bottom, 8)
+                                .background(PersistentHorizontalScroller())
+                            }
+                            .transaction { transaction in
+                                transaction.animation = nil
                             }
                             .frame(height: 402)
                         } else {
@@ -733,26 +840,48 @@ struct ProfileEditorView: View {
                         .font(.caption.bold())
                         .foregroundStyle(profileIsActive ? Color.green : Color.secondary)
                 }
-                Toggle("Activate EQ when \(profile.outputDeviceName) is selected as the macOS audio output", isOn: Binding(
-                    get: { profile.autoActivate },
-                    set: { enabled in
-                        Task { await state.setAutoActivate(id: profile.id, enabled: enabled) }
-                    }
-                ))
-                Toggle("Activate EQ when \(profileRoutingName) is selected as the macOS audio output", isOn: Binding(
-                    get: { profile.autoActivateWhenProfileDeviceSelected },
-                    set: { enabled in
-                        Task {
-                            await state.setAutoActivateWhenProfileDeviceSelected(
-                                id: profile.id,
-                                enabled: enabled
-                            )
-                        }
-                    }
-                ))
-                Text("The first condition routes the physical output through CamillaDSP. \n The second keeps the original physical output available for direct audio and activates EQ only when the profile-named output is selected.")
+                Divider()
+                Text("Automatic activation").font(.headline)
+                Picker("How this profile starts", selection: automaticActivationBinding) {
+                    Text("Physical output — when \(profile.outputDeviceName) is selected")
+                        .tag(AutomaticActivationChoice.physicalOutput)
+                    Text("Profile audio device — when \(profileRoutingName) is selected")
+                        .tag(AutomaticActivationChoice.profileAudioDevice)
+                    Text("Manual only — activate from CamiTune")
+                        .tag(AutomaticActivationChoice.manual)
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+
+                Text(automaticActivationExplanation)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                if automaticActivationChoice == .manual {
+                    Button(profileIsActive ? "Deactivate EQ" : "Activate EQ Now") {
+                        Task {
+                            if profileIsActive {
+                                await state.deactivate(manual: true)
+                            } else {
+                                await state.activate(profile: profile)
+                            }
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        !profileIsActive &&
+                            (!profile.isEnabled || coreAudio.device(uid: profile.outputDeviceUID) == nil)
+                    )
+                }
+
+                if let otherProfile = physicalActivationOwner, otherProfile.id != profile.id {
+                    Label(
+                        "\(profile.outputDeviceName) currently starts \(otherProfile.name). Choose Physical output above only if you want this profile to become the new default.",
+                        systemImage: "info.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                }
                 HStack {
                     Text("Processing sample rate")
                     Spacer()
@@ -760,6 +889,16 @@ struct ProfileEditorView: View {
                         get: { profile.sampleRate },
                         set: { newRate in
                             guard newRate != profile.sampleRate else { return }
+                            guard state.processingSampleRateProblem(
+                                rate: newRate,
+                                outputUID: profile.outputDeviceUID
+                            ) == nil else {
+                                state.reportProcessingSampleRateProblem(
+                                    rate: newRate,
+                                    outputUID: profile.outputDeviceUID
+                                )
+                                return
+                            }
                             profile.sampleRate = newRate
                             updateGraphResponses()
                             if profileIsActive {
@@ -769,13 +908,80 @@ struct ProfileEditorView: View {
                         }
                     )) {
                         ForEach([44_100, 48_000, 88_200, 96_000, 176_400, 192_000], id: \.self) { rate in
-                            Text(rateLabel(rate)).tag(rate)
+                            let unsupported = state.processingSampleRateProblem(
+                                rate: rate,
+                                outputUID: profile.outputDeviceUID
+                            ) != nil
+                            Text(unsupported ? "\(rateLabel(rate)) — Unsupported" : rateLabel(rate))
+                                .tag(rate)
+                                .disabled(unsupported)
                         }
                     }
                     .labelsHidden()
-                    .frame(width: 130)
+                    .frame(width: 190)
+                }
+                Text("Higher rates increase CPU and bandwidth use but do not improve lower-rate source audio; 48 kHz is the recommended default.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let problem = state.processingSampleRateProblem(
+                    rate: profile.sampleRate,
+                    outputUID: profile.outputDeviceUID
+                ) {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }.padding(6)
+        }
+    }
+
+    private var physicalActivationOwner: DeviceProfile? {
+        guard let profileID = state.profiles.automaticProfileID(
+            forPhysicalDeviceUID: profile.outputDeviceUID
+        ) else { return nil }
+        return state.profiles.profiles.first(where: { $0.id == profileID })
+    }
+
+    private var automaticActivationChoice: AutomaticActivationChoice {
+        if physicalActivationOwner?.id == profile.id { return .physicalOutput }
+        if profile.autoActivateWhenProfileDeviceSelected { return .profileAudioDevice }
+        return .manual
+    }
+
+    private var automaticActivationBinding: Binding<AutomaticActivationChoice> {
+        Binding(
+            get: { automaticActivationChoice },
+            set: { choice in
+                Task { await setAutomaticActivation(choice) }
+            }
+        )
+    }
+
+    private var automaticActivationExplanation: String {
+        switch automaticActivationChoice {
+        case .physicalOutput:
+            return "This is the default profile for this hardware. Selecting the physical output in macOS routes audio through this EQ."
+        case .profileAudioDevice:
+            return "The physical output remains available for direct playback. Select the profile-named audio device in macOS when you want this EQ."
+        case .manual:
+            return "Changing the macOS audio output will not start this profile automatically."
+        }
+    }
+
+    private func setAutomaticActivation(_ choice: AutomaticActivationChoice) async {
+        switch choice {
+        case .physicalOutput:
+            await state.setAutomaticProfile(
+                for: profile.outputDevice,
+                profileID: profile.id
+            )
+        case .profileAudioDevice:
+            await state.setAutoActivateWhenProfileDeviceSelected(id: profile.id, enabled: true)
+        case .manual:
+            if physicalActivationOwner?.id == profile.id {
+                await state.setAutomaticProfile(for: profile.outputDevice, profileID: nil)
+            }
+            await state.setAutoActivateWhenProfileDeviceSelected(id: profile.id, enabled: false)
         }
     }
 
@@ -997,24 +1203,22 @@ struct ProfileEditorView: View {
 }
 
 private struct LiveSpectrumPanels: View {
-    @ObservedObject var spectrum: SpectrumAnalyzer
+    let spectrum: SpectrumAnalyzer
+    let profileID: UUID
     let responsePoints: [EQResponsePoint]
 
     var body: some View {
+        let graphResponse = responsePoints.map { ($0.frequency, $0.gainDB) }
         HStack(alignment: .top, spacing: 16) {
             GroupBox {
                 VStack(alignment: .leading) {
                     Text("Pre-EQ Spectrum").font(.headline)
-                    LineGraph(
-                        points: inputPoints,
-                        xRange: 20...20_000,
-                        yRange: -100...0,
-                        fillsArea: true
-                    )
-                    .frame(height: 220)
+                    LivePreEQSpectrumGraph(spectrum: spectrum, profileID: profileID)
+                        .frame(height: 220)
                 }
                 .padding(6)
             }
+            .frame(maxWidth: .infinity)
 
             GroupBox {
                 VStack(alignment: .leading) {
@@ -1024,34 +1228,98 @@ private struct LiveSpectrumPanels: View {
                         Text("EQ response").foregroundStyle(.blue)
                     }
                     .font(.caption)
-                    SpectrumWithResponseGraph(
-                        spectrum: outputPoints,
-                        response: responsePoints.map { ($0.frequency, $0.gainDB) },
-                        xRange: 20...20_000,
-                        spectrumRange: -100...0,
-                        responseRange: -12...12
+                    LivePostEQSpectrumGraph(
+                        spectrum: spectrum,
+                        profileID: profileID,
+                        response: graphResponse
                     )
                     .frame(height: 220)
                 }
                 .padding(6)
             }
+            .frame(maxWidth: .infinity)
+        }
+        .frame(height: 284)
+    }
+
+}
+
+private struct PersistentHorizontalScroller: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        configure(from: view)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        configure(from: nsView)
+    }
+
+    private func configure(from view: NSView) {
+        DispatchQueue.main.async {
+            var ancestor = view.superview
+            while let current = ancestor {
+                if let scrollView = current as? NSScrollView {
+                    scrollView.hasHorizontalScroller = true
+                    scrollView.autohidesScrollers = false
+                    scrollView.scrollerStyle = .legacy
+                    scrollView.horizontalScrollElasticity = .none
+                    return
+                }
+                ancestor = current.superview
+            }
+        }
+    }
+}
+
+private struct LivePreEQSpectrumGraph: View {
+    @ObservedObject var spectrum: SpectrumAnalyzer
+    let profileID: UUID
+
+    var body: some View {
+        LineGraph(
+            points: inputPoints,
+            xRange: 20...20_000,
+            yRange: -100...0,
+            fillsArea: true
+        )
+    }
+
+    private var inputPoints: [(Double, Double)] {
+        guard spectrum.activeProfileID == profileID else { return [] }
+        return spectrum.points.map { ($0.frequency, $0.db) }
+    }
+}
+
+private struct LivePostEQSpectrumGraph: View {
+    @ObservedObject var spectrum: SpectrumAnalyzer
+    let profileID: UUID
+    let response: [(Double, Double)]
+
+    var body: some View {
+        SpectrumWithResponseGraph(
+            spectrum: outputPoints,
+            response: response,
+            xRange: 20...20_000,
+            spectrumRange: -100...0,
+            responseRange: -12...12
+        )
+    }
+
+    private var outputPoints: [(Double, Double)] {
+        guard spectrum.activeProfileID == profileID else { return [] }
+        guard !response.isEmpty else { return inputPoints }
+        let minimumFrequency = response[0].0
+        let maximumFrequency = response[response.count - 1].0
+        let logSpan = log(maximumFrequency / minimumFrequency)
+        return spectrum.points.map { point in
+            let position = log(max(point.frequency, minimumFrequency) / minimumFrequency) / logSpan
+            let index = min(response.count - 1, max(0, Int(position * Double(response.count - 1))))
+            return (point.frequency, min(0, point.db + response[index].1))
         }
     }
 
     private var inputPoints: [(Double, Double)] {
         spectrum.points.map { ($0.frequency, $0.db) }
-    }
-
-    private var outputPoints: [(Double, Double)] {
-        let response = responsePoints
-        guard !response.isEmpty else { return inputPoints }
-        let minimumFrequency = response[0].frequency
-        let maximumFrequency = response[response.count - 1].frequency
-        let logSpan = log(maximumFrequency / minimumFrequency)
-        return spectrum.points.map { point in
-            let position = log(max(point.frequency, minimumFrequency) / minimumFrequency) / logSpan
-            let index = min(response.count - 1, max(0, Int(position * Double(response.count - 1))))
-            return (point.frequency, min(0, point.db + response[index].gainDB))
-        }
     }
 }

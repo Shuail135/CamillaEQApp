@@ -2,6 +2,7 @@
 #define SYSTEM_AUDIO_BRIDGE_CLIENT_H
 
 #include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -35,6 +36,11 @@ OSStatus sabr_client_set_presentation(
     AudioObjectID deviceObjectID,
     const char* displayName,
     Boolean visible
+);
+
+OSStatus sabr_client_set_profile_devices(
+    AudioObjectID deviceObjectID,
+    CFArrayRef profiles
 );
 
 void sabr_client_transport_disconnect(

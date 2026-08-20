@@ -224,6 +224,44 @@ OSStatus sabr_client_set_presentation(
     return result;
 }
 
+OSStatus sabr_client_set_profile_devices(
+    AudioObjectID deviceObjectID,
+    CFArrayRef profiles
+) {
+    if (profiles == NULL || CFGetTypeID(profiles) != CFArrayGetTypeID()) {
+        return kAudioHardwareIllegalOperationError;
+    }
+    CFMutableDictionaryRef command = CFDictionaryCreateMutable(
+        kCFAllocatorDefault,
+        0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks
+    );
+    if (command == NULL) { return kAudioHardwareUnspecifiedError; }
+    CFDictionarySetValue(
+        command,
+        CFSTR(SABR_TRANSPORT_KEY_COMMAND),
+        CFSTR(SABR_TRANSPORT_COMMAND_PROFILE_DEVICES)
+    );
+    CFDictionarySetValue(command, CFSTR(SABR_TRANSPORT_KEY_PROFILES), profiles);
+    CFPropertyListRef propertyList = command;
+    AudioObjectPropertyAddress address = {
+        .mSelector = SABR_TRANSPORT_PROPERTY,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain
+    };
+    const OSStatus result = AudioObjectSetPropertyData(
+        deviceObjectID,
+        &address,
+        0,
+        NULL,
+        sizeof(propertyList),
+        &propertyList
+    );
+    CFRelease(command);
+    return result;
+}
+
 void sabr_client_transport_disconnect(
     SABRClientTransportRef transport,
     AudioObjectID deviceObjectID

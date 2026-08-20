@@ -1,32 +1,73 @@
 import Foundation
 
+enum ProfileNamePolicy {
+    static func uniqueName(base requestedBase: String, existingNames: [String]) -> String {
+        let trimmed = requestedBase.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = trimmed.isEmpty ? "Profile" : trimmed
+        let existingKeys = Set(existingNames.map(comparisonKey))
+        guard existingKeys.contains(comparisonKey(base)) else { return base }
+
+        var suffix = 2
+        while existingKeys.contains(comparisonKey("\(base) \(suffix)")) {
+            suffix += 1
+        }
+        return "\(base) \(suffix)"
+    }
+
+    static func isAvailable(_ name: String, in profiles: [DeviceProfile], excluding profileID: UUID? = nil) -> Bool {
+        let key = comparisonKey(name)
+        return !profiles.contains { profile in
+            profile.id != profileID && comparisonKey(profile.name) == key
+        }
+    }
+
+    static func normalized(_ profiles: [DeviceProfile]) -> [DeviceProfile] {
+        var result: [DeviceProfile] = []
+        result.reserveCapacity(profiles.count)
+        for var profile in profiles {
+            profile.name = uniqueName(base: profile.name, existingNames: result.map(\.name))
+            result.append(profile)
+        }
+        return result
+    }
+
+    private static func comparisonKey(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).folding(
+            options: [.caseInsensitive, .diacriticInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+    }
+}
+
 @MainActor
 final class ProfileStore: ObservableObject {
     @Published var profiles: [DeviceProfile] = [] {
         didSet { save() }
     }
+    @Published private(set) var physicalDeviceDefaults: [PhysicalDeviceDefaultProfile] = [] {
+        didSet { save() }
+    }
     @Published var selectedProfileID: UUID? {
-        didSet { UserDefaults.standard.set(selectedProfileID?.uuidString, forKey: "selectedProfileID") }
+        didSet { userDefaults.set(selectedProfileID?.uuidString, forKey: "selectedProfileID") }
     }
 
     private let url: URL
+    private let userDefaults: UserDefaults
     private var isLoading = true
 
-    init() {
-        let base = CamiTunePaths.supportDirectory
+    init(storageURL: URL? = nil, userDefaults: UserDefaults = .standard) {
+        let base = storageURL?.deletingLastPathComponent() ?? CamiTunePaths.supportDirectory
         try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
-        self.url = base.appendingPathComponent("profiles.json")
+        self.url = storageURL ?? base.appendingPathComponent("profiles.json")
+        self.userDefaults = userDefaults
         load()
-        if let raw = UserDefaults.standard.string(forKey: "selectedProfileID"), let id = UUID(uuidString: raw) {
+        if let raw = userDefaults.string(forKey: "selectedProfileID"), let id = UUID(uuidString: raw) {
             selectedProfileID = id
         }
         if selectedProfileID == nil {
             selectedProfileID = profiles.first?.id
         }
         isLoading = false
-        // Persist any legacy routing-device/profile-key migrations performed
-        // while decoding so future launches only use the current schema.
-        save()
     }
 
     var selectedProfile: DeviceProfile? {
@@ -36,23 +77,27 @@ final class ProfileStore: ObservableObject {
 
     func addProfile(for device: AudioDeviceInfo) {
         guard !device.isRoutingDevice else { return }
-        let baseName = device.name
+        let isFirstProfileForDevice = !profiles.contains { $0.outputDeviceUID == device.id }
+        let baseName = ProfileNamePolicy.uniqueName(
+            base: device.name,
+            existingNames: profiles.map(\.name)
+        )
         let profile = DeviceProfile(
             name: baseName,
             outputDeviceUID: device.id,
             outputDeviceName: device.name,
-            autoActivate: true
+            autoActivateWhenProfileDeviceSelected: !isFirstProfileForDevice
         )
         profiles.append(profile)
+        if isFirstProfileForDevice {
+            setAutomaticProfile(physicalDevice: profile.outputDevice, profileID: profile.id)
+        }
         selectedProfileID = profile.id
     }
 
-    func setAutoActivate(profileID: UUID, enabled: Bool) {
-        setAutoActivation(profileID: profileID, enabled: enabled, whenRoutingDeviceSelected: false)
-    }
-
     func setAutoActivateWhenProfileDeviceSelected(profileID: UUID, enabled: Bool) {
-        setAutoActivation(profileID: profileID, enabled: enabled, whenRoutingDeviceSelected: true)
+        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
+        profiles[index].autoActivateWhenProfileDeviceSelected = enabled
     }
 
     func setProfileEnabled(profileID: UUID, enabled: Bool) {
@@ -66,109 +111,93 @@ final class ProfileStore: ObservableObject {
         var updated = profiles
         updated[index].outputDeviceUID = device.id
         updated[index].outputDeviceName = device.name
-
-        if updated[index].autoActivate {
-            disableAutoActivation(in: &updated, outputUID: device.id, excluding: profileID)
-        }
         profiles = updated
     }
 
-    // Profiles and EQ data remain saved while hardware is absent. Some audio
-    // drivers return a new CoreAudio UID after reconnecting, so recover the
-    // binding by name only when exactly one connected device matches.
-    func reconcileDevices(_ devices: [AudioDeviceInfo]) -> Set<UUID> {
-        let physicalDevices = devices.filter { !$0.isRoutingDevice }
-        let connectedUIDs = Set(physicalDevices.map(\.id))
-        var updated = profiles
-        var reboundProfileIDs = Set<UUID>()
+    func automaticProfileID(forPhysicalDeviceUID uid: String) -> UUID? {
+        physicalDeviceDefaults.first(where: { $0.physicalDevice.uid == uid })?.profileID
+    }
 
-        for index in updated.indices where !connectedUIDs.contains(updated[index].outputDeviceUID) {
-            let savedName = updated[index].outputDeviceName
-            let matches = physicalDevices.filter {
-                $0.name.localizedCaseInsensitiveCompare(savedName) == .orderedSame
-            }
-            guard matches.count == 1, let match = matches.first else { continue }
-
-            updated[index].outputDeviceUID = match.id
-            updated[index].outputDeviceName = match.name
-            if updated[index].autoActivate {
-                disableAutoActivation(
-                    in: &updated,
-                    outputUID: match.id,
-                    excluding: updated[index].id
-                )
-            }
-            reboundProfileIDs.insert(updated[index].id)
+    func automaticProfile(forPhysicalDeviceUID uid: String) -> DeviceProfile? {
+        guard let profileID = automaticProfileID(forPhysicalDeviceUID: uid) else { return nil }
+        return profiles.first {
+            $0.id == profileID && $0.isEnabled && $0.outputDeviceUID == uid
         }
+    }
 
-        if !reboundProfileIDs.isEmpty { profiles = updated }
-        return reboundProfileIDs
+    func setAutomaticProfile(physicalDevice: PhysicalOutputIdentity, profileID: UUID?) {
+        var updated = physicalDeviceDefaults.filter { $0.physicalDevice.uid != physicalDevice.uid }
+        if let profileID,
+           profiles.contains(where: { $0.id == profileID && $0.outputDeviceUID == physicalDevice.uid }) {
+            updated.append(PhysicalDeviceDefaultProfile(
+                physicalDevice: physicalDevice,
+                profileID: profileID
+            ))
+        }
+        physicalDeviceDefaults = updated
     }
 
     func deleteProfile(id: UUID) {
+        physicalDeviceDefaults.removeAll { $0.profileID == id }
         profiles.removeAll { $0.id == id }
         if selectedProfileID == id { selectedProfileID = profiles.first?.id }
     }
 
     func update(_ profile: DeviceProfile) {
         guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return }
+        guard ProfileNamePolicy.isAvailable(profile.name, in: profiles, excluding: profile.id) else { return }
         profiles[index] = profile
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: url),
-              let decoded = try? JSONDecoder().decode([DeviceProfile].self, from: data) else { return }
-        profiles = normalizedAutoActivation(in: decoded)
-    }
+        guard let data = try? Data(contentsOf: url) else { return }
+        let decoder = JSONDecoder()
+        if let stored = try? decoder.decode(StoredProfileConfiguration.self, from: data) {
+            profiles = stored.profiles
+            physicalDeviceDefaults = stored.physicalDeviceDefaults
+            return
+        }
+        guard let legacy = try? decoder.decode([LegacyStoredProfile].self, from: data) else { return }
+        profiles = legacy.map(\.profile)
 
-    private func setAutoActivation(profileID: UUID, enabled: Bool, whenRoutingDeviceSelected: Bool) {
-        guard let index = profiles.firstIndex(where: { $0.id == profileID }) else { return }
-        var updated = profiles
-        if enabled {
-            if whenRoutingDeviceSelected {
-                updated[index].autoActivate = false
-            } else {
-                updated[index].autoActivateWhenProfileDeviceSelected = false
-                let outputUID = updated[index].outputDeviceUID
-                disableAutoActivation(in: &updated, outputUID: outputUID, excluding: profileID)
-            }
+        var claimedUIDs = Set<String>()
+        physicalDeviceDefaults = legacy.compactMap { item in
+            guard item.autoActivate,
+                  claimedUIDs.insert(item.profile.outputDeviceUID).inserted else { return nil }
+            return PhysicalDeviceDefaultProfile(
+                physicalDevice: item.profile.outputDevice,
+                profileID: item.profile.id
+            )
         }
-        if whenRoutingDeviceSelected {
-            updated[index].autoActivateWhenProfileDeviceSelected = enabled
-        } else {
-            updated[index].autoActivate = enabled
-        }
-        profiles = updated
-    }
-
-    private func disableAutoActivation(in profiles: inout [DeviceProfile], outputUID: String, excluding profileID: UUID) {
-        for index in profiles.indices
-        where profiles[index].id != profileID && profiles[index].outputDeviceUID == outputUID {
-            profiles[index].autoActivate = false
-        }
-    }
-
-    private func normalizedAutoActivation(in profiles: [DeviceProfile]) -> [DeviceProfile] {
-        var result = profiles
-        var claimedOutputUIDs = Set<String>()
-        for index in result.indices {
-            // The two activation modes describe conflicting behavior for the
-            // original physical output. Preserve the first mode if legacy
-            // data somehow has both enabled.
-            if result[index].autoActivate && result[index].autoActivateWhenProfileDeviceSelected {
-                result[index].autoActivateWhenProfileDeviceSelected = false
-            }
-            guard result[index].autoActivate else { continue }
-            if !claimedOutputUIDs.insert(result[index].outputDeviceUID).inserted {
-                result[index].autoActivate = false
-            }
-        }
-        return result
     }
 
     private func save() {
         guard !isLoading else { return }
-        guard let data = try? JSONEncoder().encode(profiles) else { return }
+        let stored = StoredProfileConfiguration(
+            profiles: profiles,
+            physicalDeviceDefaults: physicalDeviceDefaults
+        )
+        guard let data = try? JSONEncoder().encode(stored) else { return }
         try? data.write(to: url, options: .atomic)
+    }
+}
+
+private struct StoredProfileConfiguration: Codable {
+    var profiles: [DeviceProfile]
+    var physicalDeviceDefaults: [PhysicalDeviceDefaultProfile]
+}
+
+private struct LegacyStoredProfile: Decodable {
+    let profile: DeviceProfile
+    let autoActivate: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case autoActivate
+    }
+
+    init(from decoder: Decoder) throws {
+        profile = try DeviceProfile(from: decoder)
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        autoActivate = try values.decodeIfPresent(Bool.self, forKey: .autoActivate) ?? false
     }
 }

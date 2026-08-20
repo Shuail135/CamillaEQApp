@@ -9,10 +9,14 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         var underrunCount: UInt64 = 0
         var activeChannels: UInt32 = 0
         var sampleRate: Double = 0
+        var ringCapacityFrames: UInt32 = 0
+        var rateAdjustmentPPM: Double = 0
+        var rateMatchBufferedFrames: UInt64 = 0
     }
 
     @Published private(set) var status = "Driver transport idle"
     @Published private(set) var statistics = Statistics()
+    @Published private(set) var runtimeError: String?
 
     private let state = NSCondition()
     private var transport: SABRClientTransportRef?
@@ -20,8 +24,9 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     private var worker: Thread?
     private var stopping = false
     private var workerFinished = true
-    private weak var spectrum: SpectrumAnalyzer?
+    private var pcmRouter: PCMRouter?
     private var expectedChannelCount: UInt32 = 2
+    private var expectedSampleRate = 48_000.0
 
     deinit { stop() }
 
@@ -29,8 +34,8 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     func start(
         deviceObjectID: AudioObjectID,
         expectedChannelCount: UInt32,
-        audioSink: FileHandle,
-        spectrum: SpectrumAnalyzer
+        expectedSampleRate: Double,
+        pcmRouter: PCMRouter
     ) throws {
         stop()
         guard expectedChannelCount > 0,
@@ -50,12 +55,12 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
             throw TransportError.coreAudio(result)
         }
 
-        spectrum.startExternal(audioSink: audioSink, sourceName: "System Audio Bridge")
         state.lock()
         self.transport = transport
         self.deviceObjectID = deviceObjectID
-        self.spectrum = spectrum
+        self.pcmRouter = pcmRouter
         self.expectedChannelCount = expectedChannelCount
+        self.expectedSampleRate = expectedSampleRate
         stopping = false
         workerFinished = false
         state.unlock()
@@ -64,6 +69,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         thread.name = "System Audio Bridge Transport"
         thread.qualityOfService = .userInteractive
         worker = thread
+        runtimeError = nil
         status = "Waiting for System Audio Bridge frames…"
         thread.start()
     }
@@ -80,7 +86,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         let deviceObjectID = self.deviceObjectID
         self.transport = nil
         self.deviceObjectID = nil
-        self.spectrum = nil
+        self.pcmRouter = nil
         worker = nil
         state.unlock()
 
@@ -91,6 +97,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         Task { @MainActor [weak self] in
             self?.status = "Driver transport idle"
             self?.statistics = Statistics()
+            self?.runtimeError = nil
         }
     }
 
@@ -104,9 +111,19 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         var lastStatisticsUpdate = Date()
         var reportedStreaming = false
         var reportedMismatch: UInt32?
+        var reportedSampleRateMismatch: Double?
 
         while !shouldStop() {
             guard let transport = currentTransport() else { break }
+            var occupancy = SABRClientTransportStatistics()
+            sabr_client_transport_get_statistics(transport, &occupancy)
+            let availableFrames = occupancy.writeFrame >= occupancy.readFrame
+                ? occupancy.writeFrame - occupancy.readFrame
+                : 0
+            let sourceBufferedFrames = Int(min(
+                availableFrames,
+                UInt64(occupancy.frameCapacity)
+            ))
             var channels: UInt32 = 0
             var sampleRate = 0.0
             let frames = samples.withUnsafeMutableBufferPointer { buffer in
@@ -121,22 +138,27 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
             }
             if frames == 0 {
                 usleep(1_000)
-            } else if channels == expectedChannelCount {
+            } else if channels == expectedChannelCount,
+                      abs(sampleRate - expectedSampleRate) < 0.5 {
                 let sampleCount = Int(frames * channels)
                 let reportedChannels = channels
-                spectrum?.ingestExternal(
-                    interleaved: Array(samples.prefix(sampleCount)),
+                let interleaved = Array(samples.prefix(sampleCount))
+                currentPCMRouter()?.route(PCMFrame(
+                    interleaved: interleaved,
                     channelCount: Int(channels),
-                    sampleRate: sampleRate
-                )
+                    sampleRate: sampleRate,
+                    sourceBufferedFrames: sourceBufferedFrames,
+                    sourceCapacityFrames: Int(occupancy.frameCapacity)
+                ))
                 if !reportedStreaming {
                     reportedStreaming = true
                     reportedMismatch = nil
+                    reportedSampleRateMismatch = nil
                     Task { @MainActor [weak self] in
                         self?.status = "Streaming \(reportedChannels) channels from System Audio Bridge"
                     }
                 }
-            } else {
+            } else if channels != expectedChannelCount {
                 let reportedChannels = channels
                 let expectedChannels = expectedChannelCount
                 if reportedMismatch != reportedChannels {
@@ -144,6 +166,19 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
                     reportedMismatch = reportedChannels
                     Task { @MainActor [weak self] in
                         self?.status = "Driver channel mismatch: received \(reportedChannels), expected \(expectedChannels)"
+                    }
+                }
+                usleep(1_000)
+            } else {
+                let actualRate = sampleRate
+                let requestedRate = expectedSampleRate
+                if reportedSampleRateMismatch != actualRate {
+                    reportedStreaming = false
+                    reportedSampleRateMismatch = actualRate
+                    let message = "System Audio Bridge is producing \(Self.rateDescription(actualRate)), but CamillaDSP expects \(Self.rateDescription(requestedRate)). Audio was stopped to prevent wrong-speed playback. Choose a rate supported by the physical output."
+                    Task { @MainActor [weak self] in
+                        self?.status = "Sample-rate mismatch"
+                        self?.runtimeError = message
                     }
                 }
                 usleep(1_000)
@@ -164,12 +199,16 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     private func publishStatistics(_ transport: SABRClientTransportRef) {
         var raw = SABRClientTransportStatistics()
         sabr_client_transport_get_statistics(transport, &raw)
+        let rateMatching = currentPCMRouter()?.statistics
         let value = Statistics(
             bufferedFrames: raw.writeFrame >= raw.readFrame ? raw.writeFrame - raw.readFrame : 0,
             droppedFrames: raw.droppedFrames,
             underrunCount: raw.underrunCount,
             activeChannels: raw.activeChannels,
-            sampleRate: raw.sampleRate
+            sampleRate: raw.sampleRate,
+            ringCapacityFrames: raw.frameCapacity,
+            rateAdjustmentPPM: rateMatching?.rateAdjustmentPPM ?? 0,
+            rateMatchBufferedFrames: rateMatching?.rateMatchBufferedFrames ?? 0
         )
         Task { @MainActor [weak self] in self?.statistics = value }
     }
@@ -184,6 +223,16 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         state.lock()
         defer { state.unlock() }
         return transport
+    }
+
+    private func currentPCMRouter() -> PCMRouter? {
+        state.lock()
+        defer { state.unlock() }
+        return pcmRouter
+    }
+
+    private static func rateDescription(_ rate: Double) -> String {
+        String(format: "%.1f kHz", rate / 1_000)
     }
 
     enum TransportError: LocalizedError {

@@ -29,8 +29,11 @@ extern "C" {
 #define SABR_TRANSPORT_KEY_COMMAND "command"
 #define SABR_TRANSPORT_KEY_DISPLAY_NAME "displayName"
 #define SABR_TRANSPORT_KEY_VISIBLE "visible"
+#define SABR_TRANSPORT_KEY_PROFILES "profiles"
+#define SABR_TRANSPORT_KEY_DEVICE_UID "deviceUID"
 #define SABR_TRANSPORT_COMMAND_DISCONNECT "disconnect"
 #define SABR_TRANSPORT_COMMAND_PRESENTATION "presentation"
+#define SABR_TRANSPORT_COMMAND_PROFILE_DEVICES "profileDevices"
 
 typedef enum SABRTransportDirection {
     SABR_TRANSPORT_DIRECTION_OUTPUT = 1,

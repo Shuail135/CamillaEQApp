@@ -5,7 +5,7 @@ import SystemAudioBridgeC
 
 @MainActor
 final class CoreAudioManager: ObservableObject {
-    static let minimumPresentationDriverVersion = "0.1.0"
+    static let minimumPresentationDriverVersion = "0.2.1"
 
     @Published private(set) var outputDevices: [AudioDeviceInfo] = []
     @Published private(set) var defaultOutputUID: String?
@@ -82,71 +82,6 @@ final class CoreAudioManager: ObservableObject {
         refresh()
     }
 
-    /// Sound Settings caches virtual-device rows by UID and does not always
-    /// repaint them after a name-only notification. Removing the bridge from
-    /// the visible device list and immediately re-presenting the same object
-    /// emits the system device-list notifications macOS actually observes.
-    /// Hiding does not stop the device or change the default audio route.
-    func refreshSystemAudioBridgePresentation(name: String) throws {
-        guard let bridge = systemAudioBridge else {
-            throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID)
-        }
-        let hiddenStatus = setSystemAudioBridgePresentation(
-            objectID: bridge.objectID,
-            name: name,
-            visible: false
-        )
-        guard hiddenStatus == noErr else { throw AudioError.osStatus(hiddenStatus) }
-
-        let visibleStatus = setSystemAudioBridgePresentation(
-            objectID: bridge.objectID,
-            name: name,
-            visible: true
-        )
-        if visibleStatus != noErr {
-            // Make one best-effort attempt to avoid leaving an active route
-            // hidden if the first re-presentation was interrupted.
-            _ = setSystemAudioBridgePresentation(
-                objectID: bridge.objectID,
-                name: name,
-                visible: true
-            )
-            throw AudioError.osStatus(visibleStatus)
-        }
-        refresh()
-    }
-
-    /// Forces Sound Settings to re-read other virtual-device names while the
-    /// real bridge remains hidden (the normal state when EQ is inactive).
-    /// The show/hide pair is back-to-back, so clients only observe the final
-    /// hidden state but Core Audio still emits device-list changes.
-    func refreshDeviceListKeepingSystemAudioBridgeHidden() throws {
-        guard let bridge = systemAudioBridge else {
-            throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID)
-        }
-        let visibleStatus = setSystemAudioBridgePresentation(
-            objectID: bridge.objectID,
-            name: bridge.name,
-            visible: true
-        )
-        guard visibleStatus == noErr else { throw AudioError.osStatus(visibleStatus) }
-
-        let hiddenStatus = setSystemAudioBridgePresentation(
-            objectID: bridge.objectID,
-            name: bridge.name,
-            visible: false
-        )
-        if hiddenStatus != noErr {
-            _ = setSystemAudioBridgePresentation(
-                objectID: bridge.objectID,
-                name: bridge.name,
-                visible: false
-            )
-            throw AudioError.osStatus(hiddenStatus)
-        }
-        refresh()
-    }
-
     private func setSystemAudioBridgePresentation(
         objectID: AudioObjectID,
         name: String,
@@ -159,40 +94,32 @@ final class CoreAudioManager: ObservableObject {
 
     func device(uid: String) -> AudioDeviceInfo? {
         outputDevices.first(where: { $0.id == uid }) ??
-            (uid == AudioDeviceInfo.systemAudioBridgeUID ? deviceInfo(forUID: uid) : nil)
+            deviceInfo(forUID: uid)
     }
 
     func profileRoutingDevice(profileID: UUID) -> AudioDeviceInfo? {
         device(uid: ProfileRoutingDescriptor.uid(for: profileID))
     }
 
-    /// Removes the short-lived aggregate device used to select a profile from
-    /// macOS. The caller must first move the default output to the real bridge;
-    /// Core Audio will not reliably remove an aggregate while it is default.
-    func removeProfileRoutingDevice(profileID: UUID) throws {
-        refresh()
-        guard let device = profileRoutingDevice(profileID: profileID) else { return }
-        guard device.id != defaultOutputUID else {
-            throw AudioError.profileRoutingDeviceIsDefault(device.name)
+    func waitForProfileRoutingDevice(profileID: UUID) async -> AudioDeviceInfo? {
+        for attempt in 0..<40 {
+            refresh()
+            if let device = profileRoutingDevice(profileID: profileID) {
+                return device
+            }
+            guard attempt < 39, !Task.isCancelled else { return nil }
+            try? await Task.sleep(for: .milliseconds(50))
         }
-        let status = AudioHardwareDestroyAggregateDevice(device.objectID)
-        guard status == noErr || status == kAudioHardwareBadObjectError else {
-            throw AudioError.osStatus(status)
-        }
-        refresh()
+        return nil
     }
 
-    /// Profile-name devices are public Core Audio aggregates so they can be
-    /// selected in Sound Settings. Explicitly destroy every aggregate owned
-    /// by the app at launch and termination so those selectors never outlive
-    /// the app after a normal quit or uninstall.
+    /// Unpublishes the driver's native profile endpoints and removes any
+    /// aggregate selectors left by an older CamiTune build.
     func destroyAllProfileRoutingDevices(fallbackUID: String? = nil) {
         refresh()
         var selectors = outputDevices.filter {
             ProfileRoutingDescriptor.isProfileRoutingUID($0.id)
         }
-        guard !selectors.isEmpty else { return }
-
         if let defaultOutputUID,
            selectors.contains(where: { $0.id == defaultOutputUID }) {
             let fallback = fallbackUID.flatMap { requested in
@@ -205,9 +132,12 @@ final class CoreAudioManager: ObservableObject {
         selectors = outputDevices.filter {
             ProfileRoutingDescriptor.isProfileRoutingUID($0.id)
         }
-        for device in selectors where device.id != defaultOutputUID {
+        for device in selectors where device.id != defaultOutputUID && isAggregateDevice(device.objectID) {
             let status = AudioHardwareDestroyAggregateDevice(device.objectID)
             guard status == noErr || status == kAudioHardwareBadObjectError else { continue }
+        }
+        if let bridge = systemAudioBridge {
+            _ = sabr_client_set_profile_devices(bridge.objectID, [] as CFArray)
         }
         refresh()
     }
@@ -219,7 +149,7 @@ final class CoreAudioManager: ObservableObject {
         additionallyVisible: Set<UUID> = []
     ) throws -> [UUID: ProfileRoutingDescriptor] {
         refresh()
-        guard systemAudioBridge != nil else { throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID) }
+        guard let bridge = systemAudioBridge else { throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID) }
 
         let descriptors = ProfileRoutingDescriptor.descriptors(for: profiles)
         let desired = ProfileRoutingDescriptor.visibleProfileIDs(
@@ -229,28 +159,39 @@ final class CoreAudioManager: ObservableObject {
             additionallyVisible: additionallyVisible
         )
 
-        let existing = outputDevices.compactMap { device -> (UUID, AudioDeviceInfo)? in
-            guard let profileID = ProfileRoutingDescriptor.profileID(from: device.id) else { return nil }
-            return (profileID, device)
-        }
-        for (profileID, device) in existing where !desired.contains(profileID) {
-            guard device.id != defaultOutputUID else { continue }
+        // One-time migration: native driver endpoints replace the aggregate
+        // selectors used by older builds.
+        var migratedDefaultUID: String?
+        for device in outputDevices where
+            ProfileRoutingDescriptor.isProfileRoutingUID(device.id) &&
+            isAggregateDevice(device.objectID) {
+            if device.id == defaultOutputUID {
+                migratedDefaultUID = device.id
+                try setDefaultOutput(uid: bridge.id)
+            }
             let status = AudioHardwareDestroyAggregateDevice(device.objectID)
             guard status == noErr || status == kAudioHardwareBadObjectError else {
                 throw AudioError.osStatus(status)
             }
         }
 
-        refresh()
-        for profileID in desired.sorted(by: { $0.uuidString < $1.uuidString }) {
-            guard let descriptor = descriptors[profileID] else { continue }
-            if let existing = device(uid: descriptor.uid) {
-                if existing.name != descriptor.name { try setDeviceName(existing.objectID, name: descriptor.name) }
-            } else {
-                try createProfileAggregate(descriptor)
+        let profileDevices: [[String: String]] = desired
+            .sorted(by: { $0.uuidString < $1.uuidString })
+            .compactMap { profileID in
+                guard let descriptor = descriptors[profileID] else { return nil }
+                return [
+                    "deviceUID": descriptor.uid,
+                    "displayName": descriptor.name
+                ]
             }
+        let status = sabr_client_set_profile_devices(bridge.objectID, profileDevices as CFArray)
+        guard status == noErr else {
+            throw AudioError.profileDeviceConfigurationFailed(status)
         }
         refresh()
+        if let migratedDefaultUID, device(uid: migratedDefaultUID) != nil {
+            try setDefaultOutput(uid: migratedDefaultUID)
+        }
         return descriptors
     }
 
@@ -269,8 +210,31 @@ final class CoreAudioManager: ObservableObject {
         return ranges.contains { rate >= $0.mMinimum && rate <= $0.mMaximum }
     }
 
-    func setSampleRate(uid: String, rate: Double) throws {
+    func nominalSampleRate(uid: String) -> Double? {
+        guard let device = device(uid: uid) else { return nil }
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var value = 0.0
+        var size = UInt32(MemoryLayout<Double>.size)
+        guard AudioObjectGetPropertyData(
+            device.objectID,
+            &address,
+            0,
+            nil,
+            &size,
+            &value
+        ) == noErr else { return nil }
+        return value
+    }
+
+    func setSampleRate(uid: String, rate: Double) async throws {
         guard let device = device(uid: uid) else { throw AudioError.deviceNotFound(uid) }
+        if let actual = nominalSampleRate(uid: uid), abs(actual - rate) < 0.5 {
+            return
+        }
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -282,6 +246,17 @@ final class CoreAudioManager: ObservableObject {
         var value = rate
         let status = AudioObjectSetPropertyData(device.objectID, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &value)
         guard status == noErr else { throw AudioError.osStatus(status) }
+        for _ in 0..<20 {
+            if let actual = nominalSampleRate(uid: uid), abs(actual - rate) < 0.5 {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw AudioError.sampleRateDidNotApply(
+            device.name,
+            requested: rate,
+            actual: nominalSampleRate(uid: uid)
+        )
     }
 
     func setDefaultOutput(uid: String) throws {
@@ -298,6 +273,18 @@ final class CoreAudioManager: ObservableObject {
         )
         guard status == noErr else { throw AudioError.osStatus(status) }
         refresh()
+    }
+
+    func setDefaultOutputAndWait(uid: String) async throws {
+        let deviceName = device(uid: uid)?.name ?? uid
+        try setDefaultOutput(uid: uid)
+        for attempt in 0..<40 {
+            refresh()
+            if defaultOutputUID == uid { return }
+            guard attempt < 39 else { break }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        throw AudioError.defaultOutputDidNotApply(deviceName)
     }
 
     func setVolume(uid: String, scalar: Float32) throws {
@@ -454,46 +441,8 @@ final class CoreAudioManager: ObservableObject {
         return objectID
     }
 
-    private func createProfileAggregate(_ descriptor: ProfileRoutingDescriptor) throws {
-        let subdevice: [String: Any] = [kAudioSubDeviceUIDKey: AudioDeviceInfo.systemAudioBridgeUID]
-        let description: [String: Any] = [
-            kAudioAggregateDeviceUIDKey: descriptor.uid,
-            kAudioAggregateDeviceNameKey: descriptor.name,
-            kAudioAggregateDeviceSubDeviceListKey: [subdevice],
-            kAudioAggregateDeviceMainSubDeviceKey: AudioDeviceInfo.systemAudioBridgeUID,
-            kAudioAggregateDeviceIsPrivateKey: false,
-            kAudioAggregateDeviceIsStackedKey: false
-        ]
-        var objectID = AudioObjectID(kAudioObjectUnknown)
-        let status = AudioHardwareCreateAggregateDevice(description as CFDictionary, &objectID)
-        guard status == noErr else { throw AudioError.aggregateCreationFailed(descriptor.name, status) }
-    }
-
-    private func setDeviceName(_ objectID: AudioObjectID, name: String) throws {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioObjectPropertyName,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        var settable = DarwinBoolean(false)
-        let settableStatus = AudioObjectIsPropertySettable(objectID, &address, &settable)
-        guard settableStatus == noErr else { throw AudioError.osStatus(settableStatus) }
-        guard settable.boolValue else { throw AudioError.deviceNameNotSettable(name) }
-        var value = name as CFString
-        let status = withUnsafePointer(to: &value) { pointer in
-            AudioObjectSetPropertyData(
-                objectID,
-                &address,
-                0,
-                nil,
-                UInt32(MemoryLayout<CFString>.size),
-                pointer
-            )
-        }
-        guard status == noErr else { throw AudioError.osStatus(status) }
-        guard deviceName(objectID) == name else {
-            throw AudioError.deviceRenameDidNotApply(name)
-        }
+    private func isAggregateDevice(_ objectID: AudioObjectID) -> Bool {
+        uint32Property(objectID, selector: kAudioObjectPropertyClass) == kAudioAggregateDeviceClassID
     }
 
     private func defaultOutputDevice() -> AudioDeviceID? {
@@ -561,24 +510,23 @@ final class CoreAudioManager: ObservableObject {
         case osStatus(OSStatus)
         case volumeNotSettable
         case sampleRateNotSettable(String)
-        case aggregateCreationFailed(String, OSStatus)
-        case profileRoutingDeviceIsDefault(String)
-        case deviceNameNotSettable(String)
-        case deviceRenameDidNotApply(String)
+        case sampleRateDidNotApply(String, requested: Double, actual: Double?)
+        case defaultOutputDidNotApply(String)
+        case profileDeviceConfigurationFailed(OSStatus)
         var errorDescription: String? {
             switch self {
             case .deviceNotFound(let uid): return "Audio device not found: \(uid)"
             case .osStatus(let status): return "CoreAudio error: \(status)"
             case .volumeNotSettable: return "This audio device does not expose a settable output volume."
             case .sampleRateNotSettable(let name): return "The sample rate for \(name) cannot be changed by the app."
-            case .aggregateCreationFailed(let name, let status):
-                return "Could not create the \(name) audio device (CoreAudio \(status))."
-            case .profileRoutingDeviceIsDefault(let name):
-                return "The temporary \(name) selector is still the macOS default output."
-            case .deviceNameNotSettable(let name):
-                return "Core Audio does not allow the \(name) profile device to be renamed."
-            case .deviceRenameDidNotApply(let name):
-                return "Core Audio accepted the rename to \(name), but did not publish it."
+            case .sampleRateDidNotApply(let name, let requested, let actual):
+                let requestedText = String(format: "%.1f kHz", requested / 1_000)
+                let actualText = actual.map { String(format: "%.1f kHz", $0 / 1_000) } ?? "an unknown rate"
+                return "\(name) did not switch to \(requestedText); it remained at \(actualText)."
+            case .defaultOutputDidNotApply(let name):
+                return "macOS did not finish switching the default audio output to \(name)."
+            case .profileDeviceConfigurationFailed(let status):
+                return "System Audio Bridge could not publish the profile audio devices (CoreAudio \(status)). Reinstall the bundled driver."
             }
         }
     }

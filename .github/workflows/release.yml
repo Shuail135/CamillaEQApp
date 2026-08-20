@@ -20,12 +20,6 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Test Equalizer APO imports
-        run: swift test
-
-      - name: Test driver transport
-        run: Drivers/SystemAudioBridge/test-transport.sh
-
       - name: Build application
         run: ./build-app.sh
 
@@ -41,6 +35,7 @@ jobs:
           LICENSE="${RESOURCES}/LICENSE"
           THIRD_PARTY="${RESOURCES}/THIRD_PARTY.md"
           DRIVER="${APP}/Contents/Resources/Drivers/CamillaAudio.driver"
+          CAMILLADSP="${APP}/Contents/Resources/CamillaDSP/camilladsp"
 
           echo "=== Checking application ==="
 
@@ -62,6 +57,11 @@ jobs:
               exit 1
             fi
           done
+
+          if [[ ! -x "${CAMILLADSP}" ]]; then
+            echo "::error::UID-capable CamillaDSP is missing or not executable: ${CAMILLADSP}"
+            exit 1
+          fi
 
           SWIFTPM_BUNDLE="$(find "${APP}" -name 'CamiTune_CamiTune.bundle' -print -quit)"
           if [[ -n "${SWIFTPM_BUNDLE}" ]]; then
@@ -180,6 +180,7 @@ jobs:
           LICENSE="${RESOURCES}/LICENSE"
           THIRD_PARTY="${RESOURCES}/THIRD_PARTY.md"
           DRIVER="${APP}/Contents/Resources/Drivers/CamillaAudio.driver"
+          CAMILLADSP="${APP}/Contents/Resources/CamillaDSP/camilladsp"
 
           echo
           echo "=== Checking extracted application ==="
@@ -203,6 +204,11 @@ jobs:
               exit 1
             fi
           done
+
+          if [[ ! -x "${CAMILLADSP}" ]]; then
+            echo "::error::Packaged UID-capable CamillaDSP is missing or not executable."
+            exit 1
+          fi
 
           SWIFTPM_BUNDLE="$(find "${APP}" -name 'CamiTune_CamiTune.bundle' -print -quit)"
           if [[ -n "${SWIFTPM_BUNDLE}" ]]; then

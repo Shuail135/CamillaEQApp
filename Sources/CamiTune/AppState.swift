@@ -4,11 +4,13 @@ import AppKit
 @MainActor
 final class AppState: NSObject, ObservableObject {
     @Published private(set) var isActive = false
-    @Published private(set) var activeProfileID: UUID?
+    @Published private(set) var activeSession: AudioRuntimeSession?
     @Published var errorMessage: String?
     @Published var validationMessage: String = ""
     @Published var warnings: [String] = []
     @Published private(set) var isValidating = false
+
+    var activeProfileID: UUID? { activeSession?.profileID }
 
     let coreAudio: CoreAudioManager
     let profiles: ProfileStore
@@ -17,6 +19,7 @@ final class AppState: NSObject, ObservableObject {
     let dsp = CamillaDSPManager()
     let meters = MeterModel()
     let spectrum = SpectrumAnalyzer()
+    let pcmRouter = PCMRouter()
     let driverTransport = SystemAudioBridgeTransport()
     let updateChecker = AppUpdateChecker()
 
@@ -39,6 +42,7 @@ final class AppState: NSObject, ObservableObject {
         self.profiles = ProfileStore()
         self.dependencies = DependencyManager(coreAudio: audio)
         super.init()
+        UIRenderPerformance.startMonitoring()
 
         if audio.isSystemAudioBridgePresentationSupported {
             try? audio.setSystemAudioBridgePresentation(
@@ -46,11 +50,10 @@ final class AppState: NSObject, ObservableObject {
                 visible: false
             )
         }
-        let staleProfileID = audio.defaultOutputUID.flatMap(ProfileRoutingDescriptor.profileID(from:))
-        let cleanupFallbackUID = staleProfileID.flatMap { profileID in
-            profiles.profiles.first(where: { $0.id == profileID })?.outputDeviceUID
-        }
-        audio.destroyAllProfileRoutingDevices(fallbackUID: cleanupFallbackUID)
+        _ = try? audio.synchronizeProfileRoutingDevices(
+            profiles: profiles.profiles,
+            activeProfileID: nil
+        )
 
         monitorTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -102,6 +105,26 @@ final class AppState: NSObject, ObservableObject {
         sessionEQDrafts.removeValue(forKey: profileID)
     }
 
+    func processingSampleRateProblem(rate: Int, outputUID: String) -> String? {
+        guard let bridge = coreAudio.systemAudioBridge else {
+            return AppError.missingRoutingDriver.localizedDescription
+        }
+        guard coreAudio.supportsSampleRate(uid: bridge.id, rate: Double(rate)) else {
+            return AppError.unsupportedSampleRate(rate, bridge.name).localizedDescription
+        }
+        guard let output = coreAudio.device(uid: outputUID) else {
+            return "The selected physical output is disconnected."
+        }
+        guard coreAudio.supportsSampleRate(uid: output.id, rate: Double(rate)) else {
+            return AppError.unsupportedSampleRate(rate, output.name).localizedDescription
+        }
+        return nil
+    }
+
+    func reportProcessingSampleRateProblem(rate: Int, outputUID: String) {
+        errorMessage = processingSampleRateProblem(rate: rate, outputUID: outputUID)
+    }
+
     func validateSetup(profile: DeviceProfile) async {
         guard !isValidating else { return }
         isValidating = true
@@ -129,9 +152,7 @@ final class AppState: NSObject, ObservableObject {
                 throw AppError.unsupportedSampleRate(profile.sampleRate, output.name)
             }
 
-            var resolved = profile
-            resolved.outputDeviceName = output.name
-            try dependencies.validateConfiguration(configBuilder.build(profile: resolved, parsed: parsed))
+            try dependencies.validateConfiguration(configBuilder.build(profile: profile, parsed: parsed))
 
             if isActive, activeProfileID == profile.id {
                 let engineState = try await dsp.rpc.state()
@@ -155,50 +176,21 @@ final class AppState: NSObject, ObservableObject {
         guard !name.isEmpty,
               let index = profiles.profiles.firstIndex(where: { $0.id == id }) else { return }
         guard profiles.profiles[index].name != name else { return }
+        guard ProfileNamePolicy.isAvailable(name, in: profiles.profiles, excluding: id) else {
+            errorMessage = "A profile named \"\(name)\" already exists. Profile names must be unique."
+            return
+        }
 
         profiles.profiles[index].name = name
-        let descriptors = ProfileRoutingDescriptor.descriptors(for: profiles.profiles)
 
         do {
-            // The active route is the real bridge, not an aggregate selector,
-            // so complete that handoff and remove any stale selector before
-            // giving the bridge the new name. This prevents Sound Settings
-            // from seeing two live devices with the same profile name.
-            if activeProfileID == id {
-                // Normally activation has already removed the selector. Do
-                // not reassign the current default output on every rename:
-                // that makes Core Audio rebuild its presentation cache and
-                // delays the visible name update. Perform the handoff only
-                // when a selector genuinely survived activation.
-                if coreAudio.profileRoutingDevice(profileID: id) != nil {
-                    if let activeRoutingUID,
-                       coreAudio.defaultOutputUID != activeRoutingUID {
-                        try coreAudio.setDefaultOutput(uid: activeRoutingUID)
-                    }
-                    try coreAudio.removeProfileRoutingDevice(profileID: id)
-                }
-            }
-
-            // Rename selector aggregates first. The device-list refresh below
-            // must happen after this write or Sound Settings can re-cache the
-            // previous name.
+            // The driver keeps the profile UID on the same native endpoint, so
+            // renaming changes the selected device without replacing it.
             try coreAudio.synchronizeProfileRoutingDevices(
                 profiles: profiles.profiles,
                 activeProfileID: activeProfileID
             )
 
-            if let activeProfileID,
-               let activeDescriptor = descriptors[activeProfileID] {
-                // This both updates an active bridge name and makes macOS
-                // re-read any inactive selector renamed in the same pass.
-                try coreAudio.refreshSystemAudioBridgePresentation(
-                    name: activeDescriptor.name
-                )
-            } else if coreAudio.profileRoutingDevice(profileID: id) != nil {
-                // With EQ inactive, use the hidden bridge only to produce a
-                // real device-list refresh after the selector rename.
-                try coreAudio.refreshDeviceListKeepingSystemAudioBridgeHidden()
-            }
             errorMessage = nil
         } catch {
             errorMessage = "The profile was renamed, but its macOS audio device could not be updated: \(error.localizedDescription)"
@@ -213,10 +205,8 @@ final class AppState: NSObject, ObservableObject {
         if !enabled, activeProfileID == id {
             await deactivate(manual: false)
         } else {
-            // A profile selector is only a short-lived aggregate and does not
-            // provide normal macOS volume controls. If the profile is disabled
-            // before the monitor finishes activating it, move the route back
-            // to its physical output before removing the selector.
+            // Move away from a disabled profile endpoint before removing it;
+            // Core Audio cannot destroy a device while it is the default.
             if !enabled,
                coreAudio.defaultOutputUID.flatMap(ProfileRoutingDescriptor.profileID(from:)) == id,
                coreAudio.device(uid: profile.outputDeviceUID) != nil {
@@ -230,13 +220,23 @@ final class AppState: NSObject, ObservableObject {
         if enabled { await monitorRouting() }
     }
 
-    func setAutoActivate(id: UUID, enabled: Bool) async {
-        profiles.setAutoActivate(profileID: id, enabled: enabled)
-        if enabled { await monitorRouting() }
+    func setAutomaticProfile(
+        for physicalDevice: PhysicalOutputIdentity,
+        profileID: UUID?
+    ) async {
+        profiles.setAutomaticProfile(physicalDevice: physicalDevice, profileID: profileID)
+        if let profileID {
+            profiles.setAutoActivateWhenProfileDeviceSelected(profileID: profileID, enabled: false)
+        }
+        if profileID != nil { await monitorRouting() }
     }
 
     func setAutoActivateWhenProfileDeviceSelected(id: UUID, enabled: Bool) async {
         guard let profile = profiles.profiles.first(where: { $0.id == id }) else { return }
+        if enabled,
+           profiles.automaticProfileID(forPhysicalDeviceUID: profile.outputDeviceUID) == id {
+            profiles.setAutomaticProfile(physicalDevice: profile.outputDevice, profileID: nil)
+        }
         profiles.setAutoActivateWhenProfileDeviceSelected(profileID: id, enabled: enabled)
 
         if !enabled,
@@ -254,10 +254,15 @@ final class AppState: NSObject, ObservableObject {
         }
     }
 
-    func activate(profile: DeviceProfile, reportErrors: Bool = true) async {
+    func activate(
+        profile: DeviceProfile,
+        reportErrors: Bool = true,
+        automatic: Bool = false
+    ) async {
         guard !transitionInProgress else { return }
         transitionInProgress = true
         defer { transitionInProgress = false }
+        let activationOriginUID = coreAudio.defaultOutputUID
 
         do {
             guard profile.isEnabled else { throw AppError.profileDisabled(profile.name) }
@@ -269,7 +274,9 @@ final class AppState: NSObject, ObservableObject {
             guard coreAudio.isSystemAudioBridgePresentationSupported else {
                 throw AppError.outdatedRoutingDriver
             }
-            guard let output = coreAudio.device(uid: profile.outputDeviceUID) else { throw AppError.outputMissing(profile.outputDeviceName) }
+            guard let output = coreAudio.device(uid: profile.outputDeviceUID) else {
+                throw AppError.outputMissing(profile.outputDeviceName)
+            }
             guard !output.isRoutingDevice else { throw AppError.invalidTarget }
             guard let parsed = validate(profile: profile) else { return }
             let sampleRate = Double(profile.sampleRate)
@@ -287,53 +294,69 @@ final class AppState: NSObject, ObservableObject {
                 guard activeProfileID != profile.id else { return }
                 await stopProcessingPipeline()
                 isActive = false
-                activeProfileID = nil
+                activeSession = nil
                 activeSampleRate = nil
             }
 
-            // The aggregate already exists when a profile was selected from
-            // macOS. Manual and physical-output activation do not need to
-            // create a temporary aggregate merely to calculate the name.
-            let descriptors = ProfileRoutingDescriptor.descriptors(for: profiles.profiles)
-            guard let descriptor = descriptors[profile.id] else {
+            _ = try coreAudio.synchronizeProfileRoutingDevices(
+                profiles: profiles.profiles,
+                activeProfileID: nil,
+                additionallyVisible: [profile.id]
+            )
+            guard let routing = await coreAudio.waitForProfileRoutingDevice(profileID: profile.id) else {
                 throw AppError.profileRoutingDeviceMissing(profile.name)
             }
 
-            // Aggregate profile devices are only selectors. Once selected, the
-            // real driver adopts the collision-safe profile name so macOS uses
-            // its native volume and mute controls.
+            // Native profile endpoints share this bridge's PCM stream. Keep
+            // the generic transport hidden so Sound Settings exposes only the
+            // stable, volume-capable profile device.
             try coreAudio.setSystemAudioBridgePresentation(
-                name: descriptor.name,
-                visible: true
+                name: AudioDeviceInfo.systemAudioBridgeName,
+                visible: false
             )
-            guard let routing = coreAudio.systemAudioBridge else {
-                throw AppError.missingRoutingDriver
-            }
 
-            if coreAudio.defaultOutputUID != descriptor.uid,
+            if coreAudio.defaultOutputUID != routing.id,
                coreAudio.defaultOutputUID != bridge.id,
                coreAudio.defaultOutputUID.flatMap(ProfileRoutingDescriptor.profileID(from:)) == nil {
                 previousDefaultUID = coreAudio.defaultOutputUID
             }
             activeRoutingUID = routing.id
 
-            try coreAudio.setSampleRate(uid: bridge.id, rate: sampleRate)
+            try await coreAudio.setSampleRate(uid: output.id, rate: sampleRate)
+            try await coreAudio.setSampleRate(uid: bridge.id, rate: sampleRate)
 
             try await dsp.start(binary: dependencies.camillaDSPBinary)
-            var resolvedProfile = profile
-            resolvedProfile.outputDeviceName = output.name
-            let yaml = configBuilder.build(profile: resolvedProfile, parsed: parsed)
+            let camillaOutputs = try await dsp.rpc.availablePlaybackDevices(backend: "CoreAudio")
+            guard camillaOutputs.contains(where: { $0.identifier == profile.outputDeviceUID }) else {
+                throw AppError.camillaDSPCoreAudioUIDUnsupported
+            }
+            let yaml = configBuilder.build(profile: profile, parsed: parsed)
             try await dsp.apply(yaml: yaml)
 
+            let runtimeSession = AudioRuntimeSession(profileID: profile.id)
+            pcmRouter.start(
+                camillaSink: try dsp.audioInputHandle(),
+                analyzerConsumer: { [weak spectrum] frame in
+                    spectrum?.ingest(
+                        interleaved: frame.interleaved,
+                        channelCount: frame.channelCount,
+                        sampleRate: frame.sampleRate,
+                        session: runtimeSession
+                    )
+                }
+            )
             try driverTransport.start(
                 deviceObjectID: bridge.objectID,
                 expectedChannelCount: 2,
-                audioSink: try dsp.audioInputHandle(),
-                spectrum: spectrum
+                expectedSampleRate: sampleRate,
+                pcmRouter: pcmRouter
             )
 
-            // Switch system audio only after the DSP is ready to receive frames.
-            try coreAudio.setDefaultOutput(uid: routing.id)
+            // Switch only when activation did not originate from this profile
+            // output. The same Core Audio object remains selected afterward.
+            if coreAudio.defaultOutputUID != routing.id {
+                try await coreAudio.setDefaultOutputAndWait(uid: routing.id)
+            }
 
             volumeBridge.start(
                 routingDevice: routing,
@@ -345,11 +368,11 @@ final class AppState: NSObject, ObservableObject {
                 self.profiles.profiles[index].outputVolumeScalar = volume
             }
 
-            meters.start(rpc: dsp.rpc)
-
-            activeProfileID = profile.id
+            activeSession = runtimeSession
             activeSampleRate = profile.sampleRate
             isActive = true
+            meters.start(rpc: dsp.rpc, session: runtimeSession)
+            spectrum.start(session: runtimeSession, sourceName: "System Audio Bridge")
             _ = try? coreAudio.synchronizeProfileRoutingDevices(
                 profiles: profiles.profiles,
                 activeProfileID: profile.id
@@ -358,7 +381,15 @@ final class AppState: NSObject, ObservableObject {
             errorMessage = nil
             notifications.activated()
         } catch {
-            if reportErrors { errorMessage = error.localizedDescription }
+            if reportErrors || shouldAlwaysReport(error) {
+                errorMessage = error.localizedDescription
+            }
+            if automatic, activationOriginUID == profile.outputDeviceUID {
+                // A failed physical-output activation must not republish and
+                // remove the profile endpoint once per monitor tick. Retry
+                // after the user changes away from this physical output.
+                suppressedAutoUID = profile.outputDeviceUID
+            }
             await stopProcessingPipeline()
             if let routingUID = activeRoutingUID,
                coreAudio.defaultOutputUID == routingUID {
@@ -366,7 +397,7 @@ final class AppState: NSObject, ObservableObject {
                 try? coreAudio.setDefaultOutput(uid: restore)
             }
             isActive = false
-            activeProfileID = nil
+            activeSession = nil
             activeSampleRate = nil
             activeRoutingUID = nil
             try? coreAudio.setSystemAudioBridgePresentation(
@@ -386,15 +417,22 @@ final class AppState: NSObject, ObservableObject {
         guard let parsed = validate(profile: profile) else { return }
         guard isActive, activeProfileID == profile.id else { return }
         if activeSampleRate != profile.sampleRate {
+            if let problem = processingSampleRateProblem(
+                rate: profile.sampleRate,
+                outputUID: profile.outputDeviceUID
+            ) {
+                errorMessage = problem
+                return
+            }
             await deactivate(manual: false)
             await activate(profile: profile)
             return
         }
         do {
-            guard let output = coreAudio.device(uid: profile.outputDeviceUID) else { throw AppError.outputMissing(profile.outputDeviceName) }
-            var resolved = profile
-            resolved.outputDeviceName = output.name
-            let yaml = configBuilder.build(profile: resolved, parsed: parsed)
+            guard coreAudio.device(uid: profile.outputDeviceUID) != nil else {
+                throw AppError.outputMissing(profile.outputDeviceName)
+            }
+            let yaml = configBuilder.build(profile: profile, parsed: parsed)
             try await dsp.apply(yaml: yaml)
             guard request == latestApplyRequest, !Task.isCancelled else { return }
             errorMessage = nil
@@ -427,7 +465,7 @@ final class AppState: NSObject, ObservableObject {
         )
 
         isActive = false
-        activeProfileID = nil
+        activeSession = nil
         activeSampleRate = nil
         activeRoutingUID = nil
         previousDefaultUID = nil
@@ -443,6 +481,7 @@ final class AppState: NSObject, ObservableObject {
         meters.stop()
         volumeBridge.stop()
         driverTransport.stop()
+        pcmRouter.stop()
         spectrum.stop()
         await dsp.stop()
     }
@@ -458,21 +497,28 @@ final class AppState: NSObject, ObservableObject {
             // Setup presents missing/incompatible-driver errors. Avoid showing
             // the same background registry failure once per monitor tick.
         }
-        let reboundProfileIDs = profiles.reconcileDevices(coreAudio.outputDevices)
-
         if isActive {
-            if let activeProfileID,
-               profiles.profiles.first(where: { $0.id == activeProfileID })?.isEnabled == false {
+            if let runtimeError = driverTransport.runtimeError {
+                errorMessage = runtimeError
+                await deactivate(manual: false)
+                return
+            }
+            if let activeSampleRate,
+               let activeProfileID,
+               let activeProfile = profiles.profiles.first(where: { $0.id == activeProfileID }),
+               let actualRate = coreAudio.nominalSampleRate(uid: activeProfile.outputDeviceUID),
+               abs(actualRate - Double(activeSampleRate)) >= 0.5 {
+                errorMessage = AppError.runtimeSampleRateMismatch(
+                    expected: activeSampleRate,
+                    actual: actualRate,
+                    device: activeProfile.outputDeviceName
+                ).localizedDescription
                 await deactivate(manual: false)
                 return
             }
             if let activeProfileID,
-               reboundProfileIDs.contains(activeProfileID),
-               let reboundProfile = profiles.profiles.first(where: { candidate in
-                   candidate.id == activeProfileID
-               }) {
-                await deactivate(manual: false, restoreOutput: false)
-                await activate(profile: reboundProfile, reportErrors: false)
+               profiles.profiles.first(where: { $0.id == activeProfileID })?.isEnabled == false {
+                await deactivate(manual: false)
                 return
             }
             if let activeProfileID,
@@ -484,17 +530,6 @@ final class AppState: NSObject, ObservableObject {
             guard let routing = activeRoutingUID.flatMap({ coreAudio.device(uid: $0) }) else {
                 await deactivate(manual: false, restoreOutput: false)
                 return
-            }
-
-            if let activeProfileID,
-               let descriptor = ProfileRoutingDescriptor.descriptors(
-                   for: profiles.profiles
-               )[activeProfileID],
-               routing.name != descriptor.name {
-                try? coreAudio.setSystemAudioBridgePresentation(
-                    name: descriptor.name,
-                    visible: true
-                )
             }
 
             // If the user picks another macOS output while EQ is active, respect it.
@@ -515,13 +550,10 @@ final class AppState: NSObject, ObservableObject {
         // CoreAudio can temporarily keep a removed device's UID as the default
         // after it is unplugged. Never auto-activate from that stale UID: doing
         // so retries a missing route every monitor tick.
-        if let profile = profiles.profiles.first(where: {
-            $0.isEnabled
-                && $0.autoActivate
-                && $0.outputDeviceUID == current
-                && coreAudio.device(uid: $0.outputDeviceUID) != nil
-        }) {
-            await activate(profile: profile, reportErrors: false)
+        if let currentDevice = coreAudio.device(uid: current),
+           !currentDevice.isRoutingDevice,
+           let profile = profiles.automaticProfile(forPhysicalDeviceUID: current) {
+            await activate(profile: profile, reportErrors: false, automatic: true)
             return
         }
 
@@ -532,7 +564,7 @@ final class AppState: NSObject, ObservableObject {
                    && $0.autoActivateWhenProfileDeviceSelected
                    && coreAudio.device(uid: $0.outputDeviceUID) != nil
            }) {
-            await activate(profile: selectedProfile, reportErrors: false)
+            await activate(profile: selectedProfile, reportErrors: false, automatic: true)
         }
     }
 
@@ -547,6 +579,7 @@ final class AppState: NSObject, ObservableObject {
         meters.stop()
         volumeBridge.stop()
         driverTransport.stop()
+        pcmRouter.stop()
         spectrum.stop()
 
         if let routingUID = activeRoutingUID,
@@ -565,10 +598,32 @@ final class AppState: NSObject, ObservableObject {
         coreAudio.destroyAllProfileRoutingDevices(fallbackUID: cleanupFallbackUID)
         dsp.forceStopAndWait()
         isActive = false
-        activeProfileID = nil
+        activeSession = nil
         activeSampleRate = nil
         activeRoutingUID = nil
         previousDefaultUID = nil
+    }
+
+    private func shouldAlwaysReport(_ error: Error) -> Bool {
+        if let appError = error as? AppError {
+            switch appError {
+            case .profileRoutingDeviceMissing, .unsupportedSampleRate,
+                    .camillaDSPCoreAudioUIDUnsupported:
+                return true
+            default:
+                break
+            }
+        }
+        if let audioError = error as? CoreAudioManager.AudioError {
+            switch audioError {
+            case .sampleRateNotSettable, .sampleRateDidNotApply,
+                    .defaultOutputDidNotApply:
+                return true
+            default:
+                break
+            }
+        }
+        return false
     }
 
     enum AppError: LocalizedError {
@@ -580,6 +635,8 @@ final class AppState: NSObject, ObservableObject {
         case profileDisabled(String)
         case profileRoutingDeviceMissing(String)
         case unsupportedSampleRate(Int, String)
+        case camillaDSPCoreAudioUIDUnsupported
+        case runtimeSampleRateMismatch(expected: Int, actual: Double, device: String)
         var errorDescription: String? {
             switch self {
             case .missingCamillaDSP: return "CamillaDSP is not installed. Open Setup and install it first."
@@ -590,6 +647,10 @@ final class AppState: NSObject, ObservableObject {
             case .profileDisabled(let name): return "Activate the \(name) profile before using its EQ activation conditions."
             case .profileRoutingDeviceMissing(let name): return "CoreAudio did not create the \(name) profile audio device."
             case .unsupportedSampleRate(let rate, let device): return "\(device) does not report support for the selected \(Double(rate) / 1000) kHz sample rate."
+            case .camillaDSPCoreAudioUIDUnsupported:
+                return "The installed CamillaDSP build cannot select Core Audio devices by UID. Open Setup and select Install / Repair Everything."
+            case .runtimeSampleRateMismatch(let expected, let actual, let device):
+                return "\(device) changed to \(String(format: "%.1f", actual / 1_000)) kHz while this profile requires \(String(format: "%.1f", Double(expected) / 1_000)) kHz. Processing was stopped to prevent wrong-speed or corrupted audio."
             }
         }
     }

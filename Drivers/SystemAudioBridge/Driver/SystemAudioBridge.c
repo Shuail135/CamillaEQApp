@@ -13,6 +13,7 @@
 //==================================================================================================
 
 #include <CoreAudio/AudioServerPlugIn.h>
+#include <CoreAudio/AudioHardware.h>
 #include <dispatch/dispatch.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
@@ -122,6 +123,8 @@ enum
     kObjectID_Pitch_Adjust              = 10,
     kObjectID_ClockSource               = 11,
     kObjectID_Device2                   = 12,
+    kObjectID_ProfileDevice_First       = kObjectID_Device2,
+    kObjectID_ProfileDevice_Last        = 43,
 };
 
 enum
@@ -224,7 +227,7 @@ struct ObjectInfo {
 #endif
 
 #ifndef kDevice2_HasOutput
-#define                             kDevice2_HasOutput                  false
+#define                             kDevice2_HasOutput                  true
 #endif
 
 
@@ -269,6 +272,8 @@ static Boolean                      gBox_Acquired                       = kBox_A
 static pthread_mutex_t              gDevice_IOMutex                     = PTHREAD_MUTEX_INITIALIZER;
 static CFStringRef                  gDevice_DisplayName                 = NULL;
 static Boolean                      gDevice_IsHidden                    = kDevice_IsHidden;
+static CFStringRef                  gProfileDevice_UIDs[32]             = { NULL };
+static CFStringRef                  gProfileDevice_Names[32]            = { NULL };
 static Float64                      gDevice_SampleRate                  = 48000.0;
 static Float64                      gDevice_RequestedSampleRate         = 0.0;
 static UInt64                       gDevice_IOIsRunning                 = 0;
@@ -468,6 +473,252 @@ static CFStringRef get_device2_uid(void)      { RETURN_FORMATTED_STRING(kDevice2
 static CFStringRef get_device2_name(void)     { RETURN_FORMATTED_STRING(kDevice2_Name) }
 static CFStringRef get_device_model_uid(void) { RETURN_FORMATTED_STRING(kDevice_ModelUID) }
 
+static bool is_profile_device_object(AudioObjectID objectID)
+{
+    return objectID >= kObjectID_ProfileDevice_First &&
+        objectID <= kObjectID_ProfileDevice_Last;
+}
+
+static bool is_device_object(AudioObjectID objectID)
+{
+    return objectID == kObjectID_Device || is_profile_device_object(objectID);
+}
+
+static UInt32 profile_device_index(AudioObjectID objectID)
+{
+    return (UInt32)(objectID - kObjectID_ProfileDevice_First);
+}
+
+static UInt32 profile_device_count(void)
+{
+    UInt32 count = 0;
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(UInt32 index = 0; index < 32; ++index)
+    {
+        if(gProfileDevice_UIDs[index] != NULL) { ++count; }
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    return count;
+}
+
+static CFStringRef copy_profile_device_uid(AudioObjectID objectID)
+{
+    CFStringRef result = NULL;
+    if(!is_profile_device_object(objectID)) { return NULL; }
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    result = gProfileDevice_UIDs[profile_device_index(objectID)];
+    if(result != NULL) { CFRetain(result); }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    return result;
+}
+
+static CFStringRef copy_profile_device_name(AudioObjectID objectID)
+{
+    CFStringRef result = NULL;
+    if(!is_profile_device_object(objectID)) { return NULL; }
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    result = gProfileDevice_Names[profile_device_index(objectID)];
+    if(result != NULL) { CFRetain(result); }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    return result;
+}
+
+static void notify_profile_devices(
+    UInt32 addressCount,
+    const AudioObjectPropertyAddress* addresses
+)
+{
+    if(gPlugIn_Host == NULL || addressCount == 0 || addresses == NULL) { return; }
+    AudioObjectID deviceIDs[32];
+    UInt32 deviceCount = 0;
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(UInt32 slot = 0; slot < 32; ++slot)
+    {
+        if(gProfileDevice_UIDs[slot] != NULL)
+        {
+            deviceIDs[deviceCount++] = kObjectID_ProfileDevice_First + slot;
+        }
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+    for(UInt32 index = 0; index < deviceCount; ++index)
+    {
+        gPlugIn_Host->PropertiesChanged(
+            gPlugIn_Host,
+            deviceIDs[index],
+            addressCount,
+            addresses
+        );
+    }
+}
+
+static OSStatus set_profile_devices(CFArrayRef profiles)
+{
+    if(profiles == NULL || CFGetTypeID(profiles) != CFArrayGetTypeID())
+    {
+        return kAudioHardwareIllegalOperationError;
+    }
+
+    CFIndex count = CFArrayGetCount(profiles);
+    if(count < 0 || count > 32) { return kAudioHardwareIllegalOperationError; }
+
+    CFStringRef requestedUIDs[32] = { NULL };
+    CFStringRef requestedNames[32] = { NULL };
+    CFStringRef replacementUIDs[32] = { NULL };
+    CFStringRef replacementNames[32] = { NULL };
+    CFStringRef previousUIDs[32] = { NULL };
+    CFStringRef previousNames[32] = { NULL };
+    bool assignedSlots[32] = { false };
+    bool changedNames[32] = { false };
+    bool deviceListChanged = false;
+    OSStatus result = noErr;
+
+    for(CFIndex index = 0; index < count; ++index)
+    {
+        CFTypeRef value = CFArrayGetValueAtIndex(profiles, index);
+        if(value == NULL || CFGetTypeID(value) != CFDictionaryGetTypeID())
+        {
+            result = kAudioHardwareIllegalOperationError;
+            goto Cleanup;
+        }
+        CFDictionaryRef profile = (CFDictionaryRef)value;
+        CFTypeRef uid = CFDictionaryGetValue(profile, CFSTR(SABR_TRANSPORT_KEY_DEVICE_UID));
+        CFTypeRef name = CFDictionaryGetValue(profile, CFSTR(SABR_TRANSPORT_KEY_DISPLAY_NAME));
+        if(uid == NULL || CFGetTypeID(uid) != CFStringGetTypeID() ||
+            CFStringGetLength((CFStringRef)uid) == 0 ||
+            name == NULL || CFGetTypeID(name) != CFStringGetTypeID() ||
+            CFStringGetLength((CFStringRef)name) == 0)
+        {
+            result = kAudioHardwareIllegalOperationError;
+            goto Cleanup;
+        }
+        for(CFIndex prior = 0; prior < index; ++prior)
+        {
+            if(CFStringCompare(requestedUIDs[prior], (CFStringRef)uid, 0) == kCFCompareEqualTo)
+            {
+                result = kAudioHardwareIllegalOperationError;
+                goto Cleanup;
+            }
+        }
+        requestedUIDs[index] = CFStringCreateCopy(kCFAllocatorDefault, (CFStringRef)uid);
+        requestedNames[index] = CFStringCreateCopy(kCFAllocatorDefault, (CFStringRef)name);
+        if(requestedUIDs[index] == NULL || requestedNames[index] == NULL)
+        {
+            result = kAudioHardwareUnspecifiedError;
+            goto Cleanup;
+        }
+    }
+
+    pthread_mutex_lock(&gPlugIn_StateMutex);
+    for(CFIndex index = 0; index < count; ++index)
+    {
+        SInt32 slot = -1;
+        for(UInt32 candidate = 0; candidate < 32; ++candidate)
+        {
+            if(!assignedSlots[candidate] && gProfileDevice_UIDs[candidate] != NULL &&
+                CFStringCompare(gProfileDevice_UIDs[candidate], requestedUIDs[index], 0) == kCFCompareEqualTo)
+            {
+                slot = (SInt32)candidate;
+                break;
+            }
+        }
+        if(slot < 0)
+        {
+            for(UInt32 candidate = 0; candidate < 32; ++candidate)
+            {
+                if(!assignedSlots[candidate] && gProfileDevice_UIDs[candidate] == NULL)
+                {
+                    slot = (SInt32)candidate;
+                    break;
+                }
+            }
+        }
+        if(slot < 0)
+        {
+            for(UInt32 candidate = 0; candidate < 32; ++candidate)
+            {
+                if(!assignedSlots[candidate])
+                {
+                    slot = (SInt32)candidate;
+                    break;
+                }
+            }
+        }
+        assignedSlots[slot] = true;
+        replacementUIDs[slot] = requestedUIDs[index];
+        replacementNames[slot] = requestedNames[index];
+        requestedUIDs[index] = NULL;
+        requestedNames[index] = NULL;
+    }
+    for(UInt32 slot = 0; slot < 32; ++slot)
+    {
+        bool uidChanged = (gProfileDevice_UIDs[slot] == NULL) != (replacementUIDs[slot] == NULL);
+        if(!uidChanged && gProfileDevice_UIDs[slot] != NULL)
+        {
+            uidChanged = CFStringCompare(gProfileDevice_UIDs[slot], replacementUIDs[slot], 0) != kCFCompareEqualTo;
+        }
+        deviceListChanged = deviceListChanged || uidChanged;
+        if(!uidChanged && gProfileDevice_Names[slot] != NULL && replacementNames[slot] != NULL)
+        {
+            changedNames[slot] = CFStringCompare(
+                gProfileDevice_Names[slot],
+                replacementNames[slot],
+                0
+            ) != kCFCompareEqualTo;
+        }
+        previousUIDs[slot] = gProfileDevice_UIDs[slot];
+        previousNames[slot] = gProfileDevice_Names[slot];
+        gProfileDevice_UIDs[slot] = replacementUIDs[slot];
+        gProfileDevice_Names[slot] = replacementNames[slot];
+    }
+    pthread_mutex_unlock(&gPlugIn_StateMutex);
+
+    if(gPlugIn_Host != NULL)
+    {
+        AudioObjectPropertyAddress nameAddress = {
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        for(UInt32 slot = 0; slot < 32; ++slot)
+        {
+            if(replacementUIDs[slot] != NULL && changedNames[slot])
+            {
+                gPlugIn_Host->PropertiesChanged(
+                    gPlugIn_Host,
+                    kObjectID_ProfileDevice_First + slot,
+                    1,
+                    &nameAddress
+                );
+            }
+        }
+        if(deviceListChanged)
+        {
+            AudioObjectPropertyAddress deviceListAddress = {
+                kAudioPlugInPropertyDeviceList,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_PlugIn, 1, &deviceListAddress);
+            AudioObjectPropertyAddress boxDeviceListAddress = {
+                kAudioBoxPropertyDeviceList,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            gPlugIn_Host->PropertiesChanged(gPlugIn_Host, kObjectID_Box, 1, &boxDeviceListAddress);
+        }
+    }
+
+Cleanup:
+    for(UInt32 index = 0; index < 32; ++index)
+    {
+        if(requestedUIDs[index] != NULL) { CFRelease(requestedUIDs[index]); }
+        if(requestedNames[index] != NULL) { CFRelease(requestedNames[index]); }
+        if(previousUIDs[index] != NULL) { CFRelease(previousUIDs[index]); }
+        if(previousNames[index] != NULL) { CFRelease(previousNames[index]); }
+    }
+    return result;
+}
+
 // Volume conversions
 
 static Float32 volume_to_decibel(Float32 volume)
@@ -499,116 +750,52 @@ static Float32 volume_from_scalar(Float32 scalar)
 }
 
 static UInt32 device_object_list_size(AudioObjectPropertyScope scope, AudioObjectID objectID) {
-    
-    switch (objectID) {
-        case kObjectID_Device:
-            {
-                if (scope == kAudioObjectPropertyScopeGlobal)
-                {
-                    return kDevice_ObjectListSize;
-                }
-
-                UInt32 count = 0;
-                for (UInt32 i = 0; i < kDevice_ObjectListSize; i++)
-                {
-                    count += (kDevice_ObjectList[i].scope == scope);
-                }
-
-                return count;
-            }
-            break;
-            
-        case kObjectID_Device2:
-            {
-                if (scope == kAudioObjectPropertyScopeGlobal)
-                {
-                    return kDevice2_ObjectListSize;
-                }
-
-                UInt32 count = 0;
-                for (UInt32 i = 0; i < kDevice2_ObjectListSize; i++)
-                {
-                    count += (kDevice2_ObjectList[i].scope == scope);
-                }
-
-                return count;
-            }
-            break;
-            
-        default:
-            return 0;
-            break;
+    const struct ObjectInfo* list = objectID == kObjectID_Device
+        ? kDevice_ObjectList
+        : (is_profile_device_object(objectID) ? kDevice2_ObjectList : NULL);
+    const UInt32 listSize = objectID == kObjectID_Device
+        ? kDevice_ObjectListSize
+        : (is_profile_device_object(objectID) ? kDevice2_ObjectListSize : 0);
+    if(list == NULL) { return 0; }
+    if(scope == kAudioObjectPropertyScopeGlobal) { return listSize; }
+    UInt32 count = 0;
+    for(UInt32 index = 0; index < listSize; ++index)
+    {
+        count += (list[index].scope == scope);
     }
+    return count;
 }
 
 static UInt32 device_stream_list_size(AudioObjectPropertyScope scope, AudioObjectID objectID) {
-    
-    switch (objectID) {
-        case kObjectID_Device:
-            {
-                UInt32 count = 0;
-                for (UInt32 i = 0; i < kDevice_ObjectListSize; i++)
-                {
-                    count += (kDevice_ObjectList[i].type == kObjectType_Stream && (kDevice_ObjectList[i].scope == scope || scope == kAudioObjectPropertyScopeGlobal));
-                }
-
-                return count;
-            }
-            break;
-            
-        case kObjectID_Device2:
-            {
-                UInt32 count = 0;
-                for (UInt32 i = 0; i < kDevice2_ObjectListSize; i++)
-                {
-                    count += (kDevice2_ObjectList[i].type == kObjectType_Stream && (kDevice2_ObjectList[i].scope == scope || scope == kAudioObjectPropertyScopeGlobal));
-                }
-
-                return count;
-            }
-            break;
-            
-        default:
-            return 0;
-            break;
+    const struct ObjectInfo* list = objectID == kObjectID_Device
+        ? kDevice_ObjectList
+        : (is_profile_device_object(objectID) ? kDevice2_ObjectList : NULL);
+    const UInt32 listSize = objectID == kObjectID_Device
+        ? kDevice_ObjectListSize
+        : (is_profile_device_object(objectID) ? kDevice2_ObjectListSize : 0);
+    UInt32 count = 0;
+    for(UInt32 index = 0; list != NULL && index < listSize; ++index)
+    {
+        count += list[index].type == kObjectType_Stream &&
+            (list[index].scope == scope || scope == kAudioObjectPropertyScopeGlobal);
     }
-    
-
+    return count;
 }
 
 static UInt32 device_control_list_size(AudioObjectPropertyScope scope, AudioObjectID objectID) {
-    
-    switch (objectID) {
-        case kObjectID_Device:
-        {
-            
-            UInt32 count = 0;
-            for (UInt32 i = 0; i < kDevice_ObjectListSize; i++)
-            {
-                count += (kDevice_ObjectList[i].type == kObjectType_Control && (kDevice_ObjectList[i].scope == scope || scope == kAudioObjectPropertyScopeGlobal));
-            }
-
-            return count;
-        }
-            break;
-        case kObjectID_Device2:
-        {
-            
-            UInt32 count = 0;
-            for (UInt32 i = 0; i < kDevice2_ObjectListSize; i++)
-            {
-                count += (kDevice2_ObjectList[i].type == kObjectType_Control && (kDevice2_ObjectList[i].scope == scope || scope == kAudioObjectPropertyScopeGlobal));
-            }
-
-            return count;
-        }
-            break;
-            
-        default:
-            return 0;
-            break;
+    const struct ObjectInfo* list = objectID == kObjectID_Device
+        ? kDevice_ObjectList
+        : (is_profile_device_object(objectID) ? kDevice2_ObjectList : NULL);
+    const UInt32 listSize = objectID == kObjectID_Device
+        ? kDevice_ObjectListSize
+        : (is_profile_device_object(objectID) ? kDevice2_ObjectListSize : 0);
+    UInt32 count = 0;
+    for(UInt32 index = 0; list != NULL && index < listSize; ++index)
+    {
+        count += list[index].type == kObjectType_Control &&
+            (list[index].scope == scope || scope == kAudioObjectPropertyScopeGlobal);
     }
-
+    return count;
 }
 
 static UInt32 minimum(UInt32 a, UInt32 b) {
@@ -763,9 +950,8 @@ static OSStatus	SystemAudioBridge_Initialize(AudioServerPlugInDriverRef inDriver
 	//	store the AudioServerPlugInHostRef
 	gPlugIn_Host = inHost;
 
-	// The public name and visibility are controlled by the app. The device is
-	// hidden under its generic name and becomes visible under the active
-	// profile name, while retaining the same stable device UID.
+	// The public name and visibility are controlled by the app. CamiTune keeps
+	// this transport hidden and exposes stable native profile endpoints above it.
 	pthread_mutex_lock(&gPlugIn_StateMutex);
 	if(gDevice_DisplayName == NULL)
 	{
@@ -879,7 +1065,7 @@ static OSStatus	SystemAudioBridge_AddDeviceClient(AudioServerPlugInDriverRef inD
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_AddDeviceClient: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_AddDeviceClient: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_AddDeviceClient: bad device ID");
 
 Done:
 	return theAnswer;
@@ -898,7 +1084,7 @@ static OSStatus	SystemAudioBridge_RemoveDeviceClient(AudioServerPlugInDriverRef 
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_RemoveDeviceClient: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_RemoveDeviceClient: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_RemoveDeviceClient: bad device ID");
 
 Done:
 	return theAnswer;
@@ -929,7 +1115,7 @@ static OSStatus	SystemAudioBridge_PerformDeviceConfigurationChange(AudioServerPl
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_PerformDeviceConfigurationChange: bad driver reference");
-    FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_PerformDeviceConfigurationChange: bad device ID");
+    FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_PerformDeviceConfigurationChange: bad device ID");
     switch(inChangeAction)
     {
         case ChangeAction_EnablePitchControl:
@@ -987,7 +1173,7 @@ static OSStatus	SystemAudioBridge_AbortDeviceConfigurationChange(AudioServerPlug
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_PerformDeviceConfigurationChange: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_PerformDeviceConfigurationChange: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_PerformDeviceConfigurationChange: bad device ID");
 
 Done:
 	return theAnswer;
@@ -1034,8 +1220,15 @@ static Boolean	SystemAudioBridge_HasProperty(AudioServerPlugInDriverRef inDriver
 		case kObjectID_Volume_Input_Master:
 		case kObjectID_Mute_Input_Master:
 		case kObjectID_Pitch_Adjust:
-        case kObjectID_ClockSource:
+		case kObjectID_ClockSource:
 			theAnswer = SystemAudioBridge_HasControlProperty(inDriver, inObjectID, inClientProcessID, inAddress);
+			break;
+
+		default:
+			if(is_profile_device_object(inObjectID))
+			{
+				theAnswer = SystemAudioBridge_HasDeviceProperty(inDriver, inObjectID, inClientProcessID, inAddress);
+			}
 			break;
 	};
 
@@ -1089,7 +1282,9 @@ static OSStatus	SystemAudioBridge_IsPropertySettable(AudioServerPlugInDriverRef 
 			break;
 
 		default:
-			theAnswer = kAudioHardwareBadObjectError;
+			theAnswer = is_profile_device_object(inObjectID)
+				? SystemAudioBridge_IsDevicePropertySettable(inDriver, inObjectID, inClientProcessID, inAddress, outIsSettable)
+				: kAudioHardwareBadObjectError;
 			break;
 	};
 
@@ -1142,7 +1337,9 @@ static OSStatus	SystemAudioBridge_GetPropertyDataSize(AudioServerPlugInDriverRef
 			break;
 			
 		default:
-			theAnswer = kAudioHardwareBadObjectError;
+			theAnswer = is_profile_device_object(inObjectID)
+				? SystemAudioBridge_GetDevicePropertyDataSize(inDriver, inObjectID, inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, outDataSize)
+				: kAudioHardwareBadObjectError;
 			break;
 	};
 
@@ -1196,7 +1393,9 @@ static OSStatus	SystemAudioBridge_GetPropertyData(AudioServerPlugInDriverRef inD
 			break;
 			
 		default:
-			theAnswer = kAudioHardwareBadObjectError;
+			theAnswer = is_profile_device_object(inObjectID)
+				? SystemAudioBridge_GetDevicePropertyData(inDriver, inObjectID, inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, inDataSize, outDataSize, outData)
+				: kAudioHardwareBadObjectError;
 			break;
 	};
 
@@ -1248,7 +1447,9 @@ static OSStatus	SystemAudioBridge_SetPropertyData(AudioServerPlugInDriverRef inD
 			break;
 			
 		default:
-			theAnswer = kAudioHardwareBadObjectError;
+			theAnswer = is_profile_device_object(inObjectID)
+				? SystemAudioBridge_SetDevicePropertyData(inDriver, inObjectID, inClientProcessID, inAddress, inQualifierDataSize, inQualifierData, inDataSize, inData, &theNumberPropertiesChanged, theChangedAddresses)
+				: kAudioHardwareBadObjectError;
 			break;
 	};
 
@@ -1256,6 +1457,30 @@ static OSStatus	SystemAudioBridge_SetPropertyData(AudioServerPlugInDriverRef inD
 	if(theNumberPropertiesChanged > 0 && gPlugIn_Host != NULL)
 	{
 		gPlugIn_Host->PropertiesChanged(gPlugIn_Host, inObjectID, theNumberPropertiesChanged, theChangedAddresses);
+
+		// The native profile endpoints intentionally share the transport's
+		// volume and mute controls. Forward control changes to every published
+		// endpoint so device-level Core Audio listeners (including CamiTune's
+		// physical-output mirror) observe the value selected in macOS.
+		if(inObjectID == kObjectID_Volume_Output_Master ||
+			inObjectID == kObjectID_Mute_Output_Master)
+		{
+			AudioObjectPropertyAddress deviceAddresses[2];
+			deviceAddresses[0].mSelector = inObjectID == kObjectID_Volume_Output_Master
+				? kAudioDevicePropertyVolumeScalar
+				: kAudioDevicePropertyMute;
+			deviceAddresses[0].mScope = kAudioObjectPropertyScopeOutput;
+			deviceAddresses[0].mElement = kAudioObjectPropertyElementMain;
+			UInt32 deviceAddressCount = 1;
+			if(inObjectID == kObjectID_Volume_Output_Master)
+			{
+				deviceAddresses[1].mSelector = kAudioDevicePropertyVolumeDecibels;
+				deviceAddresses[1].mScope = kAudioObjectPropertyScopeOutput;
+				deviceAddresses[1].mElement = kAudioObjectPropertyElementMain;
+				deviceAddressCount = 2;
+			}
+			notify_profile_devices(deviceAddressCount, deviceAddresses);
+		}
 
 		// A presentation command changes whether the main device appears in
 		// macOS and may also rename it. Notify the plug-in device list as well
@@ -1397,14 +1622,7 @@ static OSStatus	SystemAudioBridge_GetPlugInPropertyDataSize(AudioServerPlugInDri
 			break;
 			
 		case kAudioObjectPropertyOwnedObjects:
-			if(gBox_Acquired)
-			{
-				*outDataSize = 2 * sizeof(AudioClassID);
-			}
-			else
-			{
-				*outDataSize = sizeof(AudioClassID);
-			}
+			*outDataSize = (gBox_Acquired ? 2 + profile_device_count() : 1) * sizeof(AudioObjectID);
 			break;
 			
 		case kAudioPlugInPropertyBoxList:
@@ -1416,14 +1634,9 @@ static OSStatus	SystemAudioBridge_GetPlugInPropertyDataSize(AudioServerPlugInDri
 			break;
 			
 		case kAudioPlugInPropertyDeviceList:
-			if(gBox_Acquired)
-			{
-				*outDataSize = sizeof(AudioObjectID);
-			}
-			else
-			{
-				*outDataSize = 0;
-			}
+			*outDataSize = gBox_Acquired
+				? (1 + profile_device_count()) * sizeof(AudioObjectID)
+				: 0;
 			break;
 			
 		case kAudioPlugInPropertyTranslateUIDToDevice:
@@ -1499,22 +1712,23 @@ static OSStatus	SystemAudioBridge_GetPlugInPropertyData(AudioServerPlugInDriverR
 			//	case, only that number of items will be returned
 			theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
 			
-			//	Clamp that to the number of boxes this driver implements (which is just 1)
-			if(theNumberItemsToFetch > (gBox_Acquired ? 2 : 1))
+			UInt32 ownedObjectCount = gBox_Acquired ? 2 + profile_device_count() : 1;
+			if(theNumberItemsToFetch > ownedObjectCount) { theNumberItemsToFetch = ownedObjectCount; }
+			UInt32 writtenObjects = 0;
+			if(writtenObjects < theNumberItemsToFetch) { ((AudioObjectID*)outData)[writtenObjects++] = kObjectID_Box; }
+			if(gBox_Acquired && writtenObjects < theNumberItemsToFetch)
 			{
-				theNumberItemsToFetch = (gBox_Acquired ? 2 : 1);
+				((AudioObjectID*)outData)[writtenObjects++] = kObjectID_Device;
 			}
-			
-			//	Write the devices' object IDs into the return value
-			if(theNumberItemsToFetch > 1)
+			pthread_mutex_lock(&gPlugIn_StateMutex);
+			for(UInt32 slot = 0; gBox_Acquired && slot < 32 && writtenObjects < theNumberItemsToFetch; ++slot)
 			{
-				((AudioObjectID*)outData)[0] = kObjectID_Box;
-				((AudioObjectID*)outData)[1] = kObjectID_Device;
+				if(gProfileDevice_UIDs[slot] != NULL)
+				{
+					((AudioObjectID*)outData)[writtenObjects++] = kObjectID_ProfileDevice_First + slot;
+				}
 			}
-			else if(theNumberItemsToFetch > 0)
-			{
-				((AudioObjectID*)outData)[0] = kObjectID_Box;
-			}
+			pthread_mutex_unlock(&gPlugIn_StateMutex);
 			
 			//	Return how many bytes we wrote to
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioClassID);
@@ -1572,18 +1786,22 @@ static OSStatus	SystemAudioBridge_GetPlugInPropertyData(AudioServerPlugInDriverR
 			//	case, only that number of items will be returned
 			theNumberItemsToFetch = inDataSize / sizeof(AudioObjectID);
 			
-			//	Clamp that to the number of devices this driver implements (which is just 1 if the
-			//	box has been acquired)
-			if(theNumberItemsToFetch > (gBox_Acquired ? 1 : 0))
+			UInt32 availableDeviceCount = gBox_Acquired ? 1 + profile_device_count() : 0;
+			if(theNumberItemsToFetch > availableDeviceCount) { theNumberItemsToFetch = availableDeviceCount; }
+			UInt32 writtenDevices = 0;
+			if(gBox_Acquired && writtenDevices < theNumberItemsToFetch)
 			{
-				theNumberItemsToFetch = (gBox_Acquired ? 1 : 0);
+				((AudioObjectID*)outData)[writtenDevices++] = kObjectID_Device;
 			}
-			
-			//	Write the devices' object IDs into the return value
-	            if(theNumberItemsToFetch > 0)
-	            {
-	                ((AudioObjectID*)outData)[0] = kObjectID_Device;
-	            }
+			pthread_mutex_lock(&gPlugIn_StateMutex);
+			for(UInt32 slot = 0; gBox_Acquired && slot < 32 && writtenDevices < theNumberItemsToFetch; ++slot)
+			{
+				if(gProfileDevice_UIDs[slot] != NULL)
+				{
+					((AudioObjectID*)outData)[writtenDevices++] = kObjectID_ProfileDevice_First + slot;
+				}
+			}
+			pthread_mutex_unlock(&gPlugIn_StateMutex);
 			
 			//	Return how many bytes we wrote to
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioClassID);
@@ -1601,15 +1819,27 @@ static OSStatus	SystemAudioBridge_GetPlugInPropertyData(AudioServerPlugInDriverR
             
             
 			
+			CFStringRef requestedUID = *((CFStringRef*)inQualifierData);
 			CFStringRef deviceUID = get_device_uid();
 
-			if(CFStringCompare(*((CFStringRef*)inQualifierData), deviceUID, 0) == kCFCompareEqualTo)
+			if(CFStringCompare(requestedUID, deviceUID, 0) == kCFCompareEqualTo)
 			{
 				*((AudioObjectID*)outData) = kObjectID_Device;
 			}
 			else
 			{
 				*((AudioObjectID*)outData) = kAudioObjectUnknown;
+				pthread_mutex_lock(&gPlugIn_StateMutex);
+				for(UInt32 slot = 0; slot < 32; ++slot)
+				{
+					if(gProfileDevice_UIDs[slot] != NULL &&
+						CFStringCompare(requestedUID, gProfileDevice_UIDs[slot], 0) == kCFCompareEqualTo)
+					{
+						*((AudioObjectID*)outData) = kObjectID_ProfileDevice_First + slot;
+						break;
+					}
+				}
+				pthread_mutex_unlock(&gPlugIn_StateMutex);
 			}
 			*outDataSize = sizeof(AudioObjectID);
 			CFRelease(deviceUID);
@@ -1862,9 +2092,9 @@ static OSStatus	SystemAudioBridge_GetBoxPropertyDataSize(AudioServerPlugInDriver
 			
 		case kAudioBoxPropertyDeviceList:
 			{
-				pthread_mutex_lock(&gPlugIn_StateMutex);
-				*outDataSize = gBox_Acquired ? sizeof(AudioObjectID) : 0;
-				pthread_mutex_unlock(&gPlugIn_StateMutex);
+				*outDataSize = gBox_Acquired
+					? (1 + profile_device_count()) * sizeof(AudioObjectID)
+					: 0;
 			}
 			break;
 			
@@ -2039,16 +2269,17 @@ static OSStatus	SystemAudioBridge_GetBoxPropertyData(AudioServerPlugInDriverRef 
 			pthread_mutex_lock(&gPlugIn_StateMutex);
 			if(gBox_Acquired)
 			{
-                if(inDataSize < sizeof(AudioObjectID))
-                {
-                    theAnswer = kAudioHardwareBadPropertySizeError;
-                    *outDataSize = 0;
-                }
-	                else
-	                {
-	                    ((AudioObjectID*)outData)[0] = kObjectID_Device;
-	                    *outDataSize = sizeof(AudioObjectID);
-	                }
+				UInt32 capacity = inDataSize / sizeof(AudioObjectID);
+				UInt32 written = 0;
+				if(capacity > 0) { ((AudioObjectID*)outData)[written++] = kObjectID_Device; }
+				for(UInt32 slot = 0; slot < 32 && written < capacity; ++slot)
+				{
+					if(gProfileDevice_UIDs[slot] != NULL)
+					{
+						((AudioObjectID*)outData)[written++] = kObjectID_ProfileDevice_First + slot;
+					}
+				}
+				*outDataSize = written * sizeof(AudioObjectID);
 			}
 			else
 			{
@@ -2183,7 +2414,7 @@ static Boolean	SystemAudioBridge_HasDeviceProperty(AudioServerPlugInDriverRef in
 	//	check the arguments
 	FailIf(inDriver != gAudioServerPlugInDriverRef, Done, "SystemAudioBridge_HasDeviceProperty: bad driver reference");
 	FailIf(inAddress == NULL, Done, "SystemAudioBridge_HasDeviceProperty: no address");
-	FailIf(inObjectID != kObjectID_Device && inObjectID != kObjectID_Device2, Done, "SystemAudioBridge_HasDeviceProperty: not the device object");
+	FailIf(!is_device_object(inObjectID), Done, "SystemAudioBridge_HasDeviceProperty: not the device object");
 	
 	//	Note that for each object, this driver implements all the required properties plus a few
 	//	extras that are useful but not required. There is more detailed commentary about each
@@ -2243,7 +2474,7 @@ static OSStatus	SystemAudioBridge_IsDevicePropertySettable(AudioServerPlugInDriv
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_IsDevicePropertySettable: bad driver reference");
 	FailWithAction(inAddress == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_IsDevicePropertySettable: no address");
 	FailWithAction(outIsSettable == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_IsDevicePropertySettable: no place to put the return value");
-	FailWithAction(inObjectID != kObjectID_Device && inObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_IsDevicePropertySettable: not the device object");
+	FailWithAction(!is_device_object(inObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_IsDevicePropertySettable: not the device object");
 	
 	//	Note that for each object, this driver implements all the required properties plus a few
 	//	extras that are useful but not required. There is more detailed commentary about each
@@ -2309,7 +2540,7 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyDataSize(AudioServerPlugInDri
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetDevicePropertyDataSize: bad driver reference");
 	FailWithAction(inAddress == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_GetDevicePropertyDataSize: no address");
 	FailWithAction(outDataSize == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_GetDevicePropertyDataSize: no place to put the return value");
-	FailWithAction(inObjectID != kObjectID_Device && inObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetDevicePropertyDataSize: not the device object");
+	FailWithAction(!is_device_object(inObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetDevicePropertyDataSize: not the device object");
 	
 	//	Note that for each object, this driver implements all the required properties plus a few
 	//	extras that are useful but not required. There is more detailed commentary about each
@@ -2451,7 +2682,7 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 	FailWithAction(inAddress == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_GetDevicePropertyData: no address");
 	FailWithAction(outDataSize == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_GetDevicePropertyData: no place to put the return value size");
 	FailWithAction(outData == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_GetDevicePropertyData: no place to put the return value");
-	FailWithAction(inObjectID != kObjectID_Device && inObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetDevicePropertyData: not the device object");
+	FailWithAction(!is_device_object(inObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetDevicePropertyData: not the device object");
 	
 	//	Note that for each object, this driver implements all the required properties plus a few
 	//	extras that are useful but not required.
@@ -2485,17 +2716,11 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			//	This is the human readable name of the device.
 			FailWithAction(inDataSize < sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SystemAudioBridge_GetDevicePropertyData: not enough space for the return value of kAudioObjectPropertyManufacturer for the device");
             
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    *((CFStringRef*)outData) = get_device_name();
-                    *outDataSize = sizeof(CFStringRef);
-                    break;
-                    
-                case kObjectID_Device2:
-                    *((CFStringRef*)outData) = get_device2_name();
-                    *outDataSize = sizeof(CFStringRef);
-                    break;
-            }
+			*((CFStringRef*)outData) = inObjectID == kObjectID_Device
+				? get_device_name()
+				: copy_profile_device_name(inObjectID);
+			if(*((CFStringRef*)outData) == NULL) { *((CFStringRef*)outData) = get_device2_name(); }
+			*outDataSize = sizeof(CFStringRef);
 			break;
 			
 		case kAudioObjectPropertyManufacturer:
@@ -2511,28 +2736,14 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			//	case, only that number of items will be returned
             theNumberItemsToFetch = minimum(inDataSize / sizeof(AudioObjectID), device_object_list_size(inAddress->mScope, inObjectID));
 
-            //    fill out the list with the right objects
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
-                    {
-                        if (kDevice_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal)
-                        {
-                            ((AudioObjectID*)outData)[k++] = kDevice_ObjectList[i].id;
-                        }
-                    }
-                    break;
-
-                case kObjectID_Device2:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
-                    {
-                        if (kDevice2_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal)
-                        {
-                            ((AudioObjectID*)outData)[k++] = kDevice2_ObjectList[i].id;
-                        }
-                    }
-                    break;
-            }
+			const struct ObjectInfo* ownedList = inObjectID == kObjectID_Device ? kDevice_ObjectList : kDevice2_ObjectList;
+			for(UInt32 index = 0, written = 0; written < theNumberItemsToFetch; ++index)
+			{
+				if(ownedList[index].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal)
+				{
+					((AudioObjectID*)outData)[written++] = ownedList[index].id;
+				}
+			}
 
 			//	report how much we wrote
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioObjectID);
@@ -2544,19 +2755,11 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			//	device must have different values for this property.
 			FailWithAction(inDataSize < sizeof(CFStringRef), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SystemAudioBridge_GetDevicePropertyData: not enough space for the return value of kAudioDevicePropertyDeviceUID for the device");
 
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    *((CFStringRef*)outData) = get_device_uid();
-                    *outDataSize = sizeof(CFStringRef);
-                    break;
-                    
-                case kObjectID_Device2:
-                    *((CFStringRef*)outData) = get_device2_uid();
-                    *outDataSize = sizeof(CFStringRef);
-                    break;
-            }
-            
-
+			*((CFStringRef*)outData) = inObjectID == kObjectID_Device
+				? get_device_uid()
+				: copy_profile_device_uid(inObjectID);
+			if(*((CFStringRef*)outData) == NULL) { *((CFStringRef*)outData) = get_device2_uid(); }
+			*outDataSize = sizeof(CFStringRef);
 			break;
 
 		case kAudioDevicePropertyModelUID:
@@ -2599,19 +2802,7 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			}
 			
 			//	Write the devices' object IDs into the return value
-			if(theNumberItemsToFetch > 0)
-			{
-                switch (inObjectID) {
-                    case kObjectID_Device:
-                        ((AudioObjectID*)outData)[0] = kObjectID_Device;
-                        break;
-                        
-                    case kObjectID_Device2:
-                        ((AudioObjectID*)outData)[0] = kObjectID_Device2;
-                        break;
-                }
-				
-			}
+			if(theNumberItemsToFetch > 0) { ((AudioObjectID*)outData)[0] = inObjectID; }
 			
 			//	report how much we wrote
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioObjectID);
@@ -2634,7 +2825,16 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			//	not uncommon for a device to be dead but still momentarily available in the
 			//	device list. In the case of this device, it will always be alive.
 			FailWithAction(inDataSize < sizeof(UInt32), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SystemAudioBridge_GetDevicePropertyData: not enough space for the return value of kAudioDevicePropertyDeviceIsAlive for the device");
-			*((UInt32*)outData) = 1;
+			if(inObjectID == kObjectID_Device)
+			{
+				*((UInt32*)outData) = 1;
+			}
+			else
+			{
+				CFStringRef uid = copy_profile_device_uid(inObjectID);
+				*((UInt32*)outData) = uid != NULL ? 1 : 0;
+				if(uid != NULL) { CFRelease(uid); }
+			}
 			*outDataSize = sizeof(UInt32);
 			break;
 
@@ -2643,21 +2843,9 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
             //    we need to take both the state lock to check this value for thread safety.
             FailWithAction(inDataSize < sizeof(UInt32), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SystemAudioBridge_GetDevicePropertyData: not enough space for the return value of kAudioDevicePropertyDeviceIsRunning for the device");
             pthread_mutex_lock(&gPlugIn_StateMutex);
-            if (inObjectID == kObjectID_Device) {
-                *((UInt32*)outData) = ((gDevice_IOIsRunning > 0) > 0) ? 1 : 0;
-            }
-            
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    *((UInt32*)outData) = ((gDevice_IOIsRunning > 0) > 0) ? 1 : 0;
-                    break;
-                case kObjectID_Device2:
-                    *((UInt32*)outData) = ((gDevice2_IOIsRunning > 0) > 0) ? 1 : 0;
-                    break;
-                default:
-                    *((UInt32*)outData) = 0;
-                    break;
-            }
+			*((UInt32*)outData) = inObjectID == kObjectID_Device
+				? (gDevice_IOIsRunning > 0 ? 1 : 0)
+				: (gDevice2_IOIsRunning > 0 ? 1 : 0);
             
             pthread_mutex_unlock(&gPlugIn_StateMutex);
             *outDataSize = sizeof(UInt32);
@@ -2697,30 +2885,15 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			//	case, only that number of items will be returned
             theNumberItemsToFetch = minimum(inDataSize / sizeof(AudioObjectID), device_stream_list_size(inAddress->mScope, inObjectID));
 
-            //    fill out the list with as many objects as requested
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
-                    {
-                        if ((kDevice_ObjectList[i].type == kObjectType_Stream) &&
-                            (kDevice_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal))
-                        {
-                            ((AudioObjectID*)outData)[k++] = kDevice_ObjectList[i].id;
-                        }
-                    }
-                    break;
-
-                case kObjectID_Device2:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
-                    {
-                        if ((kDevice2_ObjectList[i].type == kObjectType_Stream) &&
-                            (kDevice2_ObjectList[i].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal))
-                        {
-                            ((AudioObjectID*)outData)[k++] = kDevice2_ObjectList[i].id;
-                        }
-                    }
-                    break;
-            }
+			const struct ObjectInfo* streamList = inObjectID == kObjectID_Device ? kDevice_ObjectList : kDevice2_ObjectList;
+			for(UInt32 index = 0, written = 0; written < theNumberItemsToFetch; ++index)
+			{
+				if(streamList[index].type == kObjectType_Stream &&
+					(streamList[index].scope == inAddress->mScope || inAddress->mScope == kAudioObjectPropertyScopeGlobal))
+				{
+					((AudioObjectID*)outData)[written++] = streamList[index].id;
+				}
+			}
 
 			//	report how much we wrote
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioObjectID);
@@ -2733,31 +2906,17 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 
             theNumberItemsToFetch = minimum(inDataSize / sizeof(AudioObjectID), device_control_list_size(inAddress->mScope, inObjectID));
 
-            //    fill out the list with as many objects as requested
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    pthread_mutex_lock(&gPlugIn_StateMutex);
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
-                    {
-                        // TODO remove hack! There must be a better way than looking for a fixed i
-                        if ((kDevice_ObjectList[i].type == kObjectType_Control) && !(!gPitch_Adjust_Enabled && kDevice_ObjectList[i].id==kObjectID_Pitch_Adjust))
-                        {
-                            ((AudioObjectID*)outData)[k++] = kDevice_ObjectList[i].id;
-                        }
-                    }
-                    pthread_mutex_unlock(&gPlugIn_StateMutex);
-                    break;
-
-                case kObjectID_Device2:
-                    for (UInt32 i = 0, k = 0; k < theNumberItemsToFetch; i++)
-                    {
-                        if ((kDevice_ObjectList[i].type == kObjectType_Control) && !(!gPitch_Adjust_Enabled && kDevice_ObjectList[i].id==kObjectID_Pitch_Adjust))
-                        {
-                            ((AudioObjectID*)outData)[k++] = kDevice2_ObjectList[i].id;
-                        }
-                    }
-                    break;
-            }
+			const struct ObjectInfo* controlList = inObjectID == kObjectID_Device ? kDevice_ObjectList : kDevice2_ObjectList;
+			pthread_mutex_lock(&gPlugIn_StateMutex);
+			for(UInt32 index = 0, written = 0; written < theNumberItemsToFetch; ++index)
+			{
+				if(controlList[index].type == kObjectType_Control &&
+					!(!gPitch_Adjust_Enabled && controlList[index].id == kObjectID_Pitch_Adjust))
+				{
+					((AudioObjectID*)outData)[written++] = controlList[index].id;
+				}
+			}
+			pthread_mutex_unlock(&gPlugIn_StateMutex);
 
 			//	report how much we wrote
 			*outDataSize = theNumberItemsToFetch * sizeof(AudioObjectID);
@@ -2812,17 +2971,18 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			//	This returns whether or not the device is visible to clients.
 			FailWithAction(inDataSize < sizeof(UInt32), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SystemAudioBridge_GetDevicePropertyData: not enough space for the return value of kAudioDevicePropertyIsHidden for the device");
             
-            switch (inObjectID) {
-                case kObjectID_Device:
-                    pthread_mutex_lock(&gPlugIn_StateMutex);
-                    *((UInt32*)outData) = gDevice_IsHidden;
-                    pthread_mutex_unlock(&gPlugIn_StateMutex);
-                    break;
-                
-                case kObjectID_Device2:
-                    *((UInt32*)outData) = kDevice2_IsHidden;
-                    break;
-            }
+			if(inObjectID == kObjectID_Device)
+			{
+				pthread_mutex_lock(&gPlugIn_StateMutex);
+				*((UInt32*)outData) = gDevice_IsHidden;
+				pthread_mutex_unlock(&gPlugIn_StateMutex);
+			}
+			else
+			{
+				CFStringRef uid = copy_profile_device_uid(inObjectID);
+				*((UInt32*)outData) = uid == NULL ? 1 : 0;
+				if(uid != NULL) { CFRelease(uid); }
+			}
 			*outDataSize = sizeof(UInt32);
 			break;
 
@@ -2915,7 +3075,7 @@ static OSStatus	SystemAudioBridge_SetDevicePropertyData(AudioServerPlugInDriverR
 	FailWithAction(inAddress == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_SetDevicePropertyData: no address");
 	FailWithAction(outNumberPropertiesChanged == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_SetDevicePropertyData: no place to return the number of properties that changed");
 	FailWithAction(outChangedAddresses == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_SetDevicePropertyData: no place to return the properties that changed");
-	FailWithAction(inObjectID != kObjectID_Device && inObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_SetDevicePropertyData: not the device object");
+	FailWithAction(!is_device_object(inObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_SetDevicePropertyData: not the device object");
 	
 	//	initialize the returned number of changed properties
 	*outNumberPropertiesChanged = 0;
@@ -2981,6 +3141,22 @@ static OSStatus	SystemAudioBridge_SetDevicePropertyData(AudioServerPlugInDriverR
 					outChangedAddresses[1].mSelector = kAudioDevicePropertyIsHidden;
 					outChangedAddresses[1].mScope = kAudioObjectPropertyScopeGlobal;
 					outChangedAddresses[1].mElement = kAudioObjectPropertyElementMain;
+					break;
+				}
+				if(command != NULL &&
+					CFGetTypeID(command) == CFStringGetTypeID() &&
+					CFStringCompare(
+						(CFStringRef)command,
+						CFSTR(SABR_TRANSPORT_COMMAND_PROFILE_DEVICES),
+						0
+					) == kCFCompareEqualTo)
+				{
+					FailWithAction(inObjectID != kObjectID_Device, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_SetDevicePropertyData: profile devices are only configured through the main device");
+					CFTypeRef profiles = CFDictionaryGetValue(
+						dictionary,
+						CFSTR(SABR_TRANSPORT_KEY_PROFILES)
+					);
+					theAnswer = set_profile_devices((CFArrayRef)profiles);
 					break;
 				}
 			}
@@ -4431,16 +4607,16 @@ static OSStatus	SystemAudioBridge_StartIO(AudioServerPlugInDriverRef inDriver, A
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_StartIO: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_StartIO: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_StartIO: bad device ID");
     FailWithAction(inDeviceObjectID == kObjectID_Device && gDevice_IOIsRunning == UINT64_MAX, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_StartIO: overflow error.");
-    FailWithAction(inDeviceObjectID == kObjectID_Device2 && gDevice2_IOIsRunning == UINT64_MAX, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_StartIO: overflow error.");
+    FailWithAction(is_profile_device_object(inDeviceObjectID) && gDevice2_IOIsRunning == UINT64_MAX, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_StartIO: overflow error.");
 
 	//	we need to hold the state lock
 	pthread_mutex_lock(&gPlugIn_StateMutex);
 	
     
     if (inDeviceObjectID == kObjectID_Device) { gDevice_IOIsRunning += 1; }
-    if (inDeviceObjectID == kObjectID_Device2) { gDevice2_IOIsRunning += 1; }
+    if (is_profile_device_object(inDeviceObjectID)) { gDevice2_IOIsRunning += 1; }
     
     // allocate ring buffer
     if ((gDevice_IOIsRunning || gDevice2_IOIsRunning) && gRingBuffer == NULL)
@@ -4472,16 +4648,16 @@ static OSStatus	SystemAudioBridge_StopIO(AudioServerPlugInDriverRef inDriver, Au
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_StopIO: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_StopIO: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_StopIO: bad device ID");
     FailWithAction(inDeviceObjectID == kObjectID_Device && gDevice_IOIsRunning == 0, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_StartIO: underflow error.");
-    FailWithAction(inDeviceObjectID == kObjectID_Device2 && gDevice2_IOIsRunning == 0, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_StartIO: underflow error.");
+    FailWithAction(is_profile_device_object(inDeviceObjectID) && gDevice2_IOIsRunning == 0, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_StartIO: underflow error.");
 
 	//	we need to hold the state lock
 	pthread_mutex_lock(&gPlugIn_StateMutex);
 	
     
     if (inDeviceObjectID == kObjectID_Device) { gDevice_IOIsRunning -= 1; }
-    if (inDeviceObjectID == kObjectID_Device2) { gDevice2_IOIsRunning -= 1; }
+    if (is_profile_device_object(inDeviceObjectID)) { gDevice2_IOIsRunning -= 1; }
     
     // free the ring buffer
     if (!gDevice_IOIsRunning && !gDevice2_IOIsRunning && gRingBuffer != NULL)
@@ -4520,7 +4696,7 @@ static OSStatus	SystemAudioBridge_GetZeroTimeStamp(AudioServerPlugInDriverRef in
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetZeroTimeStamp: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetZeroTimeStamp: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_GetZeroTimeStamp: bad device ID");
 
 	//	we need to hold the locks
 	pthread_mutex_lock(&gDevice_IOMutex);
@@ -4574,7 +4750,7 @@ static OSStatus	SystemAudioBridge_WillDoIOOperation(AudioServerPlugInDriverRef i
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_WillDoIOOperation: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_WillDoIOOperation: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_WillDoIOOperation: bad device ID");
 
 	//	figure out if we support the operation
 	bool willDo = false;
@@ -4621,7 +4797,7 @@ static OSStatus	SystemAudioBridge_BeginIOOperation(AudioServerPlugInDriverRef in
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_BeginIOOperation: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_BeginIOOperation: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_BeginIOOperation: bad device ID");
 
 Done:
 	return theAnswer;
@@ -4638,7 +4814,7 @@ static OSStatus	SystemAudioBridge_DoIOOperation(AudioServerPlugInDriverRef inDri
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_DoIOOperation: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_DoIOOperation: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_DoIOOperation: bad device ID");
 	FailWithAction((inStreamObjectID != kObjectID_Stream_Input) && (inStreamObjectID != kObjectID_Stream_Output), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_DoIOOperation: bad stream ID");
 
     // Calculate the ring buffer offsets and splits.
@@ -4739,7 +4915,7 @@ static OSStatus	SystemAudioBridge_EndIOOperation(AudioServerPlugInDriverRef inDr
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_EndIOOperation: bad driver reference");
-	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_EndIOOperation: bad device ID");
+	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_EndIOOperation: bad device ID");
 
 Done:
 	return theAnswer;

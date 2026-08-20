@@ -55,8 +55,7 @@ struct ProfileRoutingDescriptor: Hashable {
     ) -> Set<UUID> {
         var result = additionallyVisible
         for profile in profiles where profile.isEnabled {
-            if profile.autoActivateWhenProfileDeviceSelected ||
-                (profile.autoActivate && defaultOutputUID == profile.outputDeviceUID) {
+            if profile.autoActivateWhenProfileDeviceSelected {
                 result.insert(profile.id)
             }
         }
@@ -65,9 +64,9 @@ struct ProfileRoutingDescriptor: Hashable {
            profiles.contains(where: { $0.id == selectedProfileID && $0.isEnabled }) {
             result.insert(selectedProfileID)
         }
-        // The active profile uses the real bridge device so macOS exposes its
-        // master volume control. Aggregates are selection-only entries.
-        if let activeProfileID { result.remove(activeProfileID) }
+        // Keep the active native profile endpoint published. The driver routes
+        // every profile endpoint into the same hidden PCM transport.
+        if let activeProfileID { result.insert(activeProfileID) }
         return result
     }
 

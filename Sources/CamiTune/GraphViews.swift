@@ -2,7 +2,8 @@ import SwiftUI
 
 struct GraphicEqualizerBands: View {
     @Binding var bands: [EQBand]
-    @ObservedObject var spectrum: SpectrumAnalyzer
+    let spectrum: SpectrumAnalyzer
+    let profileID: UUID
     let responsePoints: [EQResponsePoint]
     let setKind: (EQBand.Kind, inout EQBand) -> Void
     let columnWidth: CGFloat
@@ -22,7 +23,8 @@ struct GraphicEqualizerBands: View {
             ForEach(bands.indices, id: \.self) { index in
                 EQBandColumn(
                     band: $bands[index],
-                    audioDB: audioLevel(at: bands[index].frequency),
+                    spectrum: spectrum,
+                    profileID: profileID,
                     responseDB: responseGain(at: bands[index].frequency),
                     setKind: setKind
                 )
@@ -33,24 +35,6 @@ struct GraphicEqualizerBands: View {
         .background(alignment: .topLeading) {
             EQGainGuideGrid()
         }
-    }
-
-    private func audioLevel(at frequency: Double) -> Double {
-        guard !spectrum.points.isEmpty else { return -100 }
-        var lower = 0
-        var upper = spectrum.points.count
-        while lower < upper {
-            let middle = (lower + upper) / 2
-            if spectrum.points[middle].frequency < frequency { lower = middle + 1 }
-            else { upper = middle }
-        }
-        if lower == 0 { return spectrum.points[0].db }
-        if lower == spectrum.points.count { return spectrum.points[lower - 1].db }
-        let before = spectrum.points[lower - 1]
-        let after = spectrum.points[lower]
-        return logDistance(before.frequency, frequency) <= logDistance(after.frequency, frequency)
-            ? before.db
-            : after.db
     }
 
     private func responseGain(at frequency: Double) -> Double {
@@ -78,7 +62,8 @@ struct GraphicEqualizerBands: View {
 
 private struct EQBandColumn: View {
     @Binding var band: EQBand
-    let audioDB: Double
+    let spectrum: SpectrumAnalyzer
+    let profileID: UUID
     let responseDB: Double
     let setKind: (EQBand.Kind, inout EQBand) -> Void
     private let fieldWidth: CGFloat = 68
@@ -97,12 +82,14 @@ private struct EQBandColumn: View {
             }
             .frame(maxWidth: .infinity, minHeight: 24, maxHeight: 24)
 
-            VerticalEQSlider(
+            SpectrumAwareVerticalEQSlider(
                 gain: Binding(
                     get: { band.gain ?? 0 },
                     set: { band.gain = usesGain(band.kind) ? $0 : nil }
                 ),
-                audioDB: audioDB,
+                spectrum: spectrum,
+                profileID: profileID,
+                frequency: band.frequency,
                 responseDB: responseDB,
                 gainEnabled: usesGain(band.kind)
             )
@@ -193,6 +180,47 @@ private struct EQBandColumn: View {
     }
 }
 
+private struct SpectrumAwareVerticalEQSlider: View {
+    @Binding var gain: Double
+    @ObservedObject var spectrum: SpectrumAnalyzer
+    let profileID: UUID
+    let frequency: Double
+    let responseDB: Double
+    let gainEnabled: Bool
+
+    var body: some View {
+        VerticalEQSlider(
+            gain: $gain,
+            audioDB: audioLevel,
+            responseDB: responseDB,
+            gainEnabled: gainEnabled
+        )
+    }
+
+    private var audioLevel: Double {
+        guard spectrum.activeProfileID == profileID,
+              !spectrum.points.isEmpty else { return -100 }
+        var lower = 0
+        var upper = spectrum.points.count
+        while lower < upper {
+            let middle = (lower + upper) / 2
+            if spectrum.points[middle].frequency < frequency { lower = middle + 1 }
+            else { upper = middle }
+        }
+        if lower == 0 { return spectrum.points[0].db }
+        if lower == spectrum.points.count { return spectrum.points[lower - 1].db }
+        let before = spectrum.points[lower - 1]
+        let after = spectrum.points[lower]
+        return logDistance(before.frequency, frequency) <= logDistance(after.frequency, frequency)
+            ? before.db
+            : after.db
+    }
+
+    private func logDistance(_ lhs: Double, _ rhs: Double) -> Double {
+        abs(log(max(lhs, 1) / max(rhs, 1)))
+    }
+}
+
 private struct VerticalEQSlider: View {
     @Binding var gain: Double
     let audioDB: Double
@@ -215,8 +243,9 @@ private struct VerticalEQSlider: View {
                     .position(x: track.midX, y: track.midY)
                 Capsule()
                     .fill(Color.green.opacity(0.18))
-                    .frame(width: track.width, height: track.height * preEQAmount)
-                    .position(x: track.midX, y: track.maxY - track.height * preEQAmount / 2)
+                    .frame(width: track.width, height: track.height)
+                    .scaleEffect(x: 1, y: preEQAmount, anchor: .bottom)
+                    .position(x: track.midX, y: track.midY)
                 Capsule()
                     .fill(
                         LinearGradient(
@@ -225,8 +254,9 @@ private struct VerticalEQSlider: View {
                             endPoint: .top
                         )
                     )
-                    .frame(width: track.width, height: track.height * postEQAmount)
-                    .position(x: track.midX, y: track.maxY - track.height * postEQAmount / 2)
+                    .frame(width: track.width, height: track.height)
+                    .scaleEffect(x: 1, y: postEQAmount, anchor: .bottom)
+                    .position(x: track.midX, y: track.midY)
                 if changeHeight > 0.5 {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(responseDB >= 0 ? Color.blue.opacity(0.88) : Color.orange.opacity(0.88))
@@ -249,7 +279,10 @@ private struct VerticalEQSlider: View {
                     .shadow(color: .black.opacity(0.2), radius: 1.5, y: 1)
                     .position(x: track.midX, y: thumbY)
             }
-            .animation(.linear(duration: 0.08), value: audioDB)
+            .animation(
+                .linear(duration: UIRenderPerformance.animatedLevelTransitionDuration),
+                value: audioDB
+            )
             .animation(.easeOut(duration: 0.12), value: responseDB)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             .contentShape(Rectangle())
@@ -412,7 +445,7 @@ struct LineGraph: View {
     var fillsArea: Bool = false
 
     var body: some View {
-        Canvas { context, size in
+        Canvas(rendersAsynchronously: true) { context, size in
             let rect = CGRect(origin: .zero, size: size)
             drawGrid(context: &context, rect: rect)
             guard points.count > 1 else { return }
@@ -528,7 +561,7 @@ struct SpectrumWithResponseGraph: View {
     let responseRange: ClosedRange<Double>
 
     var body: some View {
-        Canvas { context, size in
+        Canvas(rendersAsynchronously: true) { context, size in
             drawGrid(context: &context, size: size)
             drawLine(
                 points: spectrum,
@@ -674,13 +707,20 @@ struct MeterBar: View {
                     Capsule().fill(.quaternary)
                     Capsule()
                         .fill(.primary.opacity(0.45))
-                        .frame(width: geo.size.width * normalized(rms))
-                        .animation(.linear(duration: 0.08), value: rms)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .scaleEffect(x: normalized(rms), y: 1, anchor: .leading)
+                        .animation(
+                            .linear(duration: UIRenderPerformance.animatedLevelTransitionDuration),
+                            value: rms
+                        )
                     Rectangle()
                         .fill(.primary)
                         .frame(width: 2)
                         .offset(x: geo.size.width * normalized(peak) - 1)
-                        .animation(.linear(duration: 0.08), value: peak)
+                        .animation(
+                            .linear(duration: UIRenderPerformance.animatedLevelTransitionDuration),
+                            value: peak
+                        )
                 }
             }.frame(height: 9)
         }
@@ -692,21 +732,49 @@ struct MeterBar: View {
 }
 
 struct SignalMetersView: View {
-    @ObservedObject var meters: MeterModel
+    let meters: MeterModel
+    let profileID: UUID
 
     var body: some View {
         HStack(spacing: 24) {
-            meterGroup("Audio In", rms: meters.captureRMS, peak: meters.capturePeak)
-            meterGroup("Audio Out", rms: meters.playbackRMS, peak: meters.playbackPeak)
+            meterGroup("Audio In", source: .capture)
+            meterGroup("Audio Out", source: .playback)
         }
     }
 
-    private func meterGroup(_ title: String, rms: [Double], peak: [Double]) -> some View {
+    private func meterGroup(_ title: String, source: LiveStereoMeterBars.Source) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title).font(.headline)
+            LiveStereoMeterBars(meters: meters, profileID: profileID, source: source)
+        }.frame(maxWidth: .infinity)
+    }
+}
+
+private struct LiveStereoMeterBars: View {
+    enum Source {
+        case capture
+        case playback
+    }
+
+    @ObservedObject var meters: MeterModel
+    let profileID: UUID
+    let source: Source
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
             MeterBar(label: "L", rms: rms[safe: 0] ?? -150, peak: peak[safe: 0] ?? -150)
             MeterBar(label: "R", rms: rms[safe: 1] ?? -150, peak: peak[safe: 1] ?? -150)
-        }.frame(maxWidth: .infinity)
+        }
+    }
+
+    private var profileIsActive: Bool { meters.activeSession?.profileID == profileID }
+    private var rms: [Double] {
+        guard profileIsActive else { return [-150, -150] }
+        return source == .capture ? meters.captureRMS : meters.playbackRMS
+    }
+    private var peak: [Double] {
+        guard profileIsActive else { return [-150, -150] }
+        return source == .capture ? meters.capturePeak : meters.playbackPeak
     }
 }
 

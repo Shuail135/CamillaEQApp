@@ -136,48 +136,6 @@ When you turn EQ off, CamiTune stops processing and returns audio to the physica
 - **The app uses lots of resources:** when the app window is opened, it needs to calculate the live spectrum graphs, simply close the window app and leave it on the menu bar.
 
 ***
-
-## Development
-
-### System Audio Bridge v0.1.1
-
-System Audio Bridge is CamiTune's output-only Core Audio driver. When an EQ
-profile is activated, macOS sends system audio to a virtual output named after
-that profile. The driver passes the audio to CamiTune, CamillaDSP applies
-the profile's filters, and the processed result is played through the physical
-output selected in the profile.
-
-Profile audio devices shown in the macOS output list act as selectors. Choosing
-one tells CamiTune which profile to activate. The temporary selector is then
-replaced by the active bridge using the same profile name, which keeps the audio
-route clear and preserves the normal macOS volume controls.
-
-Only one profile processes system audio at a time. Other checked profiles can
-remain available in the macOS output list, ready to be selected when needed.
-
-### Equalizer APO syntax v1.0
-
-Supported examples:
-
-```text
-Preamp: -5.0 dB
-Filter 1: ON PK Fc 100 Hz Gain 2.0 dB Q 0.70
-Filter 2: ON PEQ Fc 2500 Hz Gain -3.0 dB BW Oct 0.50
-Filter 3: ON LS Fc 80 Hz Gain 1.5 dB Q 0.70
-Filter 4: ON HS Fc 8000 Hz Gain -2.0 dB Q 0.70
-Filter 5: ON HPQ Fc 25 Hz Q 0.70
-Filter 6: ON NO Fc 8000 Hz Q 5.00
-```
-
-The graphical editor imports and exports `ON` and `OFF` filters. Presets using
-`BW Oct` are converted to the equivalent Q value so they can be edited and
-saved without changing the filter response. Supported graphical filter types
-are `PK`/`PEQ`, `LS`/`LSC`, `HS`/`HSC`, `LP`/`LPQ`, `HP`/`HPQ`, `NO`, and `AP`.
-
-`Device:` is recognized but ignored because device selection belongs to CamiTune profiles. `Channel:` produces a warning because the current release applies filters to both stereo channels.
-
-The complete Equalizer APO language is not supported. This release does not claim support for `Include`, `GraphicEQ`, convolution, conditional expressions, processing stages, or arbitrary channel routing.
-
 ## Build from source
 
 Install Xcode or Xcode Command Line Tools with Swift 5.9 or newer, then run:
@@ -196,28 +154,13 @@ The finished bundle is written to `dist/CamiTune.app`. You can also open `Packag
 - The shipped processing profile is stereo; the driver transport is versioned and has capacity for up to 32 channels for future layouts.
 - Releases are not yet Developer ID signed or notarized.
 - CamiTune does not detect or disable unrelated system-EQ applications.
-
-## Roadmap
-
-- [ ] Output Group.
-- [ ] Input-device (microphone) EQ.
-- [ ] Separate L/R EQ.
-- [ ] Per-channel Equalizer APO `Channel:` support.
-- [ ] Profile import and export.
-- [ ] Simpler equalizer controls (bass, mids, and treble).
-- [ ] Menu-bar quick controls.
-- [ ] 5.1 and 7.1 processing.
-- [ ] Individual apps volume control.
-- [ ] Dynamic Loudness
-- [ ] Clipping protection
-- [ ] Headphone Crossfeed
-- [ ] API control
+- Echo for sharing entire screen for people watching it cannot be eliminated, it can only be solved if the app have screen recording permission and I don't want it
 
 ***
 
 ## Third-party software
 
-CamiTune downloads CamillaDSP from its official upstream location during setup. The System Audio Bridge driver is embedded in the application and built from the source in this repository.
+CamiTune builds CamillaDSP from its official upstream source with the included Core Audio UID patch and embeds that executable in the application. Setup installs this known-compatible build instead of downloading an unpatched release. The System Audio Bridge driver is also embedded and built from source in this repository.
 
 - [CamillaDSP](https://github.com/HEnquist/camilladsp) — GPL-3.0 for the macOS build used here.
 - System Audio Bridge is derived from [BlackHole](https://github.com/ExistentialAudio/BlackHole) — GPL-3.0.

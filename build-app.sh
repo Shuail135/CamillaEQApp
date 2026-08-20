@@ -26,6 +26,12 @@ SOURCES=(Sources/CamiTune/*.swift)
 ICON_SOURCE="Sources/CamiTune/icon.png"
 MIN_MACOS="13.0"
 BUNDLED_DRIVER="$PWD/build/driver/CamillaAudio.driver"
+CAMILLADSP_REV="05e9cfcdf43c0dfe078ed3feb8af4c8bd701fd74"
+CAMILLADSP_PATCH="$PWD/Contributions/CamillaDSP/0001-coreaudio-accept-device-uid.patch"
+CAMILLADSP_BUILD_ROOT="$PWD/build/camilladsp"
+CAMILLADSP_SOURCE="$CAMILLADSP_BUILD_ROOT/source"
+CAMILLADSP_BUNDLED_BINARY="$CAMILLADSP_BUILD_ROOT/camilladsp"
+CAMILLADSP_BUILD_STAMP="$CAMILLADSP_BUILD_ROOT/build-key"
 
 mkdir -p "$DIST"
 
@@ -94,13 +100,55 @@ BIN="$BIN_OUT"
 echo "Building bundled System Audio Bridge driver…"
 SABR_CHANNELS=2 SABR_MIN_MACOS="$MIN_MACOS" Drivers/SystemAudioBridge/build-driver.sh
 
+echo "Building UID-capable CamillaDSP…"
+if [[ -n "${CAMITUNE_CAMILLADSP_BINARY:-}" ]]; then
+    if [[ ! -x "$CAMITUNE_CAMILLADSP_BINARY" ]]; then
+        echo "ERROR: CAMITUNE_CAMILLADSP_BINARY is not executable: $CAMITUNE_CAMILLADSP_BINARY"
+        exit 1
+    fi
+    CAMILLADSP_INPUT_HASH="$(/usr/bin/shasum -a 256 "$CAMITUNE_CAMILLADSP_BINARY" | /usr/bin/awk '{print $1}')"
+    CAMILLADSP_BUILD_KEY="override-${ARCH}-${CAMILLADSP_INPUT_HASH}"
+else
+    CAMILLADSP_PATCH_HASH="$(/usr/bin/shasum -a 256 "$CAMILLADSP_PATCH" | /usr/bin/awk '{print $1}')"
+    CAMILLADSP_BUILD_KEY="source-${ARCH}-${CAMILLADSP_REV}-${CAMILLADSP_PATCH_HASH}"
+fi
+
+CURRENT_CAMILLA_BUILD_KEY="$(/bin/cat "$CAMILLADSP_BUILD_STAMP" 2>/dev/null || true)"
+if [[ -x "$CAMILLADSP_BUNDLED_BINARY" && "$CURRENT_CAMILLA_BUILD_KEY" == "$CAMILLADSP_BUILD_KEY" ]]; then
+    echo "Reusing cached UID-capable CamillaDSP."
+else
+    mkdir -p "$CAMILLADSP_BUILD_ROOT"
+    if [[ -n "${CAMITUNE_CAMILLADSP_BINARY:-}" ]]; then
+        cp "$CAMITUNE_CAMILLADSP_BINARY" "$CAMILLADSP_BUNDLED_BINARY"
+    else
+        if ! command -v cargo >/dev/null 2>&1; then
+            echo "ERROR: Rust/Cargo is required because the cached CamillaDSP build is missing or outdated."
+            echo "Install Rust from https://rustup.rs, or set CAMITUNE_CAMILLADSP_BINARY to a patched executable."
+            exit 1
+        fi
+        rm -rf "$CAMILLADSP_SOURCE"
+        mkdir -p "$CAMILLADSP_SOURCE"
+        git -C "$CAMILLADSP_SOURCE" init -q
+        git -C "$CAMILLADSP_SOURCE" remote add origin https://github.com/HEnquist/camilladsp.git
+        git -C "$CAMILLADSP_SOURCE" fetch --depth 1 origin "$CAMILLADSP_REV"
+        git -C "$CAMILLADSP_SOURCE" checkout -q --detach FETCH_HEAD
+        git -C "$CAMILLADSP_SOURCE" apply "$CAMILLADSP_PATCH"
+        cargo build --release --manifest-path "$CAMILLADSP_SOURCE/Cargo.toml"
+        cp "$CAMILLADSP_SOURCE/target/release/camilladsp" "$CAMILLADSP_BUNDLED_BINARY"
+    fi
+    echo "$CAMILLADSP_BUILD_KEY" > "$CAMILLADSP_BUILD_STAMP"
+fi
+chmod +x "$CAMILLADSP_BUNDLED_BINARY"
+
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Drivers"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Drivers" "$APP/Contents/Resources/CamillaDSP"
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 cp "$ICON_SOURCE" "$APP/Contents/Resources/icon.png"
 cp LICENSE THIRD_PARTY.md "$APP/Contents/Resources/"
 /usr/bin/ditto "$BUNDLED_DRIVER" "$APP/Contents/Resources/Drivers/CamillaAudio.driver"
+cp "$CAMILLADSP_BUNDLED_BINARY" "$APP/Contents/Resources/CamillaDSP/camilladsp"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"
+chmod +x "$APP/Contents/Resources/CamillaDSP/camilladsp"
 
 # Build the standard macOS iconset, including every Retina representation.
 ICONSET="$DIST/AppIcon.iconset"

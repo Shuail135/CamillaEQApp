@@ -7,7 +7,7 @@ struct EQResponsePoint: Identifiable {
 }
 
 struct EQResponseCalculator {
-    func calculate(parsed: ParsedEQ, sampleRate: Double = 48_000, count: Int = 400) -> [EQResponsePoint] {
+    func calculate(parsed: ParsedEQ, sampleRate: Double = 48_000, count: Int = 200) -> [EQResponsePoint] {
         let minF = 20.0
         let maxF = min(20_000.0, sampleRate * 0.49)
         return (0..<count).map { i in

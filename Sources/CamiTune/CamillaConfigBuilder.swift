@@ -50,7 +50,7 @@ devices:
   playback:
     type: CoreAudio
     channels: 2
-    device: "\(yamlEscape(profile.outputDeviceName))"
+    device: "\(yamlEscape(profile.outputDeviceUID))"
     exclusive: false
 \(filterSection)
 mixers: {}

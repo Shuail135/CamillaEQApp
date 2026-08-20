@@ -15,7 +15,7 @@ userspace process reads that ring and may analyze, record, route, or process
 the frames with any suitable audio engine.
 
 ```text
-macOS apps -> bridge carrying the active profile name
+macOS apps -> native profile endpoint -> hidden bridge transport
                               |
                               v
                     private mapped ring
@@ -31,12 +31,11 @@ Calls and screen sharing apps can continue to use the real microphone as
 their input. Because the virtual device is not an input device, another caller
 cannot select it as a microphone and feed remote voices back into the call.
 
-## Build and test
+## Build
 
 The scripts use Apple's command-line tools and target macOS 13 by default.
 
 ```sh
-Drivers/SystemAudioBridge/test-transport.sh
 Drivers/SystemAudioBridge/build-driver.sh
 Drivers/SystemAudioBridge/package-driver.sh
 ```
@@ -54,7 +53,7 @@ Drivers/SystemAudioBridge/install-driver.sh
 That operation asks for an administrator password, installs only
 `/Library/Audio/Plug-Ins/HAL/CamillaAudio.driver`, and reloads Core Audio.
 The corresponding removal script is `uninstall-driver.sh`. Neither operation
-is run as part of a normal build or test.
+is run as part of a normal build.
 
 ## Extension contract
 
@@ -86,5 +85,3 @@ The driver callback does not allocate, lock, open files, log, or call into the
 app. File mapping and connection changes occur through a non-real-time custom
 Core Audio property. If the app falls behind, the bounded writer counts and
 drops new frames instead of blocking Core Audio.
-
-See `UPSTREAM.md` for BlackHole provenance and licensing.
