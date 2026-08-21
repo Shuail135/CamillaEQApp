@@ -196,18 +196,49 @@ final class CoreAudioManager: ObservableObject {
     }
 
     func supportsSampleRate(uid: String, rate: Double) -> Bool {
-        guard let device = device(uid: uid) else { return false }
-        var address = AudioObjectPropertyAddress(
+        guard rate.isFinite, rate > 0, let device = device(uid: uid) else { return false }
+        if let current = nominalSampleRate(uid: uid), abs(current - rate) < 0.5 {
+            return true
+        }
+        var availableRatesAddress = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
         var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(device.objectID, &address, 0, nil, &size) == noErr else { return false }
+        guard AudioObjectGetPropertyDataSize(
+            device.objectID,
+            &availableRatesAddress,
+            0,
+            nil,
+            &size
+        ) == noErr else { return false }
         let count = Int(size) / MemoryLayout<AudioValueRange>.size
+        guard count > 0 else { return false }
         var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
-        guard AudioObjectGetPropertyData(device.objectID, &address, 0, nil, &size, &ranges) == noErr else { return false }
-        return ranges.contains { rate >= $0.mMinimum && rate <= $0.mMaximum }
+        guard AudioObjectGetPropertyData(
+            device.objectID,
+            &availableRatesAddress,
+            0,
+            nil,
+            &size,
+            &ranges
+        ) == noErr,
+        ranges.contains(where: { rate >= $0.mMinimum && rate <= $0.mMaximum }) else {
+            return false
+        }
+
+        var nominalRateAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var settable: DarwinBoolean = false
+        return AudioObjectIsPropertySettable(
+            device.objectID,
+            &nominalRateAddress,
+            &settable
+        ) == noErr && settable.boolValue
     }
 
     func nominalSampleRate(uid: String) -> Double? {

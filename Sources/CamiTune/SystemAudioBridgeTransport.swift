@@ -27,6 +27,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     private var pcmRouter: PCMRouter?
     private var expectedChannelCount: UInt32 = 2
     private var expectedSampleRate = 48_000.0
+    private var generation: UInt64 = 0
 
     deinit { stop() }
 
@@ -63,9 +64,11 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         self.expectedSampleRate = expectedSampleRate
         stopping = false
         workerFinished = false
+        generation &+= 1
+        let runGeneration = generation
         state.unlock()
 
-        let thread = Thread { [weak self] in self?.run() }
+        let thread = Thread { [weak self] in self?.run(generation: runGeneration) }
         thread.name = "System Audio Bridge Transport"
         thread.qualityOfService = .userInteractive
         worker = thread
@@ -76,6 +79,8 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
 
     func stop() {
         state.lock()
+        generation &+= 1
+        let stoppedGeneration = generation
         stopping = true
         // The worker only polls the shared ring and never performs blocking I/O.
         // Wait for it to release the mapped region before destroying that
@@ -95,13 +100,14 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         }
         if let transport { sabr_client_transport_destroy(transport) }
         Task { @MainActor [weak self] in
+            guard self?.isCurrentGeneration(stoppedGeneration) == true else { return }
             self?.status = "Driver transport idle"
             self?.statistics = Statistics()
             self?.runtimeError = nil
         }
     }
 
-    private func run() {
+    private func run(generation runGeneration: UInt64) {
         let maximumFrames: UInt32 = 2048
         let channelCapacity = sabr_client_transport_max_channels()
         var samples = [Float](
@@ -113,7 +119,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         var reportedMismatch: UInt32?
         var reportedSampleRateMismatch: Double?
 
-        while !shouldStop() {
+        while !shouldStop(generation: runGeneration) {
             guard let transport = currentTransport() else { break }
             var occupancy = SABRClientTransportStatistics()
             sabr_client_transport_get_statistics(transport, &occupancy)
@@ -155,6 +161,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
                     reportedMismatch = nil
                     reportedSampleRateMismatch = nil
                     Task { @MainActor [weak self] in
+                        guard self?.isCurrentGeneration(runGeneration) == true else { return }
                         self?.status = "Streaming \(reportedChannels) channels from System Audio Bridge"
                     }
                 }
@@ -165,6 +172,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
                     reportedStreaming = false
                     reportedMismatch = reportedChannels
                     Task { @MainActor [weak self] in
+                        guard self?.isCurrentGeneration(runGeneration) == true else { return }
                         self?.status = "Driver channel mismatch: received \(reportedChannels), expected \(expectedChannels)"
                     }
                 }
@@ -177,6 +185,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
                     reportedSampleRateMismatch = actualRate
                     let message = "System Audio Bridge is producing \(Self.rateDescription(actualRate)), but CamillaDSP expects \(Self.rateDescription(requestedRate)). Audio was stopped to prevent wrong-speed playback. Choose a rate supported by the physical output."
                     Task { @MainActor [weak self] in
+                        guard self?.isCurrentGeneration(runGeneration) == true else { return }
                         self?.status = "Sample-rate mismatch"
                         self?.runtimeError = message
                     }
@@ -185,7 +194,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
             }
 
             if Date().timeIntervalSince(lastStatisticsUpdate) >= 0.5 {
-                publishStatistics(transport)
+                publishStatistics(transport, generation: runGeneration)
                 lastStatisticsUpdate = Date()
             }
         }
@@ -196,7 +205,10 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         state.unlock()
     }
 
-    private func publishStatistics(_ transport: SABRClientTransportRef) {
+    private func publishStatistics(
+        _ transport: SABRClientTransportRef,
+        generation runGeneration: UInt64
+    ) {
         var raw = SABRClientTransportStatistics()
         sabr_client_transport_get_statistics(transport, &raw)
         let rateMatching = currentPCMRouter()?.statistics
@@ -210,13 +222,22 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
             rateAdjustmentPPM: rateMatching?.rateAdjustmentPPM ?? 0,
             rateMatchBufferedFrames: rateMatching?.rateMatchBufferedFrames ?? 0
         )
-        Task { @MainActor [weak self] in self?.statistics = value }
+        Task { @MainActor [weak self] in
+            guard self?.isCurrentGeneration(runGeneration) == true else { return }
+            self?.statistics = value
+        }
     }
 
-    private func shouldStop() -> Bool {
+    private func shouldStop(generation runGeneration: UInt64) -> Bool {
         state.lock()
         defer { state.unlock() }
-        return stopping
+        return stopping || generation != runGeneration
+    }
+
+    private func isCurrentGeneration(_ candidate: UInt64) -> Bool {
+        state.lock()
+        defer { state.unlock() }
+        return generation == candidate
     }
 
     private func currentTransport() -> SABRClientTransportRef? {
@@ -263,7 +284,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
                 UInt8(value & 0xff)
             ]
             let printable = bytes.allSatisfy { (32...126).contains($0) }
-            let fourCC = printable ? ", '\(String(bytes: bytes, encoding: .ascii)!)'" : ""
+            let fourCC = printable ? ", '\(String(decoding: bytes, as: UTF8.self))'" : ""
             return "\(status), 0x\(String(value, radix: 16, uppercase: true))\(fourCC)"
         }
     }

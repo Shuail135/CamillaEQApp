@@ -47,8 +47,15 @@ actor CamillaRPC {
         }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.fragmentsAllowed])
         let text = String(decoding: data, as: UTF8.self)
-        try await task.send(.string(text))
-        let message = try await task.receive()
+        // Once a request is sent its matching reply must always be consumed.
+        // UI debounce tasks are routinely cancelled; shield this exchange in
+        // an independent task so cancellation cannot leave the next command to
+        // consume the previous command's reply.
+        let exchange = Task {
+            try await task.send(.string(text))
+            return try await task.receive()
+        }
+        let message = try await exchange.value
         let responseData: Data
         switch message {
         case .string(let value): responseData = Data(value.utf8)
@@ -84,9 +91,19 @@ actor CamillaRPC {
         try ensureOK(result, command: "SetConfig")
     }
 
+    func patchConfig(_ patch: CamillaDSPRuntimePatch) async throws {
+        let result = try await request(["PatchConfig": patch.foundationObject])
+        try ensureOK(result, command: "PatchConfig")
+    }
+
     func setVolume(_ db: Double) async throws {
         let result = try await request(["SetVolume": db])
         try ensureOK(result, command: "SetVolume")
+    }
+
+    func setMute(_ muted: Bool) async throws {
+        let result = try await request(["SetMute": muted])
+        try ensureOK(result, command: "SetMute")
     }
 
     func exit() async {
@@ -114,12 +131,31 @@ actor CamillaRPC {
     }
 
     func state() async throws -> String {
-        let response = try await request("GetState")
-        let command = try successfulBody(response, command: "GetState")
-        guard let value = command["value"] as? String else {
-            throw RPCError.invalidResponse("GetState had no state value")
-        }
-        return value
+        try await stringValue(command: "GetState")
+    }
+
+    func stopReason() async throws -> String {
+        try await stringValue(command: "GetStopReason")
+    }
+
+    func processingLoad() async throws -> Double {
+        try await doubleValue(command: "GetProcessingLoad")
+    }
+
+    func resamplerLoad() async throws -> Double {
+        try await doubleValue(command: "GetResamplerLoad")
+    }
+
+    func bufferLevel() async throws -> UInt64 {
+        try await unsignedIntegerValue(command: "GetBufferLevel")
+    }
+
+    func rateAdjust() async throws -> Double {
+        try await doubleValue(command: "GetRateAdjust")
+    }
+
+    func clippedSamples() async throws -> UInt64 {
+        try await unsignedIntegerValue(command: "GetClippedSamples")
     }
 
     func availablePlaybackDevices(backend: String) async throws -> [(identifier: String, name: String)] {
@@ -154,6 +190,33 @@ actor CamillaRPC {
         return body
     }
 
+    private func stringValue(command: String) async throws -> String {
+        let response = try await request(command)
+        let body = try successfulBody(response, command: command)
+        guard let value = body["value"] as? String else {
+            throw RPCError.invalidResponse("\(command) had no string value")
+        }
+        return value
+    }
+
+    private func doubleValue(command: String) async throws -> Double {
+        let response = try await request(command)
+        let body = try successfulBody(response, command: command)
+        guard let value = body["value"] as? NSNumber else {
+            throw RPCError.invalidResponse("\(command) had no numeric value")
+        }
+        return value.doubleValue
+    }
+
+    private func unsignedIntegerValue(command: String) async throws -> UInt64 {
+        let response = try await request(command)
+        let body = try successfulBody(response, command: command)
+        guard let value = body["value"] as? NSNumber, value.doubleValue >= 0 else {
+            throw RPCError.invalidResponse("\(command) had no unsigned integer value")
+        }
+        return value.uint64Value
+    }
+
     enum RPCError: LocalizedError {
         case notConnected
         case invalidRequest
@@ -170,7 +233,7 @@ actor CamillaRPC {
     }
 }
 
-struct SignalLevels {
+struct SignalLevels: Equatable, Sendable {
     var capturePeak: [Double]
     var captureRMS: [Double]
     var playbackPeak: [Double]
@@ -182,72 +245,4 @@ struct SignalLevels {
         playbackPeak: [-150, -150],
         playbackRMS: [-150, -150]
     )
-}
-
-@MainActor
-final class MeterModel: ObservableObject {
-    @Published private(set) var activeSession: AudioRuntimeSession?
-    @Published private(set) var levels = SignalLevels.silent
-
-    var capturePeak: [Double] { levels.capturePeak }
-    var captureRMS: [Double] { levels.captureRMS }
-    var playbackPeak: [Double] { levels.playbackPeak }
-    var playbackRMS: [Double] { levels.playbackRMS }
-
-    private var pollingTask: Task<Void, Never>?
-    private var hasReceivedLevels = false
-
-    func start(rpc: CamillaRPC, session: AudioRuntimeSession) {
-        stop()
-        activeSession = session
-        pollingTask = Task { [weak self] in
-            while !Task.isCancelled {
-                do {
-                    let levels = try await rpc.signalLevels()
-                    guard let self, self.activeSession == session else { return }
-                    if self.hasReceivedLevels {
-                        self.levels = SignalLevels(
-                            capturePeak: self.smooth(current: self.capturePeak, target: levels.capturePeak, attack: 0.72, release: 0.16),
-                            captureRMS: self.smooth(current: self.captureRMS, target: levels.captureRMS, attack: 0.42, release: 0.20),
-                            playbackPeak: self.smooth(current: self.playbackPeak, target: levels.playbackPeak, attack: 0.72, release: 0.16),
-                            playbackRMS: self.smooth(current: self.playbackRMS, target: levels.playbackRMS, attack: 0.42, release: 0.20)
-                        )
-                    } else {
-                        self.levels = levels
-                        self.hasReceivedLevels = true
-                    }
-                } catch {
-                    // A transient websocket miss should not tear down the audio engine.
-                }
-                // Reduce refresh work during live scrolling and resizing, but
-                // keep the meters moving instead of visibly freezing them.
-                try? await Task.sleep(
-                    for: .milliseconds(UIRenderPerformance.meterPollMilliseconds)
-                )
-            }
-        }
-    }
-
-    func stop() {
-        pollingTask?.cancel()
-        pollingTask = nil
-        activeSession = nil
-        hasReceivedLevels = false
-        levels = .silent
-    }
-
-    private func smooth(
-        current: [Double],
-        target: [Double],
-        attack: Double,
-        release: Double
-    ) -> [Double] {
-        let channelCount = max(current.count, target.count)
-        return (0..<channelCount).map { channel in
-            let previous = channel < current.count ? current[channel] : -150
-            let next = channel < target.count ? target[channel] : -150
-            let amount = next > previous ? attack : release
-            return previous + (next - previous) * amount
-        }
-    }
 }

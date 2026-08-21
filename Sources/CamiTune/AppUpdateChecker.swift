@@ -303,17 +303,30 @@ final class AppUpdateChecker: ObservableObject {
         return appURL
     }
 
-    private static let installerScript = #"""
-while /bin/kill -0 "$1" 2>/dev/null; do /bin/sleep 1; done
+    nonisolated static let installerScript = #"""
+attempts=0
+while /bin/kill -0 "$1" 2>/dev/null; do
+    attempts=$((attempts + 1))
+    if [[ "$attempts" -ge 120 ]]; then exit 1; fi
+    /bin/sleep 1
+done
 target="$2"
 staged="$3"
-backup="${target}.previous-update"
-/bin/rm -rf "$backup"
-if /bin/mv "$target" "$backup" && /bin/mv "$staged" "$target"; then
+backup="${target}.previous-update.$1"
+if [[ -e "$backup" ]]; then exit 1; fi
+if ! /bin/mv "$target" "$backup"; then
+    exit 1
+fi
+if /bin/mv "$staged" "$target"; then
     /bin/rm -rf "$backup"
+    exit 0
 else
-    /bin/rm -rf "$target"
-    /bin/mv "$backup" "$target" 2>/dev/null || true
+    # The original app is known to be in backup before target can be
+    # removed. If installation fails, restore it and retain the backup if
+    # restoration itself cannot complete.
+    if [[ -e "$target" ]]; then /bin/rm -rf "$target"; fi
+    /bin/mv "$backup" "$target"
+    exit 1
 fi
 """#
 
@@ -352,11 +365,16 @@ fi
     }
 
     nonisolated private static func numericVersionParts(_ version: String) -> [Int] {
-        let normalized = version.trimmingCharacters(in: .whitespacesAndNewlines)
-            .drop(while: { $0 == "v" || $0 == "V" })
-        return normalized.split(separator: ".").compactMap { component in
-            let digits = component.prefix(while: { $0.isNumber })
-            return digits.isEmpty ? nil : Int(digits)
+        var normalized = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        if normalized.first == "v" || normalized.first == "V" {
+            normalized.removeFirst()
         }
+        let components = normalized.split(separator: ".", omittingEmptySubsequences: false)
+        guard !components.isEmpty,
+              components.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else {
+            return []
+        }
+        let values = components.compactMap { Int($0) }
+        return values.count == components.count ? values : []
     }
 }

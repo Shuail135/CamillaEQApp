@@ -21,6 +21,7 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
     private var pendingSamples: [Float] = []
     private var receivedBuffer = false
     private var analysisSessionID: UUID?
+    private var presentedProfileID: UUID?
     private var sourceName = "System Audio Bridge"
 
     deinit {
@@ -39,6 +40,30 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
         if fftSetup == nil { fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) }
         resetReceivedBuffer()
         status = "Waiting for audio from \(sourceName)…"
+    }
+
+    /// FFT work exists only to drive profile-editor visuals. Keep the audio
+    /// route independent and discard observation frames while that profile is
+    /// not being presented.
+    @MainActor
+    func setPresentationActive(_ active: Bool, profileID: UUID) {
+        stateLock.lock()
+        let previous = presentedProfileID
+        if active {
+            presentedProfileID = profileID
+        } else if presentedProfileID == profileID {
+            presentedProfileID = nil
+        }
+        let shouldReset = previous != presentedProfileID
+        stateLock.unlock()
+        guard shouldReset else { return }
+        points = []
+        lastPointsPublication = .distantPast
+        processingLock.lock()
+        pendingSamples.removeAll(keepingCapacity: true)
+        smoothedDB.removeAll(keepingCapacity: true)
+        processingLock.unlock()
+        resetReceivedBuffer()
     }
 
     func ingest(
@@ -108,7 +133,8 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
         if markFirstBufferReceived() {
             Task { @MainActor [weak self] in
                 guard let self,
-                      self.activeSession == session else { return }
+                      self.activeSession == session,
+                      self.accepts(session: session) else { return }
                 self.status = "Live FFT from \(self.sourceName)"
             }
         }
@@ -152,11 +178,17 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
 
         real.withUnsafeMutableBufferPointer { realPtr in
             imag.withUnsafeMutableBufferPointer { imagPtr in
-                var split = DSPSplitComplex(realp: realPtr.baseAddress!, imagp: imagPtr.baseAddress!)
+                guard let realBase = realPtr.baseAddress,
+                      let imaginaryBase = imagPtr.baseAddress else { return }
+                var split = DSPSplitComplex(realp: realBase, imagp: imaginaryBase)
+                var convertedSamples = false
                 samples.withUnsafeBytes { raw in
-                    let complex = raw.baseAddress!.assumingMemoryBound(to: DSPComplex.self)
+                    guard let baseAddress = raw.baseAddress else { return }
+                    let complex = baseAddress.assumingMemoryBound(to: DSPComplex.self)
                     vDSP_ctoz(complex, 2, &split, 1, vDSP_Length(half))
+                    convertedSamples = true
                 }
+                guard convertedSamples else { return }
                 vDSP_fft_zrip(setup, &split, 1, log2n, FFTDirection(kFFTDirection_Forward))
                 var mags = [Float](repeating: 0, count: half)
                 vDSP_zvmags(&split, 1, &mags, 1, vDSP_Length(half))
@@ -221,7 +253,9 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
                     return SpectrumPoint(frequency: frequency, db: db)
                 }
                 Task { @MainActor [weak self] in
-                    guard let self, self.activeSession == session else { return }
+                    guard let self,
+                          self.activeSession == session,
+                          self.accepts(session: session) else { return }
                     let now = Date()
                     guard UIRenderPerformance.allowsSpectrumPublication(
                         since: self.lastPointsPublication,
@@ -252,6 +286,7 @@ final class SpectrumAnalyzer: ObservableObject, @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return analysisSessionID == session.id
+            && presentedProfileID == session.profileID
     }
 
 }

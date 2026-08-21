@@ -28,11 +28,13 @@ struct PCMFrame: Sendable {
 
 final class PCMRouter: @unchecked Sendable {
     typealias AnalyzerConsumer = (PCMFrame) -> Void
+    typealias MeterConsumer = (PCMFrame) -> Void
 
     struct Statistics: Sendable {
         var camillaDroppedFrames: UInt64 = 0
         var camillaQueueRecoveries: UInt64 = 0
         var camillaWriteFailures: UInt64 = 0
+        var meterDroppedFrames: UInt64 = 0
         var rateAdjustmentPPM: Double = 0
         var rateMatchBufferedFrames: UInt64 = 0
     }
@@ -40,6 +42,7 @@ final class PCMRouter: @unchecked Sendable {
     private let state = NSLock()
     private var camillaBranch: CamillaPCMBranch?
     private var analyzerBranch: AnalyzerPCMBranch?
+    private var meterBranch: MeterPCMBranch?
     private var statisticsValue = Statistics()
 
     var statistics: Statistics {
@@ -50,6 +53,7 @@ final class PCMRouter: @unchecked Sendable {
 
     func start(
         camillaSink: FileHandle,
+        meterConsumer: MeterConsumer? = nil,
         analyzerConsumer: AnalyzerConsumer? = nil
     ) {
         stop()
@@ -68,13 +72,23 @@ final class PCMRouter: @unchecked Sendable {
                 )
             }
         )
+        let meterBranch = meterConsumer.map { consumer in
+            MeterPCMBranch(
+                consumer: consumer,
+                dropHandler: { [weak self] droppedFrames in
+                    self?.recordMeterDrop(droppedFrames: droppedFrames)
+                }
+            )
+        }
         let analyzerBranch = analyzerConsumer.map(AnalyzerPCMBranch.init(consumer:))
         camillaBranch.start()
+        meterBranch?.start()
         analyzerBranch?.start()
 
         state.lock()
         statisticsValue = Statistics()
         self.camillaBranch = camillaBranch
+        self.meterBranch = meterBranch
         self.analyzerBranch = analyzerBranch
         state.unlock()
     }
@@ -82,25 +96,30 @@ final class PCMRouter: @unchecked Sendable {
     func route(_ frame: PCMFrame) {
         state.lock()
         let camillaBranch = self.camillaBranch
+        let meterBranch = self.meterBranch
         let analyzerBranch = self.analyzerBranch
         state.unlock()
 
-        // These are deliberately independent bounded queues. Analyzer stalls
-        // can drop visualization frames, but never execute on or hold up the
-        // CamillaDSP delivery branch.
+        // These are deliberately independent bounded queues. Analyzer or meter
+        // stalls can drop observation frames, but never execute on or hold up
+        // the CamillaDSP delivery branch.
         camillaBranch?.enqueue(frame)
+        meterBranch?.enqueue(frame)
         analyzerBranch?.enqueue(frame)
     }
 
     func stop() {
         state.lock()
         let camillaBranch = self.camillaBranch
+        let meterBranch = self.meterBranch
         let analyzerBranch = self.analyzerBranch
         self.camillaBranch = nil
+        self.meterBranch = nil
         self.analyzerBranch = nil
         state.unlock()
 
         camillaBranch?.stop()
+        meterBranch?.stop()
         analyzerBranch?.stop()
     }
 
@@ -117,11 +136,95 @@ final class PCMRouter: @unchecked Sendable {
         state.unlock()
     }
 
+    private func recordMeterDrop(droppedFrames: Int) {
+        state.lock()
+        statisticsValue.meterDroppedFrames &+= UInt64(max(0, droppedFrames))
+        state.unlock()
+    }
+
     private func recordRateAdjustment(adjustmentPPM: Double, bufferedFrames: Int) {
         state.lock()
         statisticsValue.rateAdjustmentPPM = adjustmentPPM
         statisticsValue.rateMatchBufferedFrames = UInt64(max(0, bufferedFrames))
         state.unlock()
+    }
+}
+
+/// A latest-value PCM branch for metering. If UI work falls behind it replaces
+/// stale observations instead of applying backpressure to the audio writer.
+private final class MeterPCMBranch: @unchecked Sendable {
+    private let consumer: PCMRouter.MeterConsumer
+    private let dropHandler: (Int) -> Void
+    private let condition = NSCondition()
+    private var buffers: [PCMFrame] = []
+    private var stopping = false
+    private var workerFinished = true
+    private var worker: Thread?
+    private let maximumQueuedBuffers = 2
+
+    init(
+        consumer: @escaping PCMRouter.MeterConsumer,
+        dropHandler: @escaping (Int) -> Void
+    ) {
+        self.consumer = consumer
+        self.dropHandler = dropHandler
+    }
+
+    func start() {
+        condition.lock()
+        stopping = false
+        workerFinished = false
+        condition.unlock()
+
+        let thread = Thread { [weak self] in self?.run() }
+        thread.name = "CamiTune Meter PCM Delivery"
+        thread.qualityOfService = .userInitiated
+        worker = thread
+        thread.start()
+    }
+
+    func enqueue(_ frame: PCMFrame) {
+        var droppedFrames = 0
+        condition.lock()
+        guard !stopping else {
+            condition.unlock()
+            return
+        }
+        if buffers.count >= maximumQueuedBuffers {
+            droppedFrames = buffers.reduce(0) { $0 + $1.frameCount }
+            buffers.removeAll(keepingCapacity: true)
+        }
+        buffers.append(frame)
+        condition.signal()
+        condition.unlock()
+        if droppedFrames > 0 { dropHandler(droppedFrames) }
+    }
+
+    func stop() {
+        condition.lock()
+        stopping = true
+        buffers.removeAll()
+        condition.broadcast()
+        let deadline = Date().addingTimeInterval(0.25)
+        while !workerFinished, condition.wait(until: deadline) {}
+        worker = nil
+        condition.unlock()
+    }
+
+    private func run() {
+        while true {
+            condition.lock()
+            while buffers.isEmpty && !stopping { condition.wait() }
+            if stopping {
+                workerFinished = true
+                condition.broadcast()
+                condition.unlock()
+                return
+            }
+            let buffer = buffers.removeFirst()
+            condition.unlock()
+            consumer(buffer)
+        }
     }
 }
 
@@ -299,7 +402,11 @@ private final class CamillaPCMBranch: @unchecked Sendable {
         stopping = true
         queue.clear()
         condition.broadcast()
-        while !workerFinished { condition.wait() }
+        let deadline = Date().addingTimeInterval(0.5)
+        while !workerFinished, condition.wait(until: deadline) {}
+        // The app closes CamillaDSP stdin before calling this method, which
+        // normally releases a blocked write immediately. Retain a finite join
+        // as a final safety boundary for unusual FileHandle/platform failures.
         worker = nil
         condition.unlock()
     }

@@ -13,13 +13,16 @@ struct ProfileRoutingDescriptor: Hashable {
             (profile: profile, base: baseName(for: profile))
         }
         let groups = Dictionary(grouping: bases) {
-            $0.base.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            $0.base.folding(
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
         }
 
-        return Dictionary(uniqueKeysWithValues: bases.map { item in
+        return Dictionary(bases.map { item in
             let collides = (groups[item.base.folding(
                 options: [.caseInsensitive, .diacriticInsensitive],
-                locale: .current
+                locale: Locale(identifier: "en_US_POSIX")
             )]?.count ?? 0) > 1
             let suffix = item.profile.id.uuidString.prefix(6).uppercased()
             let displayName = collides ? "\(item.base) [\(suffix)]" : item.base
@@ -29,7 +32,7 @@ struct ProfileRoutingDescriptor: Hashable {
                 name: displayName
             )
             return (item.profile.id, descriptor)
-        })
+        }, uniquingKeysWith: { first, _ in first })
     }
 
     static func uid(for profileID: UUID) -> String {

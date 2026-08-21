@@ -221,7 +221,9 @@ struct ObjectInfo {
 #define                             kDevice_HasOutput                   true
 #endif
 
-// TODO: These need to be the opposite of kDevice_HasOutput and kDevice_HasInput
+// A profile endpoint intentionally exposes the same app-facing output scope as
+// the main bridge. Its role is selected by the transport mapping, not by
+// reversing these direction flags.
 #ifndef kDevice2_HasInput
 #define                             kDevice2_HasInput                   false
 #endif
@@ -4877,7 +4879,9 @@ static OSStatus	SystemAudioBridge_DoIOOperation(AudioServerPlugInDriverRef inDri
             DebugMsg("SystemAudioBridge overload error. kAudioServerPlugInIOOperationWriteMix was unable to complete operation before the deadline. Try increasing the buffer frame size.");
             return kAudioHardwareUnspecifiedError;
         }
-        // TODO: Mix into the buffers but we will need to clear the buffers at some point.
+        // Known limitation: simultaneous writers currently replace the shared
+        // cycle buffer. Supporting multiple clients requires per-client buffers
+        // and deterministic real-time mixing/clearing, not an in-place add here.
         // Issue with outputting from mirrored device and main device at the same time. Not currently mixing. 
         
         // Copy the buffers.

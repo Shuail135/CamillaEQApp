@@ -24,6 +24,7 @@ APP="$DIST/$APP_NAME.app"
 BIN_OUT="$DIST/$APP_NAME"
 SOURCES=(Sources/CamiTune/*.swift)
 ICON_SOURCE="Sources/CamiTune/icon.png"
+TARGET_RESOURCES="Sources/CamiTune/DeviceCorrectionTargets"
 MIN_MACOS="13.0"
 BUNDLED_DRIVER="$PWD/build/driver/CamillaAudio.driver"
 CAMILLADSP_REV="05e9cfcdf43c0dfe078ed3feb8af4c8bd701fd74"
@@ -106,10 +107,10 @@ if [[ -n "${CAMITUNE_CAMILLADSP_BINARY:-}" ]]; then
         echo "ERROR: CAMITUNE_CAMILLADSP_BINARY is not executable: $CAMITUNE_CAMILLADSP_BINARY"
         exit 1
     fi
-    CAMILLADSP_INPUT_HASH="$(/usr/bin/shasum -a 256 "$CAMITUNE_CAMILLADSP_BINARY" | /usr/bin/awk '{print $1}')"
+    CAMILLADSP_INPUT_HASH="$(/usr/bin/env LC_ALL=C LANG=C /usr/bin/shasum -a 256 "$CAMITUNE_CAMILLADSP_BINARY" | /usr/bin/awk '{print $1}')"
     CAMILLADSP_BUILD_KEY="override-${ARCH}-${CAMILLADSP_INPUT_HASH}"
 else
-    CAMILLADSP_PATCH_HASH="$(/usr/bin/shasum -a 256 "$CAMILLADSP_PATCH" | /usr/bin/awk '{print $1}')"
+    CAMILLADSP_PATCH_HASH="$(/usr/bin/env LC_ALL=C LANG=C /usr/bin/shasum -a 256 "$CAMILLADSP_PATCH" | /usr/bin/awk '{print $1}')"
     CAMILLADSP_BUILD_KEY="source-${ARCH}-${CAMILLADSP_REV}-${CAMILLADSP_PATCH_HASH}"
 fi
 
@@ -145,6 +146,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Drivers" "$APP/Contents/
 cp "$BIN" "$APP/Contents/MacOS/$APP_NAME"
 cp "$ICON_SOURCE" "$APP/Contents/Resources/icon.png"
 cp LICENSE THIRD_PARTY.md "$APP/Contents/Resources/"
+/usr/bin/ditto "$TARGET_RESOURCES" "$APP/Contents/Resources/DeviceCorrectionTargets"
 /usr/bin/ditto "$BUNDLED_DRIVER" "$APP/Contents/Resources/Drivers/CamillaAudio.driver"
 cp "$CAMILLADSP_BUNDLED_BINARY" "$APP/Contents/Resources/CamillaDSP/camilladsp"
 chmod +x "$APP/Contents/MacOS/$APP_NAME"

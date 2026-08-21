@@ -26,3 +26,4 @@ tmp/
 # Local visual preview (not an application resource)
 Sources/CamiTune/tray-icon-preview.png
 test-local.sh
+DeviceCorrection.md

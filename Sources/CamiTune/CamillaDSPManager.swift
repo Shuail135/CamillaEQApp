@@ -61,6 +61,14 @@ final class CamillaDSPManager: ObservableObject {
         return handle
     }
 
+    /// Closing stdin first unblocks any PCM writer waiting on a full pipe. It
+    /// is intentionally separate from process teardown so the router can join
+    /// its delivery worker without depending on CamillaDSP's control socket.
+    func closeAudioInput() {
+        try? inputPipe?.fileHandleForWriting.close()
+        inputPipe = nil
+    }
+
     func apply(yaml: String) async throws {
         do {
             let configDirectory = supportDirectory().appendingPathComponent("configs", isDirectory: true)
@@ -71,12 +79,29 @@ final class CamillaDSPManager: ObservableObject {
                 encoding: .utf8
             )
             try await rpc.setConfig(yaml: yaml)
-            // Startup uses -20 dB as a safety guard. Once a valid config is active,
-            // the Equalizer APO Preamp inside the config becomes the intended headroom.
+            // Startup uses -20 dB as a safety guard. Once a valid graph is active,
+            // its derived response-processing headroom replaces that guard.
+            // Intentional User-preamp boost is monitored and optionally limited.
             if !hasAppliedConfig {
                 try await rpc.setVolume(0)
                 hasAppliedConfig = true
             }
+            lastError = nil
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            lastError = error.localizedDescription
+            throw error
+        }
+    }
+
+    func apply(configuration: CamillaDSPConfiguration) async throws {
+        try await apply(yaml: configuration.yaml)
+    }
+
+    func apply(patch: CamillaDSPRuntimePatch) async throws {
+        do {
+            try await rpc.patchConfig(patch)
             lastError = nil
         } catch is CancellationError {
             throw CancellationError()
@@ -93,8 +118,7 @@ final class CamillaDSPManager: ObservableObject {
             return
         }
 
-        try? inputPipe?.fileHandleForWriting.close()
-        inputPipe = nil
+        closeAudioInput()
         if childProcess.isRunning {
             childProcess.terminate()
             // App termination cannot await an async task. Give only this app's
@@ -114,13 +138,21 @@ final class CamillaDSPManager: ObservableObject {
     }
 
     func stop() async {
-        try? inputPipe?.fileHandleForWriting.close()
-        inputPipe = nil
-        await rpc.exit()
-        if let process, process.isRunning {
-            process.terminate()
-            try? await Task.sleep(for: .milliseconds(400))
-            if process.isRunning { process.interrupt() }
+        closeAudioInput()
+        // Disconnecting first also aborts a stuck in-flight RPC. Waiting for an
+        // "Exit" reply here could otherwise make profile switching hang forever.
+        await rpc.disconnect()
+        if let childProcess = process {
+            if childProcess.isRunning {
+                childProcess.terminate()
+                for _ in 0..<8 where childProcess.isRunning {
+                    try? await Task.sleep(for: .milliseconds(50))
+                }
+                if childProcess.isRunning {
+                    kill(childProcess.processIdentifier, SIGKILL)
+                }
+            }
+            childProcess.waitUntilExit()
         }
         process = nil
         hasAppliedConfig = false

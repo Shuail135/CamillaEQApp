@@ -1,5 +1,35 @@
 import Foundation
 import AppKit
+import Combine
+
+struct AutomaticActivationRetryState: Equatable, Sendable {
+    let outputUID: String
+    let failureCount: Int
+    let retryAfter: Date
+
+    static func recordingFailure(
+        for outputUID: String,
+        previous: AutomaticActivationRetryState?,
+        now: Date = Date()
+    ) -> AutomaticActivationRetryState {
+        let failureCount: Int
+        if let previous, previous.outputUID == outputUID {
+            failureCount = previous.failureCount + 1
+        } else {
+            failureCount = 1
+        }
+        let delay = min(30.0, pow(2.0, Double(min(failureCount - 1, 5))))
+        return AutomaticActivationRetryState(
+            outputUID: outputUID,
+            failureCount: failureCount,
+            retryAfter: now.addingTimeInterval(delay)
+        )
+    }
+
+    func defersActivation(for outputUID: String, now: Date = Date()) -> Bool {
+        self.outputUID == outputUID && now < retryAfter
+    }
+}
 
 @MainActor
 final class AppState: NSObject, ObservableObject {
@@ -9,6 +39,7 @@ final class AppState: NSObject, ObservableObject {
     @Published var validationMessage: String = ""
     @Published var warnings: [String] = []
     @Published private(set) var isValidating = false
+    @Published private(set) var eqDraftRevision: UInt64 = 0
 
     var activeProfileID: UUID? { activeSession?.profileID }
 
@@ -16,32 +47,58 @@ final class AppState: NSObject, ObservableObject {
     let profiles: ProfileStore
     let dependencies: DependencyManager
     let loginItem = LoginItemManager()
-    let dsp = CamillaDSPManager()
-    let meters = MeterModel()
+    let dsp: CamillaDSPManager
+    let meters = AudioRuntimeMonitor()
     let spectrum = SpectrumAnalyzer()
     let pcmRouter = PCMRouter()
     let driverTransport = SystemAudioBridgeTransport()
     let updateChecker = AppUpdateChecker()
 
     private let notifications = NotificationManager()
-    private let parser = EqualizerAPOParser()
-    private let configBuilder = CamillaConfigBuilder()
+    private let graphBuilder = ProcessingGraphBuilder()
+    private let dspController: CamillaDSPController
     private let volumeBridge = SystemVolumeBridge()
     private var previousDefaultUID: String?
     private var monitorTimer: Timer?
     private var suppressedAutoUID: String?
+    private var automaticActivationRetry: AutomaticActivationRetryState?
     private var transitionInProgress = false
     private var activeSampleRate: Int?
     private var activeRoutingUID: String?
+    /// The physical device actually owned by the running engine. Persisted
+    /// profile fields may change while an async teardown is in flight, so they
+    /// cannot safely serve as the runtime routing snapshot.
+    private var activePhysicalOutputUID: String?
     private var latestApplyRequest: UInt64 = 0
+    private struct PendingLiveApply {
+        var request: UInt64
+        var profile: DeviceProfile
+    }
+    private var pendingLiveApply: PendingLiveApply?
+    private var liveApplyWorker: Task<Void, Never>?
     private var sessionEQDrafts: [UUID: String] = [:]
+    private var sessionEQDraftsReplaceDeviceCorrection: Set<UUID> = []
+    private var sessionDeviceCorrectionProvenance: [UUID: DeviceCorrectionProfile] = [:]
+    private var sessionClearsDeviceCorrectionProvenance: Set<UUID> = []
+    private var sessionLimiterDrafts: [UUID: Bool] = [:]
+    private var sessionChannelEQDrafts: [UUID: [Int: String]] = [:]
+    private var sessionChannelLimiterDrafts: [UUID: [Int: Bool]] = [:]
+    private var profilePersistenceErrorObservation: AnyCancellable?
 
     override init() {
         let audio = CoreAudioManager()
+        let dsp = CamillaDSPManager()
         self.coreAudio = audio
+        self.dsp = dsp
+        self.dspController = CamillaDSPController(manager: dsp)
         self.profiles = ProfileStore()
         self.dependencies = DependencyManager(coreAudio: audio)
         super.init()
+        profilePersistenceErrorObservation = profiles.$persistenceError
+            .compactMap { $0 }
+            .sink { [weak self] message in
+                self?.errorMessage = message
+            }
         UIRenderPerformance.startMonitoring()
 
         if audio.isSystemAudioBridgePresentationSupported {
@@ -79,11 +136,22 @@ final class AppState: NSObject, ObservableObject {
 
     func validate(profile: DeviceProfile) -> ParsedEQ? {
         do {
-            let parsed = try parser.parse(profile.equalizerAPOText)
-            warnings = parsed.warnings
-            let activeFilterCount = parsed.bands.lazy.filter(\.enabled).count
-            validationMessage = "Valid: \(activeFilterCount) active filters, preamp \(String(format: "%.2f", parsed.preampDB)) dB"
-            errorMessage = nil
+            let graph = try graphBuilder.build(profile: profile)
+            let parsed = try profile.resolvedProcessing().globalEqualizer
+            warnings = []
+            let activeFilterCount = graph.processors.lazy.filter { processor in
+                if case .biquad = processor.implementation { return true }
+                return false
+            }.count
+            let processedChannelCount = Set(graph.pipeline.compactMap { step -> Int? in
+                if case .channel(let index, _) = step.scope { return index }
+                return nil
+            }).count
+            let channelSummary = processedChannelCount == 0
+                ? "global processing only"
+                : "\(processedChannelCount) channels with individual processing"
+            validationMessage = "Valid: \(graph.pipeline.count) processing stages, \(activeFilterCount) active filters, \(channelSummary), preamp \(String(format: "%.2f", parsed.preampDB)) dB"
+            clearTransientError()
             return parsed
         } catch {
             validationMessage = ""
@@ -97,12 +165,172 @@ final class AppState: NSObject, ObservableObject {
         sessionEQDrafts[profileID]
     }
 
+    /// Spectrum FFT, PCM metering, and telemetry polling are presentation
+    /// concerns. The DSP/audio route stays active when no profile editor is on
+    /// screen, while these visual-only consumers pause.
+    func setRuntimeVisuals(profileID: UUID, active: Bool) {
+        spectrum.setPresentationActive(active, profileID: profileID)
+        meters.setPresentationActive(active, profileID: profileID)
+    }
+
+    func prepareForDependencyRepair() async -> Bool {
+        for _ in 0..<200 where transitionInProgress {
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        guard !transitionInProgress else {
+            errorMessage = "Audio routing is still changing. Wait a moment, then start the repair again."
+            return false
+        }
+        if isActive { await deactivate(manual: true) }
+        guard !isActive else {
+            errorMessage = "CamiTune could not stop the active audio route before repair."
+            return false
+        }
+        return true
+    }
+
     func setEQDraft(_ text: String, for profileID: UUID) {
         sessionEQDrafts[profileID] = text
+        eqDraftRevision &+= 1
+    }
+
+    func markEQDraftAsReplacingDeviceCorrection(for profileID: UUID) {
+        sessionEQDraftsReplaceDeviceCorrection.insert(profileID)
+    }
+
+    func eqDraftReplacesDeviceCorrection(for profileID: UUID) -> Bool {
+        sessionEQDraftsReplaceDeviceCorrection.contains(profileID)
+    }
+
+    func limiterDraft(for profileID: UUID) -> Bool? {
+        sessionLimiterDrafts[profileID]
+    }
+
+    func setLimiterDraft(_ enabled: Bool, for profileID: UUID) {
+        guard sessionLimiterDrafts[profileID] != enabled else { return }
+        sessionLimiterDrafts[profileID] = enabled
+        eqDraftRevision &+= 1
+    }
+
+    func setDeviceCorrectionProvenanceDraft(
+        _ correction: DeviceCorrectionProfile?,
+        for profileID: UUID
+    ) {
+        if let correction {
+            sessionDeviceCorrectionProvenance[profileID] = correction
+            sessionClearsDeviceCorrectionProvenance.remove(profileID)
+        } else {
+            sessionDeviceCorrectionProvenance.removeValue(forKey: profileID)
+            sessionClearsDeviceCorrectionProvenance.insert(profileID)
+        }
+    }
+
+    func deviceCorrectionProvenance(
+        for profileID: UUID,
+        persisted: DeviceCorrectionProfile?
+    ) -> DeviceCorrectionProfile? {
+        if let draft = sessionDeviceCorrectionProvenance[profileID] { return draft }
+        if sessionClearsDeviceCorrectionProvenance.contains(profileID) { return nil }
+        return persisted
+    }
+
+    func applyDeviceCorrectionProvenanceDraft(
+        to processing: inout ProcessingProfile,
+        for profileID: UUID
+    ) {
+        if let draft = sessionDeviceCorrectionProvenance[profileID] {
+            processing.globalEqualizerProvenance = draft
+        } else if sessionClearsDeviceCorrectionProvenance.contains(profileID) {
+            processing.globalEqualizerProvenance = nil
+        }
     }
 
     func clearEQDraft(for profileID: UUID) {
         sessionEQDrafts.removeValue(forKey: profileID)
+        sessionEQDraftsReplaceDeviceCorrection.remove(profileID)
+        sessionDeviceCorrectionProvenance.removeValue(forKey: profileID)
+        sessionClearsDeviceCorrectionProvenance.remove(profileID)
+        sessionLimiterDrafts.removeValue(forKey: profileID)
+        eqDraftRevision &+= 1
+    }
+
+    func channelEQDraft(for profileID: UUID, channelIndex: Int) -> String? {
+        sessionChannelEQDrafts[profileID]?[channelIndex]
+    }
+
+    func setChannelEQDraft(_ text: String, for profileID: UUID, channelIndex: Int) {
+        sessionChannelEQDrafts[profileID, default: [:]][channelIndex] = text
+        eqDraftRevision &+= 1
+    }
+
+    func channelLimiterDraft(for profileID: UUID, channelIndex: Int) -> Bool? {
+        sessionChannelLimiterDrafts[profileID]?[channelIndex]
+    }
+
+    func setChannelLimiterDraft(
+        _ enabled: Bool,
+        for profileID: UUID,
+        channelIndex: Int
+    ) {
+        guard sessionChannelLimiterDrafts[profileID]?[channelIndex] != enabled else {
+            return
+        }
+        sessionChannelLimiterDrafts[profileID, default: [:]][channelIndex] = enabled
+        eqDraftRevision &+= 1
+    }
+
+    func clearChannelEQDraft(for profileID: UUID, channelIndex: Int) {
+        sessionChannelEQDrafts[profileID]?.removeValue(forKey: channelIndex)
+        if sessionChannelEQDrafts[profileID]?.isEmpty == true {
+            sessionChannelEQDrafts.removeValue(forKey: profileID)
+        }
+        sessionChannelLimiterDrafts[profileID]?.removeValue(forKey: channelIndex)
+        if sessionChannelLimiterDrafts[profileID]?.isEmpty == true {
+            sessionChannelLimiterDrafts.removeValue(forKey: profileID)
+        }
+        eqDraftRevision &+= 1
+    }
+
+    /// Produces the profile currently being auditioned without persisting drafts.
+    /// Global and per-channel editors both use this so changing one scope cannot
+    /// revert an unsaved draft in another scope.
+    func applyingSessionEQDrafts(to profile: DeviceProfile) throws -> DeviceProfile {
+        var updated = profile
+        if let text = sessionEQDrafts[profile.id] {
+            let parsed = try EqualizerAPOParser().parse(text)
+            updated.setGlobalEqualizer(preampDB: parsed.preampDB, bands: parsed.bands)
+            if sessionEQDraftsReplaceDeviceCorrection.contains(profile.id) {
+                updated.processing.setDeviceCorrection(nil)
+            }
+        }
+        if let limiterEnabled = sessionLimiterDrafts[profile.id] {
+            updated.processing.setLimiterEnabled(limiterEnabled)
+        }
+        applyDeviceCorrectionProvenanceDraft(to: &updated.processing, for: profile.id)
+        let channelEQDrafts = sessionChannelEQDrafts[profile.id] ?? [:]
+        let channelLimiterDrafts = sessionChannelLimiterDrafts[profile.id] ?? [:]
+        let draftedChannelIndexes = Set(channelEQDrafts.keys).union(channelLimiterDrafts.keys)
+        for channelIndex in draftedChannelIndexes {
+            let current = updated.processing.settings(forChannel: channelIndex) ?? .identity
+            let parsed = try channelEQDrafts[channelIndex].map {
+                try EqualizerAPOParser().parse($0)
+            } ?? ParsedEQ(
+                preampDB: current.gainDB,
+                bands: current.bands,
+                warnings: []
+            )
+            let role = updated.processing.channels.first(where: { $0.index == channelIndex })?.role
+                ?? (channelIndex == 0 ? .left : (channelIndex == 1 ? .right : .unknown))
+            try updated.setChannelProcessing(
+                index: channelIndex,
+                role: role,
+                gainDB: parsed.preampDB,
+                bands: parsed.bands,
+                limiterEnabled: channelLimiterDrafts[channelIndex]
+                    ?? current.limiterEnabled
+            )
+        }
+        return updated
     }
 
     func processingSampleRateProblem(rate: Int, outputUID: String) -> String? {
@@ -130,7 +358,7 @@ final class AppState: NSObject, ObservableObject {
         isValidating = true
         validationMessage = "Validating dependencies, devices, sample rate, and CamillaDSP configuration…"
         defer { isValidating = false }
-        guard let parsed = validate(profile: profile) else { return }
+        guard validate(profile: profile) != nil else { return }
         do {
             dependencies.refresh()
             guard FileManager.default.isExecutableFile(atPath: dependencies.camillaDSPBinary.path) else {
@@ -152,15 +380,18 @@ final class AppState: NSObject, ObservableObject {
                 throw AppError.unsupportedSampleRate(profile.sampleRate, output.name)
             }
 
-            try dependencies.validateConfiguration(configBuilder.build(profile: profile, parsed: parsed))
+            let graph = try graphBuilder.build(profile: profile)
+            try await dependencies.validateConfiguration(
+                dspController.configuration(for: graph).yaml
+            )
 
             if isActive, activeProfileID == profile.id {
-                let engineState = try await dsp.rpc.state()
-                validationMessage = "Ready: EQ syntax, dependencies, devices, \(rateDescription(profile.sampleRate)), CamillaDSP config, and live engine checked (\(engineState))."
+                let diagnostics = try await dspController.fetchDiagnostics()
+                validationMessage = "Ready: EQ syntax, dependencies, devices, \(rateDescription(profile.sampleRate)), CamillaDSP config, and live engine checked (\(diagnostics.engineState))."
             } else {
                 validationMessage = "Ready: EQ syntax, dependencies, devices, \(rateDescription(profile.sampleRate)), and CamillaDSP config checked. Activate EQ to test the live audio engine."
             }
-            errorMessage = nil
+            clearTransientError()
         } catch {
             validationMessage = ""
             errorMessage = "Validation failed: \(error.localizedDescription)"
@@ -191,7 +422,7 @@ final class AppState: NSObject, ObservableObject {
                 activeProfileID: activeProfileID
             )
 
-            errorMessage = nil
+            clearTransientError()
         } catch {
             errorMessage = "The profile was renamed, but its macOS audio device could not be updated: \(error.localizedDescription)"
         }
@@ -220,10 +451,25 @@ final class AppState: NSObject, ObservableObject {
         if enabled { await monitorRouting() }
     }
 
+    /// Profile creation changes routing policy, so it must pass through the
+    /// runtime owner instead of only mutating persistent profile storage.
+    @discardableResult
+    func addProfile(for device: AudioDeviceInfo) -> UUID? {
+        guard let profile = profiles.addProfile(for: device) else { return nil }
+        automaticActivationRetry = nil
+        if suppressedAutoUID == device.id { suppressedAutoUID = nil }
+        Task { [weak self] in
+            await self?.monitorRouting()
+        }
+        return profile.id
+    }
+
     func setAutomaticProfile(
         for physicalDevice: PhysicalOutputIdentity,
         profileID: UUID?
     ) async {
+        automaticActivationRetry = nil
+        if suppressedAutoUID == physicalDevice.uid { suppressedAutoUID = nil }
         profiles.setAutomaticProfile(physicalDevice: physicalDevice, profileID: profileID)
         if let profileID {
             profiles.setAutoActivateWhenProfileDeviceSelected(profileID: profileID, enabled: false)
@@ -232,6 +478,7 @@ final class AppState: NSObject, ObservableObject {
     }
 
     func setAutoActivateWhenProfileDeviceSelected(id: UUID, enabled: Bool) async {
+        automaticActivationRetry = nil
         guard let profile = profiles.profiles.first(where: { $0.id == id }) else { return }
         if enabled,
            profiles.automaticProfileID(forPhysicalDeviceUID: profile.outputDeviceUID) == id {
@@ -251,6 +498,42 @@ final class AppState: NSObject, ObservableObject {
                 profiles: profiles.profiles,
                 activeProfileID: activeProfileID
             )
+        }
+    }
+
+    /// Changes an output through the runtime owner. If this profile is active,
+    /// its old engine and volume bridge are released before the same profile is
+    /// restarted against the new physical endpoint. Session EQ drafts remain
+    /// in memory and are applied to the restarted graph.
+    func setOutputDevice(profileID: UUID, device: AudioDeviceInfo) async {
+        guard !device.isRoutingDevice,
+              let current = profiles.profiles.first(where: { $0.id == profileID }) else {
+            return
+        }
+        let requiresRestart = isActive
+            && activeProfileID == profileID
+            && current.outputDeviceUID != device.id
+
+        profiles.setOutputDevice(profileID: profileID, device: device)
+        automaticActivationRetry = nil
+        suppressedAutoUID = nil
+
+        if requiresRestart {
+            await deactivate(manual: false)
+            guard let persisted = profiles.profiles.first(where: { $0.id == profileID }) else {
+                return
+            }
+            do {
+                await activate(profile: try applyingSessionEQDrafts(to: persisted))
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        } else {
+            _ = try? coreAudio.synchronizeProfileRoutingDevices(
+                profiles: profiles.profiles,
+                activeProfileID: activeProfileID
+            )
+            await monitorRouting()
         }
     }
 
@@ -278,7 +561,7 @@ final class AppState: NSObject, ObservableObject {
                 throw AppError.outputMissing(profile.outputDeviceName)
             }
             guard !output.isRoutingDevice else { throw AppError.invalidTarget }
-            guard let parsed = validate(profile: profile) else { return }
+            guard validate(profile: profile) != nil else { return }
             let sampleRate = Double(profile.sampleRate)
             guard coreAudio.supportsSampleRate(uid: bridge.id, rate: sampleRate) else {
                 throw AppError.unsupportedSampleRate(profile.sampleRate, bridge.name)
@@ -291,11 +574,15 @@ final class AppState: NSObject, ObservableObject {
                 // There is one system route and one private CamillaDSP engine.
                 // Switching profiles must explicitly release the old pipeline
                 // before the replacement can own either resource.
-                guard activeProfileID != profile.id else { return }
+                let alreadyOwnsRequestedRuntime = activeProfileID == profile.id
+                    && activePhysicalOutputUID == profile.outputDeviceUID
+                    && activeSampleRate == profile.sampleRate
+                guard !alreadyOwnsRequestedRuntime else { return }
                 await stopProcessingPipeline()
                 isActive = false
                 activeSession = nil
                 activeSampleRate = nil
+                activePhysicalOutputUID = nil
             }
 
             _ = try coreAudio.synchronizeProfileRoutingDevices(
@@ -326,16 +613,28 @@ final class AppState: NSObject, ObservableObject {
             try await coreAudio.setSampleRate(uid: bridge.id, rate: sampleRate)
 
             try await dsp.start(binary: dependencies.camillaDSPBinary)
+            dspController.resetRuntime()
             let camillaOutputs = try await dsp.rpc.availablePlaybackDevices(backend: "CoreAudio")
             guard camillaOutputs.contains(where: { $0.identifier == profile.outputDeviceUID }) else {
                 throw AppError.camillaDSPCoreAudioUIDUnsupported
             }
-            let yaml = configBuilder.build(profile: profile, parsed: parsed)
-            try await dsp.apply(yaml: yaml)
+            let graph = try graphBuilder.build(profile: profile)
+            try await dspController.applyGraph(graph)
 
             let runtimeSession = AudioRuntimeSession(profileID: profile.id)
+            meters.start(
+                controller: dspController,
+                session: runtimeSession,
+                routeDiagnosticsProvider: { [driverTransport, pcmRouter] in
+                    AudioRouteDiagnostics(
+                        transport: driverTransport.statistics,
+                        router: pcmRouter.statistics
+                    )
+                }
+            )
             pcmRouter.start(
                 camillaSink: try dsp.audioInputHandle(),
+                meterConsumer: meters.pcmConsumer(for: runtimeSession),
                 analyzerConsumer: { [weak spectrum] frame in
                     spectrum?.ingest(
                         interleaved: frame.interleaved,
@@ -370,25 +669,29 @@ final class AppState: NSObject, ObservableObject {
 
             activeSession = runtimeSession
             activeSampleRate = profile.sampleRate
+            activePhysicalOutputUID = profile.outputDeviceUID
             isActive = true
-            meters.start(rpc: dsp.rpc, session: runtimeSession)
             spectrum.start(session: runtimeSession, sourceName: "System Audio Bridge")
             _ = try? coreAudio.synchronizeProfileRoutingDevices(
                 profiles: profiles.profiles,
                 activeProfileID: profile.id
             )
             suppressedAutoUID = nil
-            errorMessage = nil
+            automaticActivationRetry = nil
+            clearTransientError()
             notifications.activated()
         } catch {
             if reportErrors || shouldAlwaysReport(error) {
                 errorMessage = error.localizedDescription
             }
             if automatic, activationOriginUID == profile.outputDeviceUID {
-                // A failed physical-output activation must not republish and
-                // remove the profile endpoint once per monitor tick. Retry
-                // after the user changes away from this physical output.
-                suppressedAutoUID = profile.outputDeviceUID
+                // Transient driver/WebSocket startup races should recover while
+                // the physical output remains selected. Backoff prevents a
+                // permanent setup failure from churning the route every second.
+                automaticActivationRetry = .recordingFailure(
+                    for: profile.outputDeviceUID,
+                    previous: automaticActivationRetry
+                )
             }
             await stopProcessingPipeline()
             if let routingUID = activeRoutingUID,
@@ -399,6 +702,7 @@ final class AppState: NSObject, ObservableObject {
             isActive = false
             activeSession = nil
             activeSampleRate = nil
+            activePhysicalOutputUID = nil
             activeRoutingUID = nil
             try? coreAudio.setSystemAudioBridgePresentation(
                 name: "System Audio Bridge",
@@ -413,8 +717,33 @@ final class AppState: NSObject, ObservableObject {
 
     func apply(profile: DeviceProfile) async {
         latestApplyRequest &+= 1
-        let request = latestApplyRequest
-        guard let parsed = validate(profile: profile) else { return }
+        pendingLiveApply = PendingLiveApply(
+            request: latestApplyRequest,
+            profile: profile
+        )
+        if liveApplyWorker == nil {
+            liveApplyWorker = Task { @MainActor [weak self] in
+                await self?.drainLiveApplies()
+            }
+        }
+        await liveApplyWorker?.value
+    }
+
+    /// Serializes WebSocket exchanges and coalesces edits that arrive while an
+    /// earlier patch is awaiting its reply. A caller canceling its UI debounce
+    /// task cannot abandon a sent request or desynchronize the graph snapshot.
+    private func drainLiveApplies() async {
+        while let pending = pendingLiveApply {
+            pendingLiveApply = nil
+            await performLiveApply(pending)
+        }
+        liveApplyWorker = nil
+    }
+
+    private func performLiveApply(_ pending: PendingLiveApply) async {
+        let profile = pending.profile
+        let request = pending.request
+        guard validate(profile: profile) != nil else { return }
         guard isActive, activeProfileID == profile.id else { return }
         if activeSampleRate != profile.sampleRate {
             if let problem = processingSampleRateProblem(
@@ -424,7 +753,7 @@ final class AppState: NSObject, ObservableObject {
                 errorMessage = problem
                 return
             }
-            await deactivate(manual: false)
+            await deactivate(manual: false, invalidateLiveApplies: false)
             await activate(profile: profile)
             return
         }
@@ -432,25 +761,32 @@ final class AppState: NSObject, ObservableObject {
             guard coreAudio.device(uid: profile.outputDeviceUID) != nil else {
                 throw AppError.outputMissing(profile.outputDeviceName)
             }
-            let yaml = configBuilder.build(profile: profile, parsed: parsed)
-            try await dsp.apply(yaml: yaml)
-            guard request == latestApplyRequest, !Task.isCancelled else { return }
-            errorMessage = nil
-        } catch is CancellationError {
-            // Dragging again intentionally supersedes an in-flight live update.
+            let graph = try graphBuilder.build(profile: profile)
+            try await dspController.applyGraph(graph)
+            guard request == latestApplyRequest else { return }
+            clearTransientError()
         } catch {
             guard request == latestApplyRequest else { return }
             errorMessage = error.localizedDescription
         }
     }
 
-    func deactivate(manual: Bool = true, restoreOutput: Bool = true) async {
+    func deactivate(
+        manual: Bool = true,
+        restoreOutput: Bool = true,
+        invalidateLiveApplies: Bool = true
+    ) async {
         guard !transitionInProgress else { return }
-        latestApplyRequest &+= 1
+        if invalidateLiveApplies {
+            latestApplyRequest &+= 1
+            pendingLiveApply = nil
+        }
         transitionInProgress = true
         defer { transitionInProgress = false }
 
-        let targetUID = activeProfileID.flatMap { id in profiles.profiles.first(where: { $0.id == id })?.outputDeviceUID }
+        let targetUID = activePhysicalOutputUID ?? activeProfileID.flatMap { id in
+            profiles.profiles.first(where: { $0.id == id })?.outputDeviceUID
+        }
 
         await stopProcessingPipeline()
 
@@ -467,9 +803,13 @@ final class AppState: NSObject, ObservableObject {
         isActive = false
         activeSession = nil
         activeSampleRate = nil
+        activePhysicalOutputUID = nil
         activeRoutingUID = nil
         previousDefaultUID = nil
-        if manual { suppressedAutoUID = targetUID }
+        if manual {
+            suppressedAutoUID = targetUID
+            automaticActivationRetry = nil
+        }
         _ = try? coreAudio.synchronizeProfileRoutingDevices(
             profiles: profiles.profiles,
             activeProfileID: nil
@@ -481,9 +821,11 @@ final class AppState: NSObject, ObservableObject {
         meters.stop()
         volumeBridge.stop()
         driverTransport.stop()
+        dsp.closeAudioInput()
         pcmRouter.stop()
         spectrum.stop()
         await dsp.stop()
+        dspController.resetRuntime()
     }
 
     private func monitorRouting() async {
@@ -503,10 +845,26 @@ final class AppState: NSObject, ObservableObject {
                 await deactivate(manual: false)
                 return
             }
+            guard let activeProfileID,
+                  let activeProfile = profiles.profiles.first(where: { $0.id == activeProfileID }) else {
+                await deactivate(manual: false, restoreOutput: false)
+                return
+            }
+            if let activePhysicalOutputUID,
+               activeProfile.outputDeviceUID != activePhysicalOutputUID {
+                do {
+                    let updated = try applyingSessionEQDrafts(to: activeProfile)
+                    await deactivate(manual: false)
+                    await activate(profile: updated)
+                } catch {
+                    errorMessage = error.localizedDescription
+                    await deactivate(manual: false)
+                }
+                return
+            }
             if let activeSampleRate,
-               let activeProfileID,
-               let activeProfile = profiles.profiles.first(where: { $0.id == activeProfileID }),
-               let actualRate = coreAudio.nominalSampleRate(uid: activeProfile.outputDeviceUID),
+               let outputUID = activePhysicalOutputUID,
+               let actualRate = coreAudio.nominalSampleRate(uid: outputUID),
                abs(actualRate - Double(activeSampleRate)) >= 0.5 {
                 errorMessage = AppError.runtimeSampleRateMismatch(
                     expected: activeSampleRate,
@@ -516,14 +874,12 @@ final class AppState: NSObject, ObservableObject {
                 await deactivate(manual: false)
                 return
             }
-            if let activeProfileID,
-               profiles.profiles.first(where: { $0.id == activeProfileID })?.isEnabled == false {
+            if !activeProfile.isEnabled {
                 await deactivate(manual: false)
                 return
             }
-            if let activeProfileID,
-               let activeProfile = profiles.profiles.first(where: { $0.id == activeProfileID }),
-               coreAudio.device(uid: activeProfile.outputDeviceUID) == nil {
+            if let outputUID = activePhysicalOutputUID,
+               coreAudio.device(uid: outputUID) == nil {
                 await deactivate(manual: false, restoreOutput: false)
                 return
             }
@@ -545,6 +901,13 @@ final class AppState: NSObject, ObservableObject {
         if let suppressedAutoUID {
             if current == suppressedAutoUID { return }
             self.suppressedAutoUID = nil
+        }
+        if let automaticActivationRetry {
+            if automaticActivationRetry.outputUID != current {
+                self.automaticActivationRetry = nil
+            } else if automaticActivationRetry.defersActivation(for: current) {
+                return
+            }
         }
 
         // CoreAudio can temporarily keep a removed device's UID as the default
@@ -579,6 +942,7 @@ final class AppState: NSObject, ObservableObject {
         meters.stop()
         volumeBridge.stop()
         driverTransport.stop()
+        dsp.closeAudioInput()
         pcmRouter.stop()
         spectrum.stop()
 
@@ -600,6 +964,7 @@ final class AppState: NSObject, ObservableObject {
         isActive = false
         activeSession = nil
         activeSampleRate = nil
+        activePhysicalOutputUID = nil
         activeRoutingUID = nil
         previousDefaultUID = nil
     }
@@ -624,6 +989,12 @@ final class AppState: NSObject, ObservableObject {
             }
         }
         return false
+    }
+
+    /// Successful transient operations must not hide a profile-store failure
+    /// published during the same edit.
+    func clearTransientError() {
+        errorMessage = profiles.persistenceError
     }
 
     enum AppError: LocalizedError {

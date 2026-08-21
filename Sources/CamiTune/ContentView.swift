@@ -243,8 +243,8 @@ struct ContentView: View {
               let device = coreAudio.physicalOutputDevices.first(where: {
                   $0.id == pendingOutputUID
               }) else { return }
-        profileStore.addProfile(for: device)
-        selection = profileStore.selectedProfileID?.uuidString ?? "setup"
+        let profileID = state.addProfile(for: device)
+        selection = profileID?.uuidString ?? "setup"
         showingOutputPicker = false
         self.pendingOutputUID = nil
     }
@@ -342,19 +342,32 @@ struct SetupView: View {
                     title: "CamillaDSP",
                     status: dependencies.camillaDSPStatus,
                     detail: "UID-capable build bundled with CamiTune; installed under ~/Library/Application Support/CamiTune/bin.",
-                    action: { Task { await dependencies.installCamillaDSP() } }
+                    action: {
+                        Task {
+                            guard await state.prepareForDependencyRepair() else { return }
+                            await dependencies.installCamillaDSP()
+                        }
+                    }
                 )
 
                 dependencyCard(
                     title: "System Audio Bridge Driver",
                     status: dependencies.audioDriverStatus,
-                    detail: "Installed under ~/Library/Application Support/CamiTune/Driver; Installation asks once for macOS administrator approval.",
-                    action: { Task { await dependencies.installAudioDriver() } }
+                    detail: "Installed under ~/Library/Application Support/CamiTune/Drivers; installation asks once for macOS administrator approval.",
+                    action: {
+                        Task {
+                            guard await state.prepareForDependencyRepair() else { return }
+                            await dependencies.installAudioDriver()
+                        }
+                    }
                 )
 
                 HStack {
                     Button("Install / Repair Everything") {
-                        Task { await dependencies.installEverything() }
+                        Task {
+                            guard await state.prepareForDependencyRepair() else { return }
+                            await dependencies.installEverything()
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(dependencies.setupInProgress)
@@ -568,8 +581,13 @@ struct ProfileEditorView: View {
     @State private var responsePointsForGraph: [EQResponsePoint] = []
     @State private var filterResponsePointsForGraph: [EQResponsePoint] = []
     @State private var preampDB = 0.0
+    @State private var limiterEnabled = false
+    @State private var automaticSystemHeadroomDB = 0.0
     @State private var graphicBands: [EQBand] = []
+    @State private var pendingBandCount: Int?
+    @State private var showBandReductionConfirmation = false
     @State private var showTextImporter = false
+    @State private var showDeviceCorrectionEditor = false
     @State private var eqIsSaved = true
     @State private var suppressEQChanges = false
     @State private var liveApplyTask: Task<Void, Never>?
@@ -636,8 +654,10 @@ struct ProfileEditorView: View {
 
                 GroupBox {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("Audio levels").font(.title3.bold())
+                        Text("Meters & status").font(.title3.bold())
                         SignalMetersView(meters: state.meters, profileID: profile.id)
+                        Divider()
+                        AudioRuntimeStatusView(monitor: state.meters, profileID: profile.id)
                     }.padding(6)
                 }
 
@@ -655,6 +675,9 @@ struct ProfileEditorView: View {
                                 .font(.caption.weight(.medium))
                                 .foregroundStyle(eqIsSaved ? Color.green : Color.secondary)
                             Spacer()
+                            Button("Device Correction…") {
+                                showDeviceCorrectionEditor = true
+                            }
                             Button("Import .txt") { showTextImporter = true }
                             Button("Paste APO Text") { importFromClipboard() }
                             Button { saveGraphicEQ() } label: {
@@ -666,7 +689,7 @@ struct ProfileEditorView: View {
                             }
                             .buttonStyle(.plain)
                         }
-                        Text("Supports Equalizer APO Preamp plus ON/OFF PK/PEQ, LS/LSC, HS/HSC, LP/LPQ, HP/HPQ, NO, and AP filters using Q or BW Oct.")
+                        Text("Imports ON/OFF PK/PEQ, LS/LSC, HS/HSC, LP/LPQ, HP/HPQ, NO, and AP filters using Q, BW Oct, or 6/12 dB shelf slopes. APO Preamp is ignored; use User Preamp instead. Other valid APO commands are skipped.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         HStack(spacing: 8) {
@@ -682,15 +705,26 @@ struct ProfileEditorView: View {
                             .labelsHidden()
                             .frame(width: 64)
                         }
-                        PreampControl(preampDB: $preampDB) {
-                            calculateAutomaticPreamp()
-                        }
+                        PreampGainControl(
+                            gainDB: $preampDB,
+                            limiterEnabled: $limiterEnabled,
+                            meters: state.meters,
+                            profileID: profile.id
+                        )
+                        Text("Automatic system headroom: \(automaticSystemHeadroomDB, format: .number.precision(.fractionLength(2))) dB")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
 
                         if !graphicBands.isEmpty {
                             let columnWidth = 96.0
-                            let fixedWidth = 48.0 + CGFloat(max(0, graphicBands.count - 1)) * 5
-                            let contentWidth = fixedWidth + CGFloat(graphicBands.count) * columnWidth
-                            ScrollView(.horizontal, showsIndicators: true) {
+                            let contentWidth = GraphicEqualizerBands.requiredContentWidth(
+                                bandCount: graphicBands.count,
+                                columnWidth: columnWidth
+                            )
+                            OverflowAwareHorizontalScrollView(
+                                contentWidth: contentWidth,
+                                height: 402
+                            ) {
                                 GraphicEqualizerBands(
                                     bands: $graphicBands,
                                     spectrum: state.spectrum,
@@ -699,14 +733,10 @@ struct ProfileEditorView: View {
                                     setKind: setKind,
                                     columnWidth: columnWidth
                                 )
-                                .frame(width: contentWidth, alignment: .leading)
-                                .padding(.bottom, 8)
-                                .background(PersistentHorizontalScroller())
                             }
-                            .transaction { transaction in
-                                transaction.animation = nil
-                            }
-                            .frame(height: 402)
+
+                            Divider()
+                            SimpleEQControlsView(bands: $graphicBands)
                         } else {
                             Text("Choose a band count above.")
                                 .foregroundStyle(.secondary)
@@ -714,10 +744,16 @@ struct ProfileEditorView: View {
                         }
                     }.padding(6)
                 }
+
+                PerChannelProcessingView(
+                    state: state,
+                    profile: $profile
+                )
             }
             .padding(28)
         }
         .onAppear {
+            state.setRuntimeVisuals(profileID: profile.id, active: true)
             loadGraphicEQ()
             installFocusClearingMonitor()
         }
@@ -729,8 +765,12 @@ struct ProfileEditorView: View {
             if isRenamingProfile && !isFocused { commitProfileRename() }
         }
         .onChange(of: preampDB) { _ in graphicEQChanged() }
+        .onChange(of: limiterEnabled) { _ in graphicEQChanged() }
         .onChange(of: graphicBands) { _ in graphicEQChanged() }
+        .onChange(of: profile.sampleRate) { _ in updateGraphResponses() }
+        .onChange(of: state.eqDraftRevision) { _ in updateAutomaticSystemHeadroom() }
         .onDisappear {
+            state.setRuntimeVisuals(profileID: profile.id, active: false)
             commitProfileRename()
             liveApplyTask?.cancel()
             preserveUnsavedEQDraft()
@@ -745,6 +785,32 @@ struct ProfileEditorView: View {
             } catch {
                 state.errorMessage = "Could not import Equalizer APO text: \(error.localizedDescription)"
             }
+        }
+        .alert("Recalculate Equalizer Bands?", isPresented: $showBandReductionConfirmation) {
+            Button("Cancel", role: .cancel) {
+                pendingBandCount = nil
+            }
+            Button("Recalculate", role: .destructive) {
+                applyPendingBandReduction()
+            }
+        } message: {
+            Text(bandReductionConfirmationMessage)
+        }
+        .sheet(isPresented: $showDeviceCorrectionEditor) {
+            DeviceCorrectionEditorView(
+                existing: currentDeviceCorrectionProvenance,
+                sampleRate: Double(profile.sampleRate),
+                automaticHeadroom: automaticHeadroomForCorrection,
+                shouldConfirmReplacement: {
+                    EQEditorSupport.hasMeaningfulProcessing(ParsedEQ(
+                        preampDB: preampDB,
+                        bands: graphicBands,
+                        warnings: []
+                    ))
+                },
+                onCancel: { showDeviceCorrectionEditor = false },
+                onLoad: loadDeviceCorrectionEQ
+            )
         }
     }
 
@@ -822,7 +888,12 @@ struct ProfileEditorView: View {
                             get: { profile.outputDeviceUID },
                             set: { newUID in
                                 if let device = state.coreAudio.device(uid: newUID) {
-                                    state.profiles.setOutputDevice(profileID: profile.id, device: device)
+                                    Task {
+                                        await state.setOutputDevice(
+                                            profileID: profile.id,
+                                            device: device
+                                        )
+                                    }
                                 }
                             }
                         )) {
@@ -987,15 +1058,49 @@ struct ProfileEditorView: View {
 
     private func loadGraphicEQ() {
         let draft = state.eqDraft(for: profile.id)
-        let source = draft ?? profile.equalizerAPOText
-        guard let parsed = try? EqualizerAPOParser().parse(source) else { return }
+        let limiterDraft = state.limiterDraft(for: profile.id)
+        let parsed: ParsedEQ
+        let persistedLimiterEnabled: Bool
+        var migratedDeviceCorrection = false
+        do {
+            let processing = try profile.resolvedProcessing()
+            persistedLimiterEnabled = processing.limiterEnabled
+            if let draft {
+                parsed = try EqualizerAPOParser().parse(draft)
+            } else {
+                if processing.deviceCorrection != nil {
+                    parsed = processing.globalEqualizerIncludingDeviceCorrection
+                    migratedDeviceCorrection = true
+                    state.setDeviceCorrectionProvenanceDraft(
+                        processing.deviceCorrection,
+                        for: profile.id
+                    )
+                    state.markEQDraftAsReplacingDeviceCorrection(for: profile.id)
+                    state.setEQDraft(
+                        EqualizerAPOSerializer().serialize(parsed),
+                        for: profile.id
+                    )
+                } else {
+                    parsed = processing.globalEqualizer
+                }
+            }
+        } catch {
+            state.errorMessage = error.localizedDescription
+            return
+        }
         suppressEQChanges = true
         liveApplyTask?.cancel()
+        let organizedBands = EQEditorSupport.organizedBands(parsed.bands)
         preampDB = parsed.preampDB
-        graphicBands = parsed.bands
-        parsedForGraph = parsed
+        limiterEnabled = limiterDraft ?? persistedLimiterEnabled
+        graphicBands = organizedBands
+        parsedForGraph = ParsedEQ(
+            preampDB: parsed.preampDB,
+            bands: organizedBands,
+            warnings: parsed.warnings
+        )
         updateGraphResponses()
-        eqIsSaved = draft == nil
+        eqIsSaved = draft == nil && limiterDraft == nil && !migratedDeviceCorrection
         DispatchQueue.main.async { suppressEQChanges = false }
     }
 
@@ -1005,6 +1110,7 @@ struct ProfileEditorView: View {
         updateGraphResponses()
         eqIsSaved = false
         state.setEQDraft(serializeGraphicEQ(), for: profile.id)
+        state.setLimiterDraft(limiterEnabled, for: profile.id)
         guard profileIsActive else { return }
         liveApplyTask?.cancel()
         let updatedProfile = profileWithCurrentEQ()
@@ -1017,24 +1123,34 @@ struct ProfileEditorView: View {
 
     private func saveGraphicEQ() {
         liveApplyTask?.cancel()
-        profile.equalizerAPOText = serializeGraphicEQ()
+        profile.setGlobalEqualizer(preampDB: preampDB, bands: graphicBands)
+        profile.processing.setLimiterEnabled(limiterEnabled)
+        if state.eqDraftReplacesDeviceCorrection(for: profile.id) {
+            profile.processing.setDeviceCorrection(nil)
+        }
+        state.applyDeviceCorrectionProvenanceDraft(
+            to: &profile.processing,
+            for: profile.id
+        )
         state.clearEQDraft(for: profile.id)
         eqIsSaved = true
         if profileIsActive {
-            let updatedProfile = profile
+            let updatedProfile = (try? state.applyingSessionEQDrafts(to: profile)) ?? profile
             Task { await state.apply(profile: updatedProfile) }
         }
     }
 
     private func profileWithCurrentEQ() -> DeviceProfile {
         var updated = profile
-        updated.equalizerAPOText = serializeGraphicEQ()
-        return updated
+        updated.setGlobalEqualizer(preampDB: preampDB, bands: graphicBands)
+        updated.processing.setLimiterEnabled(limiterEnabled)
+        return (try? state.applyingSessionEQDrafts(to: updated)) ?? updated
     }
 
     private func preserveUnsavedEQDraft() {
         guard !eqIsSaved else { return }
         state.setEQDraft(serializeGraphicEQ(), for: profile.id)
+        state.setLimiterDraft(limiterEnabled, for: profile.id)
     }
 
     private func importFromClipboard() {
@@ -1047,154 +1163,146 @@ struct ProfileEditorView: View {
     }
 
     private func importAPOText(_ text: String) throws {
-        let parsed = try EqualizerAPOParser().parse(text)
-        state.errorMessage = nil
+        let preservedUserPreampDB = preampDB
+        let parsed = try EqualizerAPOParser().parse(text, preampPolicy: .ignore)
+        state.clearTransientError()
+        // A valid APO document may contain only commands that CamiTune cannot
+        // represent yet (for example Include or Convolution). Treat that as a
+        // successful no-op instead of replacing the current EQ with a flat graph.
+        guard parsed.importedDirectiveCount > 0 else { return }
         suppressEQChanges = true
-        preampDB = parsed.preampDB
-        graphicBands = parsed.bands
-        parsedForGraph = parsed
+        let organizedBands = EQEditorSupport.organizedBands(parsed.bands)
+        // APO Preamp must never become User Preamp. Reapply the captured value
+        // before and after SwiftUI processes the bands mutation so an import
+        // cannot leak gain through a deferred view update.
+        preampDB = preservedUserPreampDB
+        graphicBands = organizedBands
+        parsedForGraph = ParsedEQ(
+            preampDB: preservedUserPreampDB,
+            bands: organizedBands,
+            warnings: parsed.warnings
+        )
         updateGraphResponses()
         eqIsSaved = false
+        state.setDeviceCorrectionProvenanceDraft(nil, for: profile.id)
         DispatchQueue.main.async {
+            preampDB = preservedUserPreampDB
             suppressEQChanges = false
             graphicEQChanged()
         }
     }
 
     private func setBandCount(_ count: Int) {
-        let target = min(20, max(0, count))
-        let oldCount = graphicBands.count
-        let customized = graphicBands.enumerated().compactMap { index, band in
-            isDefaultBand(band, index: index, count: oldCount) ? nil : band
+        guard count != graphicBands.count else { return }
+        if EQEditorSupport.shouldRefitWhenReducing(graphicBands, to: count) {
+            pendingBandCount = count
+            showBandReductionConfirmation = true
+            return
         }
-        let resolvedTarget = max(target, customized.count)
-        var candidateFrequencies = distributedFrequencies(count: resolvedTarget)
+        graphicBands = EQEditorSupport.resizedBands(graphicBands, count: count)
+    }
 
-        // A customized band occupies the nearest normal EQ slot. Remove that
-        // slot, then recreate only the untouched defaults. User-entered
-        // frequency, gain, Q, and filter values are never altered.
-        for custom in customized where !candidateFrequencies.isEmpty {
-            let nearest = candidateFrequencies.indices.min {
-                abs(log(candidateFrequencies[$0] / max(custom.frequency, 1)))
-                    < abs(log(candidateFrequencies[$1] / max(custom.frequency, 1)))
-            }
-            if let nearest { candidateFrequencies.remove(at: nearest) }
-        }
+    private var bandReductionConfirmationMessage: String {
+        let target = pendingBandCount ?? graphicBands.count
+        return "Every current band has an active value. Reducing from \(graphicBands.count) to \(target) bands will recalculate frequency, gain, and Q to approximate the same overall EQ response."
+    }
 
-        var rebuilt = customized
-        rebuilt.append(contentsOf: candidateFrequencies.map {
-            EQBand(kind: .peaking, frequency: $0, gain: 0, q: 1)
-        })
-        rebuilt.sort { $0.frequency < $1.frequency }
-        if let first = rebuilt.indices.first,
-           isUntouchedValues(rebuilt[first]) {
-            rebuilt[first].kind = .lowShelf
-        }
-        if let last = rebuilt.indices.last,
-           last != rebuilt.indices.first,
-           isUntouchedValues(rebuilt[last]) {
-            rebuilt[last].kind = .highShelf
-        }
-        graphicBands = rebuilt
+    private func applyPendingBandReduction() {
+        guard let target = pendingBandCount else { return }
+        pendingBandCount = nil
+        graphicBands = EQEditorSupport.responseFittedBands(
+            graphicBands,
+            count: target,
+            sampleRate: Double(profile.sampleRate)
+        )
     }
 
     private func updateGraphResponses() {
-        let response = EQResponseCalculator().calculate(
-            parsed: parsedForGraph,
+        let calculator = EQResponseCalculator()
+        var combined = parsedForGraph
+        if !state.eqDraftReplacesDeviceCorrection(for: profile.id),
+           let correction = profile.processing.deviceCorrection,
+           correction.isEnabled {
+            combined.bands.insert(contentsOf: correction.filters, at: 0)
+        }
+        responsePointsForGraph = calculator.calculate(
+            parsed: combined,
             sampleRate: Double(profile.sampleRate)
         )
-        responsePointsForGraph = response
-        filterResponsePointsForGraph = response.map {
-            EQResponsePoint(frequency: $0.frequency, gainDB: $0.gainDB - parsedForGraph.preampDB)
-        }
-    }
-
-    private func distributedFrequencies(count: Int) -> [Double] {
-        let minimum = 31.0
-        let maximum = 16_000.0
-        return (0..<count).map { index in
-            let position = count == 1 ? 0.5 : Double(index) / Double(count - 1)
-            return minimum * pow(maximum / minimum, position)
-        }
-    }
-
-    private func isDefaultBand(_ band: EQBand, index: Int, count: Int) -> Bool {
-        guard count > 0 else { return false }
-        let expected = distributedFrequencies(count: count)[index]
-        let expectedKind: EQBand.Kind = count > 1 && index == 0
-            ? .lowShelf
-            : (count > 1 && index == count - 1 ? .highShelf : .peaking)
-        return abs(log(max(band.frequency, 1) / expected)) < 0.015
-            && abs((band.gain ?? 0)) < 0.0001
-            && abs((band.q ?? 1) - 1) < 0.0001
-            && band.enabled
-            && band.kind == expectedKind
-    }
-
-    private func isUntouchedValues(_ band: EQBand) -> Bool {
-        abs((band.gain ?? 0)) < 0.0001 && abs((band.q ?? 1) - 1) < 0.0001
-    }
-
-    private func calculateAutomaticPreamp() {
-        let withoutPreamp = ParsedEQ(preampDB: 0, bands: graphicBands, warnings: [])
-        let response = EQResponseCalculator().calculate(
-            parsed: withoutPreamp,
-            sampleRate: Double(profile.sampleRate),
-            count: 1_200
+        filterResponsePointsForGraph = calculator.calculate(
+            parsed: ParsedEQ(preampDB: 0, bands: graphicBands, warnings: []),
+            sampleRate: Double(profile.sampleRate)
         )
-        let maximumBoost = response.map(\.gainDB).max() ?? 0
-        preampDB = max(-12, min(0, -maximumBoost))
+        updateAutomaticSystemHeadroom()
+    }
+
+    private func loadDeviceCorrectionEQ(_ correction: DeviceCorrectionProfile) {
+        suppressEQChanges = true
+        liveApplyTask?.cancel()
+        let organizedBands = EQEditorSupport.organizedBands(correction.filters)
+        preampDB = 0
+        graphicBands = organizedBands
+        parsedForGraph = ParsedEQ(
+            preampDB: 0,
+            bands: organizedBands,
+            warnings: []
+        )
+        state.markEQDraftAsReplacingDeviceCorrection(for: profile.id)
+        state.setDeviceCorrectionProvenanceDraft(correction, for: profile.id)
+        state.setEQDraft(serializeGraphicEQ(), for: profile.id)
+        eqIsSaved = false
+        showDeviceCorrectionEditor = false
+        updateGraphResponses()
+        DispatchQueue.main.async {
+            suppressEQChanges = false
+            graphicEQChanged()
+        }
+    }
+
+    private func updateAutomaticSystemHeadroom() {
+        do {
+            var current = profile
+            current.setGlobalEqualizer(preampDB: preampDB, bands: graphicBands)
+            current = try state.applyingSessionEQDrafts(to: current)
+            // The visible editor is authoritative even before its draft write is
+            // published; channel drafts still come from AppState.
+            current.setGlobalEqualizer(preampDB: preampDB, bands: graphicBands)
+            automaticSystemHeadroomDB = try ProcessingGraphBuilder().build(
+                profile: current
+            ).automaticHeadroomDB
+        } catch {
+            automaticSystemHeadroomDB = 0
+        }
+    }
+
+    private func automaticHeadroomForCorrection(_ filters: [EQBand]) -> Double {
+        do {
+            var candidate = profile
+            candidate = try state.applyingSessionEQDrafts(to: candidate)
+            candidate.processing.setDeviceCorrection(nil)
+            candidate.setGlobalEqualizer(preampDB: 0, bands: filters)
+            return try ProcessingGraphBuilder().build(profile: candidate).automaticHeadroomDB
+        } catch {
+            return 0
+        }
+    }
+
+    private var currentDeviceCorrectionProvenance: DeviceCorrectionProfile? {
+        state.deviceCorrectionProvenance(
+            for: profile.id,
+            persisted: profile.processing.globalEqualizerProvenance
+                ?? profile.processing.deviceCorrection
+        )
     }
 
     private func setKind(_ kind: EQBand.Kind, for band: inout EQBand) {
-        band.kind = kind
-        band.q = band.q ?? 0.707
-        band.bandwidth = nil
-        band.gain = usesGain(kind) ? (band.gain ?? 0) : nil
-    }
-
-    private func usesGain(_ kind: EQBand.Kind) -> Bool {
-        kind == .peaking || kind == .lowShelf || kind == .highShelf
-    }
-
-    private func filterLabel(_ kind: EQBand.Kind) -> String {
-        switch kind {
-        case .peaking: return "Peaking"
-        case .lowShelf: return "Low shelf"
-        case .highShelf: return "High shelf"
-        case .lowPass: return "Low pass"
-        case .highPass: return "High pass"
-        case .notch: return "Notch"
-        case .allPass: return "All pass"
-        }
+        EQEditorSupport.setKind(kind, for: &band)
     }
 
     private func serializeGraphicEQ() -> String {
-        var lines = ["Preamp: \(formatEQNumber(preampDB)) dB"]
-        for (index, band) in graphicBands.enumerated() {
-            let stateToken = band.enabled ? "ON" : "OFF"
-            var line = "Filter \(index + 1): \(stateToken) \(filterToken(band.kind)) Fc \(formatEQNumber(max(1, band.frequency))) Hz"
-            if usesGain(band.kind) { line += " Gain \(formatEQNumber(band.gain ?? 0)) dB" }
-            line += " Q \(formatEQNumber(max(0.05, band.q ?? 0.707)))"
-            lines.append(line)
-        }
-        return lines.joined(separator: "\n")
-    }
-
-    private func filterToken(_ kind: EQBand.Kind) -> String {
-        switch kind {
-        case .peaking: return "PK"
-        case .lowShelf: return "LS"
-        case .highShelf: return "HS"
-        case .lowPass: return "LPQ"
-        case .highPass: return "HPQ"
-        case .notch: return "NO"
-        case .allPass: return "AP"
-        }
-    }
-
-    private func formatEQNumber(_ value: Double) -> String {
-        String(format: "%.4g", value)
+        EqualizerAPOSerializer().serialize(
+            ParsedEQ(preampDB: preampDB, bands: graphicBands, warnings: [])
+        )
     }
 
     private func rateLabel(_ rate: Int) -> String {
@@ -1222,7 +1330,7 @@ private struct LiveSpectrumPanels: View {
 
             GroupBox {
                 VStack(alignment: .leading) {
-                    Text("Post-EQ Spectrum").font(.headline)
+                    Text("Estimated Post-Global EQ Spectrum").font(.headline)
                     HStack(spacing: 12) {
                         Text("post-EQ").foregroundStyle(.green)
                         Text("EQ response").foregroundStyle(.blue)
@@ -1242,6 +1350,34 @@ private struct LiveSpectrumPanels: View {
         .frame(height: 284)
     }
 
+}
+
+struct OverflowAwareHorizontalScrollView<Content: View>: View {
+    let contentWidth: CGFloat
+    let height: CGFloat
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        GeometryReader { geometry in
+            let needsScrolling = contentWidth > geometry.size.width + 0.5
+            if needsScrolling {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    content()
+                        .frame(width: contentWidth, alignment: .leading)
+                        .padding(.bottom, 8)
+                        .background(PersistentHorizontalScroller())
+                }
+                .transaction { transaction in
+                    transaction.animation = nil
+                }
+            } else {
+                content()
+                    .frame(width: contentWidth, alignment: .leading)
+                    .padding(.bottom, 8)
+            }
+        }
+        .frame(height: height)
+    }
 }
 
 private struct PersistentHorizontalScroller: NSViewRepresentable {

@@ -22,11 +22,12 @@ struct AdaptiveRateController {
 
         let deltaTime = Double(elapsedFrames) / sampleRate
         let observed = Double(max(0, bufferedFrames))
-        if filteredBufferedFrames == nil { filteredBufferedFrames = targetFrames }
+        var filtered = filteredBufferedFrames ?? targetFrames
         let smoothing = 1 - exp(-deltaTime / 0.5)
-        filteredBufferedFrames! += (observed - filteredBufferedFrames!) * smoothing
+        filtered += (observed - filtered) * smoothing
+        filteredBufferedFrames = filtered
 
-        var normalizedError = (filteredBufferedFrames! - targetFrames) / targetFrames
+        var normalizedError = (filtered - targetFrames) / targetFrames
         if abs(normalizedError) < 0.02 { normalizedError = 0 }
         integralPPM += normalizedError * 40 * deltaTime
         integralPPM = min(400, max(-400, integralPPM))

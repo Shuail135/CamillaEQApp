@@ -17,7 +17,8 @@ var packageTargets: [Target] = [
         dependencies: ["SystemAudioBridgeC"],
         path: "Sources/CamiTune",
         resources: [
-            .copy("icon.png")
+            .copy("icon.png"),
+            .copy("DeviceCorrectionTargets")
         ]
     )
 ]

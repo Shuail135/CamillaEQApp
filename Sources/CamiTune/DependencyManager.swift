@@ -106,10 +106,15 @@ final class DependencyManager: ObservableObject {
     }
 
     func installCamillaDSP() async {
-        setupFailed = false
+        guard !setupInProgress else { return }
         setupInProgress = true
-        setupMessage = "Installing the bundled UID-capable CamillaDSP build…"
         defer { setupInProgress = false }
+        await performCamillaDSPInstall()
+    }
+
+    private func performCamillaDSPInstall() async {
+        setupFailed = false
+        setupMessage = "Installing the bundled UID-capable CamillaDSP build…"
         camillaDSPStatus = .working("Installing CamiTune's UID-capable CamillaDSP build…")
         do {
             try createSupportLayout()
@@ -120,11 +125,30 @@ final class DependencyManager: ObservableObject {
             ) else { throw SetupError.bundledCamillaDSPMissing }
             let binDir = camillaDSPBinary.deletingLastPathComponent()
             try FileManager.default.createDirectory(at: binDir, withIntermediateDirectories: true)
-            try? FileManager.default.removeItem(at: camillaDSPBinary)
-            try? FileManager.default.removeItem(at: camillaDSPCapabilityMarker)
-            try FileManager.default.copyItem(at: binary, to: camillaDSPBinary)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: camillaDSPBinary.path)
-            _ = try? run("/usr/bin/xattr", ["-d", "com.apple.quarantine", camillaDSPBinary.path])
+            let stagedBinary = binDir.appendingPathComponent(
+                "camilladsp.installing-\(UUID().uuidString)"
+            )
+            defer { try? FileManager.default.removeItem(at: stagedBinary) }
+            try FileManager.default.copyItem(at: binary, to: stagedBinary)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: stagedBinary.path
+            )
+            _ = try? await run(
+                "/usr/bin/xattr",
+                ["-d", "com.apple.quarantine", stagedBinary.path]
+            )
+            _ = try await run(stagedBinary.path, ["--version"])
+            if FileManager.default.fileExists(atPath: camillaDSPBinary.path) {
+                _ = try FileManager.default.replaceItemAt(
+                    camillaDSPBinary,
+                    withItemAt: stagedBinary,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            } else {
+                try FileManager.default.moveItem(at: stagedBinary, to: camillaDSPBinary)
+            }
             try Self.coreAudioUIDCapability.write(
                 to: camillaDSPCapabilityMarker,
                 atomically: true,
@@ -140,10 +164,15 @@ final class DependencyManager: ObservableObject {
     }
 
     func installAudioDriver() async {
-        setupFailed = false
+        guard !setupInProgress else { return }
         setupInProgress = true
-        setupMessage = "Installing the bundled System Audio Bridge driver…"
         defer { setupInProgress = false }
+        await performAudioDriverInstall()
+    }
+
+    private func performAudioDriverInstall() async {
+        setupFailed = false
+        setupMessage = "Installing the bundled System Audio Bridge driver…"
         audioDriverStatus = .working("Waiting for macOS administrator approval…")
         do {
             guard let bundledDriver = Bundle.main.url(
@@ -153,7 +182,10 @@ final class DependencyManager: ObservableObject {
             ) else {
                 throw SetupError.bundledDriverMissing
             }
-            _ = try run("/usr/bin/codesign", ["--verify", "--strict", bundledDriver.path])
+            _ = try await run(
+                "/usr/bin/codesign",
+                ["--verify", "--strict", bundledDriver.path]
+            )
 
             // Keep CamiTune's own copy of the driver with the rest of its
             // managed dependencies. macOS loads HAL drivers from /Library, so
@@ -163,11 +195,24 @@ final class DependencyManager: ObservableObject {
                 at: managedDriverURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            let stagedDriver = managedDriverURL.deletingLastPathComponent()
+                .appendingPathComponent("CamillaAudio.installing-\(UUID().uuidString).driver")
+            defer { try? FileManager.default.removeItem(at: stagedDriver) }
+            try FileManager.default.copyItem(at: bundledDriver, to: stagedDriver)
+            _ = try await run(
+                "/usr/bin/codesign",
+                ["--verify", "--strict", stagedDriver.path]
+            )
             if FileManager.default.fileExists(atPath: managedDriverURL.path) {
-                try FileManager.default.removeItem(at: managedDriverURL)
+                _ = try FileManager.default.replaceItemAt(
+                    managedDriverURL,
+                    withItemAt: stagedDriver,
+                    backupItemName: nil,
+                    options: .usingNewMetadataOnly
+                )
+            } else {
+                try FileManager.default.moveItem(at: stagedDriver, to: managedDriverURL)
             }
-            try FileManager.default.copyItem(at: bundledDriver, to: managedDriverURL)
-            _ = try run("/usr/bin/codesign", ["--verify", "--strict", managedDriverURL.path])
 
             coreAudio.destroyAllProfileRoutingDevices()
             let destination = "/Library/Audio/Plug-Ins/HAL/CamillaAudio.driver"
@@ -188,7 +233,7 @@ final class DependencyManager: ObservableObject {
                 "(/bin/launchctl kickstart -k system/com.apple.audio.coreaudiod || /usr/bin/killall coreaudiod)"
             ].joined(separator: " && ")
             let script = "do shell script \(appleScriptQuote(command)) with administrator privileges"
-            try run("/usr/bin/osascript", ["-e", script])
+            _ = try await run("/usr/bin/osascript", ["-e", script])
 
             // The copy can finish before CoreAudio publishes the new device.
             // Poll the live device list so setup completes without relaunching the app.
@@ -209,11 +254,14 @@ final class DependencyManager: ObservableObject {
     }
 
     func installEverything() async {
+        guard !setupInProgress else { return }
         setupInProgress = true
+        defer { setupInProgress = false }
         setupMessage = "Setting up CamiTune dependencies…"
-        await installCamillaDSP()
-        if case .installed = audioDriverStatus {} else { await installAudioDriver() }
-        setupInProgress = false
+        await performCamillaDSPInstall()
+        if case .installed = audioDriverStatus {} else {
+            await performAudioDriverInstall()
+        }
         refresh()
         if case .installed = camillaDSPStatus, case .installed = audioDriverStatus {
             setupFailed = false
@@ -223,14 +271,14 @@ final class DependencyManager: ObservableObject {
         }
     }
 
-    func validateConfiguration(_ yaml: String) throws {
+    func validateConfiguration(_ yaml: String) async throws {
         guard FileManager.default.isExecutableFile(atPath: camillaDSPBinary.path) else {
             throw SetupError.binaryMissing
         }
         try createSupportLayout()
         let validationURL = supportDirectory.appendingPathComponent("configs/validation.yml")
         try yaml.write(to: validationURL, atomically: true, encoding: .utf8)
-        _ = try run(camillaDSPBinary.path, ["--check", validationURL.path])
+        _ = try await run(camillaDSPBinary.path, ["--check", validationURL.path])
     }
 
     private func waitForAudioDriver() async -> Bool {
@@ -243,7 +291,16 @@ final class DependencyManager: ObservableObject {
     }
 
     @discardableResult
-    private func run(_ path: String, _ arguments: [String]) throws -> String {
+    private func run(_ path: String, _ arguments: [String]) async throws -> String {
+        try await Task.detached(priority: .userInitiated) {
+            try Self.runBlocking(path, arguments)
+        }.value
+    }
+
+    private nonisolated static func runBlocking(
+        _ path: String,
+        _ arguments: [String]
+    ) throws -> String {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = arguments
@@ -251,14 +308,17 @@ final class DependencyManager: ObservableObject {
         p.standardOutput = pipe
         p.standardError = pipe
         try p.run()
-        p.waitUntilExit()
+        // Drain while the child is running. Waiting first can deadlock once a
+        // verbose validation/install command fills the pipe's kernel buffer.
         let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
         guard p.terminationStatus == 0 else { throw SetupError.commandFailed(output) }
         return output
     }
 
     private func version(of binary: URL) -> String? {
-        (try? run(binary.path, ["--version"]))?.trimmingCharacters(in: .whitespacesAndNewlines)
+        (try? Self.runBlocking(binary.path, ["--version"]))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }

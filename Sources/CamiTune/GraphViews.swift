@@ -1,5 +1,110 @@
 import SwiftUI
 
+struct SimpleEQControlsView: View {
+    @Binding var bands: [EQBand]
+
+    var body: some View {
+        HStack(spacing: 24) {
+            ForEach(SimpleEQRange.allCases) { range in
+                SimpleEQKnob(
+                    value: binding(for: range),
+                    range: range,
+                    isEnabled: SimpleEQControl.value(for: range, in: bands) != nil
+                )
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 5)
+    }
+
+    private func binding(for range: SimpleEQRange) -> Binding<Double> {
+        Binding(
+            get: { SimpleEQControl.value(for: range, in: bands) ?? 0 },
+            set: { bands = SimpleEQControl.setting($0, for: range, in: bands) }
+        )
+    }
+}
+
+private struct SimpleEQKnob: View {
+    @Binding var value: Double
+    let range: SimpleEQRange
+    let isEnabled: Bool
+    @State private var dragOrigin: Double?
+
+    private var normalizedValue: Double {
+        let limits = SimpleEQControl.gainRange
+        return (value - limits.lowerBound) / (limits.upperBound - limits.lowerBound)
+    }
+
+    private var angle: Angle {
+        .degrees(-135 + min(1, max(0, normalizedValue)) * 270)
+    }
+
+    var body: some View {
+        VStack(spacing: 5) {
+            Text(range.title)
+                .font(.headline)
+            ZStack {
+                Circle()
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: .black.opacity(0.2), radius: 3, y: 2)
+                Circle()
+                    .stroke(Color.secondary.opacity(0.35), lineWidth: 2)
+                Capsule()
+                    .fill(Color.secondary)
+                    .frame(width: 2.5, height: 14)
+                    .offset(y: -14)
+                    .rotationEffect(angle)
+            }
+            .frame(width: 52, height: 52)
+            .contentShape(Circle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { gesture in
+                        guard isEnabled else { return }
+                        if dragOrigin == nil { dragOrigin = value }
+                        let origin = dragOrigin ?? value
+                        setValue(origin - Double(gesture.translation.height) * 0.08)
+                    }
+                    .onEnded { _ in dragOrigin = nil }
+            )
+            .onTapGesture(count: 2) {
+                guard isEnabled else { return }
+                setValue(0)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(range.title)
+            .accessibilityValue(isEnabled ? formattedValue : "No matching bands")
+            .accessibilityAdjustableAction { direction in
+                guard isEnabled else { return }
+                switch direction {
+                case .increment: setValue(value + SimpleEQControl.step)
+                case .decrement: setValue(value - SimpleEQControl.step)
+                @unknown default: break
+                }
+            }
+
+            Text(isEnabled ? formattedValue : "—")
+                .font(.system(.body, design: .monospaced).weight(.medium))
+            Text(range.frequencyDescription)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 108)
+        .opacity(isEnabled ? 1 : 0.45)
+    }
+
+    private var formattedValue: String {
+        String(format: "%+.1f dB", value)
+    }
+
+    private func setValue(_ newValue: Double) {
+        let limits = SimpleEQControl.gainRange
+        let clamped = min(limits.upperBound, max(limits.lowerBound, newValue))
+        value = (clamped / SimpleEQControl.step).rounded() * SimpleEQControl.step
+    }
+}
+
 struct GraphicEqualizerBands: View {
     @Binding var bands: [EQBand]
     let spectrum: SpectrumAnalyzer
@@ -7,6 +112,16 @@ struct GraphicEqualizerBands: View {
     let responsePoints: [EQResponsePoint]
     let setKind: (EQBand.Kind, inout EQBand) -> Void
     let columnWidth: CGFloat
+    var showsSpectrumLevels = true
+
+    static func requiredContentWidth(
+        bandCount: Int,
+        columnWidth: CGFloat
+    ) -> CGFloat {
+        // The HStack contains a 32 pt gain scale followed by one 5 pt
+        // inter-item gap and one fixed-width column per band.
+        32 + CGFloat(max(0, bandCount)) * (columnWidth + 5)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 5) {
@@ -20,13 +135,14 @@ struct GraphicEqualizerBands: View {
             }
             .frame(width: 32)
 
-            ForEach(bands.indices, id: \.self) { index in
+            ForEach(bands) { band in
                 EQBandColumn(
-                    band: $bands[index],
+                    band: binding(for: band),
                     spectrum: spectrum,
                     profileID: profileID,
-                    responseDB: responseGain(at: bands[index].frequency),
-                    setKind: setKind
+                    responseDB: responseGain(at: band.frequency),
+                    setKind: setKind,
+                    showsSpectrumLevels: showsSpectrumLevels
                 )
                 .frame(width: columnWidth)
             }
@@ -55,6 +171,23 @@ struct GraphicEqualizerBands: View {
             : after.gainDB
     }
 
+    /// SwiftUI's collection bindings are index-backed on macOS 13. A row can be
+    /// evaluated once more after the collection becomes empty, so resolve every
+    /// read and write by stable band identity and safely ignore a removed row.
+    private func binding(for snapshot: EQBand) -> Binding<EQBand> {
+        Binding(
+            get: {
+                bands.first(where: { $0.id == snapshot.id }) ?? snapshot
+            },
+            set: { updated in
+                guard bands.contains(where: { $0.id == snapshot.id }) else { return }
+                bands = EQEditorSupport.organizedBands(
+                    bands.map { $0.id == snapshot.id ? updated : $0 }
+                )
+            }
+        )
+    }
+
     private func logDistance(_ lhs: Double, _ rhs: Double) -> Double {
         abs(log(max(lhs, 1) / max(rhs, 1)))
     }
@@ -66,6 +199,7 @@ private struct EQBandColumn: View {
     let profileID: UUID
     let responseDB: Double
     let setKind: (EQBand.Kind, inout EQBand) -> Void
+    let showsSpectrumLevels: Bool
     private let fieldWidth: CGFloat = 68
 
     var body: some View {
@@ -91,7 +225,8 @@ private struct EQBandColumn: View {
                 profileID: profileID,
                 frequency: band.frequency,
                 responseDB: responseDB,
-                gainEnabled: usesGain(band.kind)
+                gainEnabled: usesGain(band.kind),
+                showsSpectrumLevels: showsSpectrumLevels
             )
             .frame(width: 80, height: 220)
 
@@ -187,6 +322,7 @@ private struct SpectrumAwareVerticalEQSlider: View {
     let frequency: Double
     let responseDB: Double
     let gainEnabled: Bool
+    let showsSpectrumLevels: Bool
 
     var body: some View {
         VerticalEQSlider(
@@ -198,7 +334,8 @@ private struct SpectrumAwareVerticalEQSlider: View {
     }
 
     private var audioLevel: Double {
-        guard spectrum.activeProfileID == profileID,
+        guard showsSpectrumLevels,
+              spectrum.activeProfileID == profileID,
               !spectrum.points.isEmpty else { return -100 }
         var lower = 0
         var upper = spectrum.points.count
@@ -286,7 +423,6 @@ private struct VerticalEQSlider: View {
             .animation(.easeOut(duration: 0.12), value: responseDB)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             .contentShape(Rectangle())
-            .help("Green is the estimated post-EQ level. Blue shows boost; orange shows cut; the small marker is the pre-EQ level.")
             .gesture(
                 DragGesture(minimumDistance: 0).onChanged { value in
                     guard gainEnabled else { return }
@@ -354,18 +490,204 @@ private struct GainScaleLabels: View {
     }
 }
 
-struct PreampControl: View {
-    @Binding var preampDB: Double
-    let autoAction: () -> Void
+struct PreampGainControl: View {
+    @Binding var gainDB: Double
+    @Binding var limiterEnabled: Bool
+    @ObservedObject var meters: AudioRuntimeMonitor
+    let profileID: UUID
+    var title = "User preamp"
+    var channelIndex: Int?
+    var visualEffectsEnabled = true
 
     var body: some View {
         HStack(spacing: 10) {
-            Text("Preamp")
+            Text(title)
+                .font(.body)
+                .fixedSize()
+            MeteredGainSlider(
+                gainDB: $gainDB,
+                totalPeakDB: totalPeakDB,
+                isClipping: isClipping,
+                animationsEnabled: visualEffectsEnabled,
+                accessibilityTitle: title
+            )
+            .frame(minWidth: 140, idealWidth: 390, maxWidth: 440)
+            TextField(title, value: Binding(
+                get: { gainDB },
+                set: { gainDB = min(12, max(-12, $0)) }
+            ), format: .number.precision(.fractionLength(1)))
+            .textFieldStyle(.roundedBorder)
+            .multilineTextAlignment(.trailing)
+            .frame(width: 58)
+            Text("dB")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .fixedSize()
+            Toggle("Limiter", isOn: $limiterEnabled)
+                .toggleStyle(.checkbox)
+                .fixedSize()
+                .help("Hard-limit the final processed signal to −0.5 dBFS")
+            if limiterEnabled {
+                if isClipping {
+                    Text("CLIP")
+                        .font(.caption.bold())
+                        .foregroundStyle(.red)
+                } else if limiterAtCeiling {
+                    Text("LIMIT")
+                        .font(.caption.bold())
+                        .foregroundStyle(.orange)
+                }
+            }
+            Spacer()
+        }
+        .padding(.vertical, 4)
+        .animation(.easeOut(duration: 0.12), value: limiterEnabled && isClipping)
+    }
+
+    private var profileIsActive: Bool {
+        meters.activeSession?.profileID == profileID
+    }
+
+    private var totalPeakDB: Double {
+        guard visualEffectsEnabled, profileIsActive else { return -150 }
+        if let channelIndex {
+            return meters.playbackPeak.indices.contains(channelIndex)
+                ? meters.playbackPeak[channelIndex]
+                : -150
+        }
+        return meters.playbackPeak.max() ?? -150
+    }
+
+    private var isClipping: Bool {
+        guard limiterEnabled, visualEffectsEnabled, profileIsActive else { return false }
+        if let channelIndex {
+            return meters.channelClippingIsRecent(channelIndex)
+        }
+        return meters.status.clippingIsRecent
+    }
+
+    private var limiterAtCeiling: Bool {
+        profileIsActive
+            && limiterEnabled
+            && totalPeakDB >= LimiterProcessor.standard.clipLimitDB - 0.05
+    }
+
+}
+
+private enum PreampSliderLayout {
+    static let horizontalInset: CGFloat = 9
+    static let controlHeight: CGFloat = 20
+    static let totalHeight: CGFloat = 32
+    static let labelY: CGFloat = 27
+}
+
+private struct MeteredGainSlider: View {
+    @Binding var gainDB: Double
+    let totalPeakDB: Double
+    let isClipping: Bool
+    let animationsEnabled: Bool
+    let accessibilityTitle: String
+
+    var body: some View {
+        GeometryReader { geometry in
+            let track = CGRect(
+                x: PreampSliderLayout.horizontalInset,
+                y: (PreampSliderLayout.controlHeight - 7) / 2,
+                width: max(1, geometry.size.width - 2 * PreampSliderLayout.horizontalInset),
+                height: 7
+            )
+            let levelAmount = min(1, max(0, (totalPeakDB + 72) / 72))
+            let thumbX = track.minX + track.width * ((gainDB + 12) / 24)
+            ZStack {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.18))
+                    .frame(width: track.width, height: track.height)
+                    .position(x: track.midX, y: track.midY)
+                Capsule()
+                    .fill(isClipping ? Color.red : levelColor)
+                    .frame(width: track.width, height: track.height)
+                    .scaleEffect(x: levelAmount, y: 1, anchor: .leading)
+                    .position(x: track.midX, y: track.midY)
+                Rectangle()
+                    .fill(isClipping ? Color.red : Color.secondary.opacity(0.55))
+                    .frame(width: 2, height: 11)
+                    .position(x: track.midX, y: track.midY)
+                Circle()
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .overlay(Circle().stroke(Color.primary.opacity(0.75), lineWidth: 1.5))
+                    .frame(width: 17, height: 17)
+                    .shadow(color: .black.opacity(0.2), radius: 1.5, y: 1)
+                    .position(x: thumbX, y: track.midY)
+                Group {
+                    Text("−12")
+                        .position(
+                            x: track.minX,
+                            y: PreampSliderLayout.labelY
+                        )
+                    Text("0")
+                        .position(
+                            x: track.midX,
+                            y: PreampSliderLayout.labelY
+                        )
+                    Text("+12 dB")
+                        .position(
+                            x: track.maxX,
+                            y: PreampSliderLayout.labelY
+                        )
+                }
+                .font(.system(size: 8).monospacedDigit())
+                .foregroundStyle(Color.secondary.opacity(0.72))
+                .allowsHitTesting(false)
+            }
+            .animation(
+                animationsEnabled
+                    ? .linear(duration: UIRenderPerformance.animatedLevelTransitionDuration)
+                    : nil,
+                value: totalPeakDB
+            )
+            .animation(
+                animationsEnabled ? .easeOut(duration: 0.1) : nil,
+                value: isClipping
+            )
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { value in
+                let ratio = min(1, max(0, (value.location.x - track.minX) / track.width))
+                gainDB = ((-12 + ratio * 24) * 10).rounded() / 10
+            })
+        }
+        .frame(height: PreampSliderLayout.totalHeight)
+        .accessibilityElement()
+        .accessibilityLabel(accessibilityTitle)
+        .accessibilityValue("\(gainDB, format: .number.precision(.fractionLength(1))) decibels")
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment: gainDB = min(12, gainDB + 0.1)
+            case .decrement: gainDB = max(-12, gainDB - 0.1)
+            @unknown default: break
+            }
+        }
+    }
+
+    private var levelColor: Color {
+        if totalPeakDB >= -3 { return .orange }
+        return .green
+    }
+}
+
+struct GainControl: View {
+    @Binding var gainDB: Double
+    let title: String
+    var autoButtonTitle: String?
+    var autoAction: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(title)
                 .font(.body)
                 .fixedSize()
             Slider(value: Binding(
-                get: { preampDB },
-                set: { preampDB = min(12, max(-12, $0)) }
+                get: { gainDB },
+                set: { gainDB = min(12, max(-12, $0)) }
             ), in: -12...12, step: 0.1)
             .frame(minWidth: 140, idealWidth: 440, maxWidth: 440)
             .overlay(alignment: .bottom) {
@@ -382,9 +704,9 @@ struct PreampControl: View {
                 .offset(y: 8)
                 .allowsHitTesting(false)
             }
-            TextField("Preamp", value: Binding(
-                get: { preampDB },
-                set: { preampDB = min(12, max(-12, $0)) }
+            TextField(title, value: Binding(
+                get: { gainDB },
+                set: { gainDB = min(12, max(-12, $0)) }
             ), format: .number.precision(.fractionLength(1)))
             .textFieldStyle(.roundedBorder)
             .multilineTextAlignment(.trailing)
@@ -393,8 +715,10 @@ struct PreampControl: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .fixedSize()
-            Button("Auto", action: autoAction)
-                .fixedSize()
+            if let autoButtonTitle, let autoAction {
+                Button(autoButtonTitle, action: autoAction)
+                    .fixedSize()
+            }
             Spacer()
         }
         .padding(.vertical, 4)
@@ -448,12 +772,14 @@ struct LineGraph: View {
         Canvas(rendersAsynchronously: true) { context, size in
             let rect = CGRect(origin: .zero, size: size)
             drawGrid(context: &context, rect: rect)
-            guard points.count > 1 else { return }
+            guard points.count > 1,
+                  let firstPoint = points.first,
+                  let lastPoint = points.last else { return }
             let path = smoothPath(points: points, size: size)
             if fillsArea {
                 var fill = path
-                fill.addLine(to: CGPoint(x: x(points.last!.0, width: size.width), y: size.height))
-                fill.addLine(to: CGPoint(x: x(points.first!.0, width: size.width), y: size.height))
+                fill.addLine(to: CGPoint(x: x(lastPoint.0, width: size.width), y: size.height))
+                fill.addLine(to: CGPoint(x: x(firstPoint.0, width: size.width), y: size.height))
                 fill.closeSubpath()
                 context.fill(
                     fill,
@@ -642,7 +968,9 @@ struct SpectrumWithResponseGraph: View {
         context: inout GraphicsContext,
         size: CGSize
     ) {
-        guard points.count > 1 else { return }
+        guard points.count > 1,
+              let firstPoint = points.first,
+              let lastPoint = points.last else { return }
         let mapped = points.map {
             CGPoint(x: x($0.0, width: size.width), y: y($0.1, range: yRange, height: size.height))
         }
@@ -657,8 +985,8 @@ struct SpectrumWithResponseGraph: View {
         if let last = mapped.last { path.addLine(to: last) }
         if fillsArea {
             var fill = path
-            fill.addLine(to: CGPoint(x: x(points.last!.0, width: size.width), y: size.height))
-            fill.addLine(to: CGPoint(x: x(points.first!.0, width: size.width), y: size.height))
+            fill.addLine(to: CGPoint(x: x(lastPoint.0, width: size.width), y: size.height))
+            fill.addLine(to: CGPoint(x: x(firstPoint.0, width: size.width), y: size.height))
             fill.closeSubpath()
             context.fill(
                 fill,
@@ -732,7 +1060,7 @@ struct MeterBar: View {
 }
 
 struct SignalMetersView: View {
-    let meters: MeterModel
+    let meters: AudioRuntimeMonitor
     let profileID: UUID
 
     var body: some View {
@@ -750,13 +1078,152 @@ struct SignalMetersView: View {
     }
 }
 
+struct AudioRuntimeStatusView: View {
+    @ObservedObject var monitor: AudioRuntimeMonitor
+    let profileID: UUID
+
+    private let columns = [
+        GridItem(.adaptive(minimum: 170), spacing: 24)
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(healthColor)
+                    .frame(width: 7, height: 7)
+                Text(activeStatus.engineState)
+                    .font(.body.weight(.medium))
+                if activeStatus.stopReason != "None" {
+                    Text(activeStatus.stopReason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            LazyVGrid(columns: columns, alignment: .leading, spacing: 12) {
+                RuntimeMetricValue(
+                    title: "DSP load",
+                    value: percent(activeStatus.processingLoadPercent),
+                    detail: "Resampler \(percent(activeStatus.resamplerLoadPercent))"
+                )
+                RuntimeMetricValue(
+                    title: "DSP buffer",
+                    value: "\(activeStatus.dspBufferLevelFrames) frames",
+                    detail: bridgeBufferDetail
+                )
+                RuntimeMetricValue(
+                    title: "Rate adjust",
+                    value: String(format: "%+.1f ppm", activeStatus.effectiveRateAdjustmentPPM),
+                    detail: "Matched buffer \(activeStatus.route.rateMatchBufferedFrames) frames"
+                )
+                RuntimeMetricValue(
+                    title: "Clipping",
+                    value: clippingValue,
+                    detail: clippingDetail,
+                    accent: activeStatus.clippingIsRecent ? .red : nil
+                )
+                RuntimeMetricValue(
+                    title: "Stream",
+                    value: routeValue,
+                    detail: activeStatus.route.sampleRate > 0 ? "System Audio Bridge" : "No active route"
+                )
+                RuntimeMetricValue(
+                    title: "Delivery",
+                    value: deliveryValue,
+                    detail: deliveryDetail
+                )
+            }
+        }
+    }
+
+    private var profileIsActive: Bool { monitor.activeSession?.profileID == profileID }
+    private var activeStatus: AudioRuntimeStatus {
+        profileIsActive ? monitor.status : .inactive
+    }
+
+    private var healthColor: Color {
+        switch activeStatus.health {
+        case .inactive: return .secondary
+        case .healthy: return .green
+        case .warning: return .orange
+        case .fault: return .red
+        }
+    }
+
+    private var bridgeBufferDetail: String {
+        guard let ratio = activeStatus.route.bridgeFillRatio else {
+            return "Bridge buffer unavailable"
+        }
+        return "Bridge \(Int((ratio * 100).rounded()))% full"
+    }
+
+    private var clippingValue: String {
+        let hasClipping = activeStatus.dspClippedSamples > 0
+            || activeStatus.sourceClippedSamples > 0
+        return hasClipping ? "Detected" : "None"
+    }
+
+    private var clippingDetail: String {
+        if activeStatus.clippingIsRecent { return "Detected recently" }
+        return "DSP \(activeStatus.dspClippedSamples) · source \(activeStatus.sourceClippedSamples) samples"
+    }
+
+    private var routeValue: String {
+        let route = activeStatus.route
+        guard route.sampleRate > 0 else { return "Idle" }
+        return String(format: "%.1f kHz · %u ch", route.sampleRate / 1_000, route.activeChannels)
+    }
+
+    private var deliveryValue: String {
+        let route = activeStatus.route
+        let dropped = route.bridgeDroppedFrames + route.camillaDroppedFrames
+        return "\(dropped) dropped"
+    }
+
+    private var deliveryDetail: String {
+        let route = activeStatus.route
+        return "\(route.bridgeUnderrunCount) underruns · \(route.camillaQueueRecoveries) recoveries"
+    }
+
+    private func percent(_ value: Double) -> String {
+        guard value.isFinite else { return "—" }
+        return String(format: "%.1f%%", value)
+    }
+}
+
+private struct RuntimeMetricValue: View {
+    let title: String
+    let value: String
+    let detail: String
+    var accent: Color?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.body.monospacedDigit())
+                .foregroundStyle(accent ?? .primary)
+                .lineLimit(1)
+            Text(detail)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 private struct LiveStereoMeterBars: View {
     enum Source {
         case capture
         case playback
     }
 
-    @ObservedObject var meters: MeterModel
+    @ObservedObject var meters: AudioRuntimeMonitor
     let profileID: UUID
     let source: Source
 

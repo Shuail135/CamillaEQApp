@@ -49,17 +49,8 @@ struct DeviceProfile: Identifiable, Codable, Hashable {
     var outputVolumeScalar: Double = 0.0625
     var sampleRate: Int = 48_000
     var chunkSize: Int = 1024
-    var equalizerAPOText: String = """
-Preamp: 0.0 dB
-Filter 1: ON LS Fc 31 Hz Gain 0.0 dB Q 1.00
-Filter 2: ON PK Fc 76 Hz Gain 0.0 dB Q 1.00
-Filter 3: ON PK Fc 184 Hz Gain 0.0 dB Q 1.00
-Filter 4: ON PK Fc 447 Hz Gain 0.0 dB Q 1.00
-Filter 5: ON PK Fc 1087 Hz Gain 0.0 dB Q 1.00
-Filter 6: ON PK Fc 2643 Hz Gain 0.0 dB Q 1.00
-Filter 7: ON PK Fc 6423 Hz Gain 0.0 dB Q 1.00
-Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
-"""
+    var processing: ProcessingProfile
+    private var unmigratedEqualizerAPOText: String?
 
     init(
         id: UUID = UUID(),
@@ -72,7 +63,8 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         outputVolumeScalar: Double = 0.0625,
         sampleRate: Int = 48_000,
         chunkSize: Int = 1024,
-        equalizerAPOText: String = DeviceProfile.defaultEqualizerAPOText
+        equalizerAPOText: String = DeviceProfile.defaultEqualizerAPOText,
+        processing: ProcessingProfile? = nil
     ) {
         self.id = id
         self.name = name
@@ -83,7 +75,16 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         self.outputVolumeScalar = outputVolumeScalar
         self.sampleRate = sampleRate
         self.chunkSize = chunkSize
-        self.equalizerAPOText = equalizerAPOText
+        if let processing {
+            self.processing = processing
+            self.unmigratedEqualizerAPOText = nil
+        } else if let parsed = try? Self.parseImportableEqualizerAPOText(equalizerAPOText) {
+            self.processing = ProcessingProfile.imported(from: parsed)
+            self.unmigratedEqualizerAPOText = nil
+        } else {
+            self.processing = .defaultStereo
+            self.unmigratedEqualizerAPOText = equalizerAPOText
+        }
     }
 
     var outputDeviceUID: String {
@@ -94,6 +95,66 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
     var outputDeviceName: String {
         get { outputDevice.name }
         set { outputDevice.name = newValue }
+    }
+
+    /// Compatibility surface for Equalizer APO import/export. ProcessingProfile
+    /// remains authoritative once the text parses successfully.
+    var equalizerAPOText: String {
+        get {
+            unmigratedEqualizerAPOText
+                ?? EqualizerAPOSerializer().serialize(processing.globalEqualizer)
+        }
+        set {
+            if let parsed = try? Self.parseImportableEqualizerAPOText(newValue) {
+                setGlobalEqualizer(
+                    preampDB: parsed.preampDB,
+                    bands: parsed.bands
+                )
+            } else {
+                unmigratedEqualizerAPOText = newValue
+            }
+        }
+    }
+
+    mutating func setGlobalEqualizer(preampDB: Double, bands: [EQBand]) {
+        processing.setGlobalEqualizer(preampDB: preampDB, bands: bands)
+        unmigratedEqualizerAPOText = nil
+    }
+
+    mutating func setChannelProcessing(
+        index: Int,
+        role: ChannelRole,
+        gainDB: Double,
+        bands: [EQBand],
+        limiterEnabled: Bool? = nil
+    ) throws {
+        processing = try resolvedProcessing()
+        processing.setChannelProcessing(
+            index: index,
+            role: role,
+            gainDB: gainDB,
+            bands: bands,
+            limiterEnabled: limiterEnabled
+        )
+        unmigratedEqualizerAPOText = nil
+    }
+
+    func resolvedProcessing() throws -> ProcessingProfile {
+        if let text = unmigratedEqualizerAPOText {
+            return ProcessingProfile.imported(from: try Self.parseImportableEqualizerAPOText(text))
+        }
+        return processing
+    }
+
+    private static func parseImportableEqualizerAPOText(_ text: String) throws -> ParsedEQ {
+        let parsed = try EqualizerAPOParser().parse(text)
+        guard parsed.importedDirectiveCount > 0 else {
+            throw EqualizerAPOParser.ParseError(
+                line: 1,
+                message: "The Equalizer APO document has no processing CamiTune can import yet"
+            )
+        }
+        return parsed
     }
 
     private static let defaultEqualizerAPOText = """
@@ -111,7 +172,7 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
     private enum CodingKeys: String, CodingKey {
         case id, name, outputDevice, outputDeviceUID, outputDeviceName, isEnabled
         case autoActivateWhenProfileDeviceSelected
-        case lockOutputVolume, outputVolumeScalar, sampleRate, chunkSize, equalizerAPOText
+        case lockOutputVolume, outputVolumeScalar, sampleRate, chunkSize, equalizerAPOText, processing
     }
 
     private enum LegacyCodingKeys: String, CodingKey {
@@ -144,8 +205,18 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         outputVolumeScalar = try values.decodeIfPresent(Double.self, forKey: .outputVolumeScalar) ?? 0.0625
         sampleRate = try values.decodeIfPresent(Int.self, forKey: .sampleRate) ?? 48_000
         chunkSize = try values.decodeIfPresent(Int.self, forKey: .chunkSize) ?? 1024
-        equalizerAPOText = try values.decodeIfPresent(String.self, forKey: .equalizerAPOText)
+        let legacyText = try values.decodeIfPresent(String.self, forKey: .equalizerAPOText)
             ?? Self.defaultEqualizerAPOText
+        if let decodedProcessing = try values.decodeIfPresent(ProcessingProfile.self, forKey: .processing) {
+            processing = decodedProcessing
+            unmigratedEqualizerAPOText = nil
+        } else if let parsed = try? Self.parseImportableEqualizerAPOText(legacyText) {
+            processing = ProcessingProfile.imported(from: parsed)
+            unmigratedEqualizerAPOText = nil
+        } else {
+            processing = .defaultStereo
+            unmigratedEqualizerAPOText = legacyText
+        }
     }
 
     func encode(to encoder: Encoder) throws {
@@ -159,12 +230,17 @@ Filter 8: ON HS Fc 16000 Hz Gain 0.0 dB Q 1.00
         try values.encode(outputVolumeScalar, forKey: .outputVolumeScalar)
         try values.encode(sampleRate, forKey: .sampleRate)
         try values.encode(chunkSize, forKey: .chunkSize)
+        // Do not let a placeholder graph overwrite an invalid legacy document.
+        // Keeping it unmigrated means the editor can still surface and repair it.
+        if unmigratedEqualizerAPOText == nil {
+            try values.encode(processing, forKey: .processing)
+        }
         try values.encode(equalizerAPOText, forKey: .equalizerAPOText)
     }
 }
 
-struct EQBand: Identifiable, Hashable {
-    enum Kind: String, Hashable, CaseIterable {
+struct EQBand: Identifiable, Codable, Hashable, Sendable {
+    enum Kind: String, Codable, Hashable, Sendable, CaseIterable {
         case peaking
         case lowShelf
         case highShelf
@@ -182,8 +258,8 @@ struct EQBand: Identifiable, Hashable {
     var q: Double?
     var bandwidth: Double?
 
-    init(enabled: Bool = true, kind: Kind, frequency: Double, gain: Double? = nil, q: Double? = nil, bandwidth: Double? = nil) {
-        self.id = UUID()
+    init(id: UUID = UUID(), enabled: Bool = true, kind: Kind, frequency: Double, gain: Double? = nil, q: Double? = nil, bandwidth: Double? = nil) {
+        self.id = id
         self.enabled = enabled
         self.kind = kind
         self.frequency = frequency
@@ -193,10 +269,13 @@ struct EQBand: Identifiable, Hashable {
     }
 }
 
-struct ParsedEQ {
+struct ParsedEQ: Sendable {
     var preampDB: Double = 0
     var bands: [EQBand] = []
     var warnings: [String] = []
+    /// Number of Preamp/filter directives actually represented in this graph.
+    /// Metadata and recognized-but-unsupported APO commands do not increment it.
+    var importedDirectiveCount: Int = 0
 }
 
 struct SpectrumPoint: Identifiable {

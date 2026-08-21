@@ -1,12 +1,12 @@
 # Core Functions
 
-- [ ] [DSP Architecture changes](#dsp-architecture)
-- [ ] [Per-channel EQ/gain](#per-channel-eqgain)
-- [ ] [Live config patching over WebSocket](#websocket)
-- [ ] [Simple Bass / Mids / Treble controls](#simple-eq-controls)
-- [ ] Auto-EQ
-- [ ] [Meters / status](#meters--status)
-- [ ] [Limiter + clipping detection](#limited--clipping)
+- [x] [DSP Architecture changes](#dsp-architecture)
+- [x] [Per-channel EQ/gain](#per-channel-eqgain)
+- [x] [Live config patching over WebSocket](#websocket)
+- [x] [Simple Bass / Mids / Treble controls](#simple-eq-controls)
+- [x] [Device-Correction](#Device-Correction)
+- [x] [Meters / status](#meters--status)
+- [x] [Limiter + clipping detection](#limited--clipping)
 - [ ] [FIR / convolution](#fir--convolution)
 - [ ] [Profile import / export](#profile-import--export)
 - [ ] [Headphone crossfeed](#headphone-crossfeed)
@@ -19,30 +19,41 @@
 - [ ] [Full mixer/routing UI](#full-mixerrouting-ui)
 - [ ] [Compressor](#compressor)
 - [ ] Noise gate / RACE
+- [ ] VST/AUv3 Support
+- [ ] Remote Control
 
 
 ***
 # Changelogs
 ## CamiTune
 ### v0.2 
-- [x] New custom audio driver(no longer require microphone permission)
-- [x] Better visualize EQ edit in equalizer
-- [x] New logic of profile switch and EQ activate
-- [x] Select profiles in macos default audio selection
-- [x] Separate PCM delivery of Spectrum Analyzer and Camilla
-- [x] Spectrum Analyzer only active for the current activated profile
-- [X] Implement drop/recover DSP pipeline
-- [x] Adaptive clock/rate matching
-- [x] CamillaDSP contribution patch to allow accepting Core Audio UID
-- [x] Different view for each profile
-- [ ] Better activate profile logics and interface
+- New custom audio driver(no longer require microphone permission)
+- Better visualize EQ edit in equalizer
+- New logic of profile switch and EQ activate
+- Select profiles in macos default audio selection
+- Separate PCM delivery of Spectrum Analyzer and Camilla
+- Spectrum Analyzer only active for the current activated profile
+- Implement drop/recover DSP pipeline
+- Adaptive clock/rate matching
+- CamillaDSP contribution patch to allow accepting Core Audio UID
+- Different view for each profile
+- Better activate profile logics and interface
 
-#### Knowns Bugs
-- [x] Remove adding audio route as output device
-- [x] Random crashes while removing audio devices
-- [x] Fixes profile audio devices may stored even profile is deleted
-- [x] Profile saving conflicts
-- [x] Profile can have same name
+### v0.3
+- [x] DSP architecture rework
+- [x] Per channel eq
+- [x] Websocket
+- [x] Simple eq(bass/mid/treble) control
+- [x] Device Correction v1.0
+- [x] Automatic Headroom
+- [x] Meters / status
+- [x] Limiter+clipping detection
+- [x] Equalizer APO syntax v2.0
+
+**Bug fixes:**
+- [x] cannot reduce equalizer band number after expanded
+- [x] equalizer band wouldn't auto organize from frequency
+- [x] equalizer bar's label is not absolute accurate
 
 ## Equalizer APO syntax
 ### v1.0
@@ -50,6 +61,12 @@
 - Supported `PK` / `PEQ`, `LS` / `LSC`, `HS` / `HSC`, `LP` / `LPQ`, `HP` / `HPQ`, `NO`, and `AP`
 - `Device: ` is recognized but ignored
 - `Channel:` produces a warning because the current release applies filter to both stereo channels
+
+### v2.0
+- fixed-slope LS/HS 6dB and 12dB
+- LSC/HSC x dB
+- Accepts attached units such as 100Hz, -3dB, decimal commas, and localized frequency separators.
+- Completely invalid or empty files still show an error.
 
 ### Future(in progress)
 - `Channel: `, `GraphicEQ: `, `Include: `, `Copy: `, `Delay: `, `Convolution: `
@@ -87,6 +104,35 @@ DSP / analysis / recording / physical audio sink
 - then it creates public aggregate output selectors with deterministic profile-derived UIDs and collision-safe profile names. 
 - The public device name is derived from the profile name, and it will only be published when profile activeted
 
+## Device Correction
+
+
+
+### v0.1 (in progress)
+- Global Channel Correction
+- Local CSV measurement/custom-target import
+- native conservative and exact policies
+- native PEQ optimization
+- target/EQ-value preview, and a draft-only handoff into the normal editable global EQ
+- Online search uses one result per complete device/configuration name.
+- Tuning switch, nozzle, pad, ANC, and other measured variants remain separate entries.
+- Squiglink, AutoEq, and other cataloged measurements are resolved behind the result, deduplicated, grouped by compatible rig, normalized, and combined into a confidence-weighted consensus before CamiTune calculates its own correction.
+- Independent evidence is counted by laboratory/unit rather than reference count.
+- Exact and Recommended modes both retain confidence as optimizer priority only.
+- The native fitter supports shelves and jointly refines all selected filters.
+- Structured identities, source snapshots, and a versioned persistent response cache make calculations reproducible.
+
+ **Targets:**
+- [x] Flat diagnostic target
+- [x] JM-1 / PopAvg-DF with adjustable tilt and rig-specific transfer
+- [x] Harman In-Ear 2019 v2
+- [x] IEF Preference 2025 (711 and B&K 5128 variants)
+- [x] IEF Neutral 2023
+- [x] Diffuse Field Reference (KEMAR/711 and B&K 5128 variants)
+- [x] Etymotic target
+- [x] Custom CSV
+- [x] Device Match
+
 ***
 ### DSP Architecture
 
@@ -94,18 +140,33 @@ DSP / analysis / recording / physical audio sink
 - Profile(when saved) -> EqualizerAPO parsing -> YAML -> CamillaDSP
 
 **To:**
--CamiTune UI -> ProcessingProfile -> ProcessingGraph -> CamillaDSP Compiler -> CamillaDSP
+- CamiTune UI -> ProcessingProfile -> ProcessingGraph -> CamillaDSP Compiler -> CamillaDSP
+
+**Architecture invariants for future stages**
+- `ProcessingProfile` is the only persisted DSP model. Every schema change must
+  include an explicit migration and preserve stable stage/filter identities.
+- Reserved semantic IDs identify controls such as User preamp and automatic
+  headroom; stage array position must never be used as semantic identity.
+- `ProcessingGraph` validates and orders runtime processing. UI and importers do
+  not emit CamillaDSP configuration directly.
+- The compiler is the only CamillaDSP-specific layer. A new processor must add
+  persisted coding, graph validation, backend compilation, graph-diff behavior,
+  and migration/round-trip/runtime-patch tests together.
+- Automatic headroom covers every response-raising stage except the intentional
+  User preamp. It remains runtime-derived and is never persisted as user gain.
+- Meters, FFT, clipping animation, and other visual telemetry are
+  presentation-gated; the active audio route itself must never depend on a view.
 
 **Processing stages**
-- gain
-- equalizer
-- convolution
-- delay
-- mixer
-- loudness
-- limiter
-- compressor
-- crossfeed
+- [x] gain
+- [x] equalizer
+- [ ] convolution
+- [ ] delay
+- [ ] mixer
+- [ ] loudness
+- [x] limiter
+- [ ] compressor
+- [ ] crossfeed
 
 ### Per-channel EQ/gain
 
@@ -115,7 +176,7 @@ Front
 1.  R
 Center
 2. C
-Sunwoofer
+Subwoofer
 3. LFE
 Surround
 4. Ls
@@ -125,7 +186,7 @@ Rear
 7. Rrs
 
 ##### Profile
-> Gloval Processing
+> Global Processing
 > 	Preamp
 > 	Global Filter
 > Channels
