@@ -1,7 +1,7 @@
 import Foundation
 import CoreAudio
 
-struct AudioDeviceInfo: Identifiable, Hashable {
+struct AudioDeviceInfo: Identifiable, Hashable, Sendable {
     let id: String          // CoreAudio UID
     let objectID: UInt32
     let name: String
@@ -126,6 +126,7 @@ struct DeviceProfile: Identifiable, Codable, Hashable {
         role: ChannelRole,
         gainDB: Double,
         bands: [EQBand],
+        delayMilliseconds: Double? = nil,
         limiterEnabled: Bool? = nil
     ) throws {
         processing = try resolvedProcessing()
@@ -134,6 +135,7 @@ struct DeviceProfile: Identifiable, Codable, Hashable {
             role: role,
             gainDB: gainDB,
             bands: bands,
+            delayMilliseconds: delayMilliseconds,
             limiterEnabled: limiterEnabled
         )
         unmigratedEqualizerAPOText = nil

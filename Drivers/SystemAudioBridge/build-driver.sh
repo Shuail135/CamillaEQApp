@@ -4,14 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 REPO_ROOT="${SCRIPT_DIR:h:h}"
 BUILD_ROOT="${SABR_BUILD_ROOT:-$REPO_ROOT/build/driver}"
-CHANNELS="${SABR_CHANNELS:-2}"
+CHANNELS="${SABR_CHANNELS:-8}"
 MIN_MACOS="${SABR_MIN_MACOS:-13.0}"
-DRIVER_VERSION="${SABR_DRIVER_VERSION:-0.2.1}"
+DRIVER_VERSION="${SABR_DRIVER_VERSION:-0.4.0}"
 DRIVER="$BUILD_ROOT/CamillaAudio.driver"
 BINARY="$DRIVER/Contents/MacOS/CamillaAudio"
 
-if ! [[ "$CHANNELS" =~ '^[0-9]+$' ]] || (( CHANNELS < 2 || CHANNELS > 32 )); then
-    print -u2 "SABR_CHANNELS must be an integer from 2 through 32."
+if [[ "$CHANNELS" != "2" && "$CHANNELS" != "6" && "$CHANNELS" != "8" ]]; then
+    print -u2 "SABR_CHANNELS must be 2 (stereo), 6 (5.1), or 8 (7.1)."
     exit 1
 fi
 

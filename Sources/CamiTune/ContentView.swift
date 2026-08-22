@@ -21,7 +21,8 @@ struct ContentView: View {
         self._updateChecker = ObservedObject(wrappedValue: state.updateChecker)
         let saved = UserDefaults.standard.string(forKey: "lastSidebarSelection")
         let restored: String
-        if let saved, saved == "setup" || saved == "default-profiles" {
+        if let saved,
+           saved == "setup" || saved == "default-profiles" || saved == "applications" {
             restored = saved
         } else if let saved,
                   let id = UUID(uuidString: saved),
@@ -52,6 +53,9 @@ struct ContentView: View {
 
                 Label("Default Profiles", systemImage: "speaker.wave.2.fill")
                     .tag("default-profiles")
+
+                Label("Applications", systemImage: "square.stack.3d.up.fill")
+                    .tag("applications")
 
                 Section("Output profiles") {
                     ForEach(profileStore.profiles) { profile in
@@ -115,6 +119,8 @@ struct ContentView: View {
                 SetupView(state: state)
             } else if selection == "default-profiles" {
                 DefaultProfilesView(state: state)
+            } else if selection == "applications" {
+                PerAppAudioView(controller: state.perAppAudio)
             } else if let id = UUID(uuidString: selection),
                       let index = profileStore.profiles.firstIndex(where: { $0.id == id }) {
                 ProfileEditorView(
@@ -231,7 +237,7 @@ struct ContentView: View {
     }
 
     private func beginAddingOutput() {
-        coreAudio.refresh()
+        Task { await coreAudio.refreshWithoutBlockingUI() }
         let devices = coreAudio.physicalOutputDevices
         pendingOutputUID = devices.first(where: { $0.id == coreAudio.defaultOutputUID })?.id
             ?? devices.first?.id
@@ -595,6 +601,8 @@ struct ProfileEditorView: View {
     @State private var renamingProfileID: UUID?
     @State private var profileNameDraft = ""
     @State private var focusClearingMonitor: Any?
+    @State private var graphResponseTask: Task<Void, Never>?
+    @State private var headroomCalculationTask: Task<Void, Never>?
     @FocusState private var profileNameFocused: Bool
 
     private var profileIsActive: Bool { state.isActive && state.activeProfileID == profile.id }
@@ -611,7 +619,7 @@ struct ProfileEditorView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            LazyVStack(alignment: .leading, spacing: 18) {
                 HStack(alignment: .firstTextBaseline) {
                     if isRenamingProfile {
                         TextField("Profile name", text: $profileNameDraft)
@@ -628,7 +636,7 @@ struct ProfileEditorView: View {
                             .onTapGesture { beginProfileRename() }
                             .help("Click to rename this profile")
                     }
-                    if coreAudio.device(uid: profile.outputDeviceUID) == nil {
+                    if coreAudio.cachedDevice(uid: profile.outputDeviceUID) == nil {
                         Label("Disconnected", systemImage: "exclamationmark.triangle.fill")
                             .font(.caption.bold())
                             .foregroundStyle(.orange)
@@ -745,6 +753,16 @@ struct ProfileEditorView: View {
                     }.padding(6)
                 }
 
+                ConvolutionEditorView(
+                    state: state,
+                    profile: $profile
+                )
+
+                CrossfeedEditorView(
+                    state: state,
+                    profile: $profile
+                )
+
                 PerChannelProcessingView(
                     state: state,
                     profile: $profile
@@ -768,11 +786,14 @@ struct ProfileEditorView: View {
         .onChange(of: limiterEnabled) { _ in graphicEQChanged() }
         .onChange(of: graphicBands) { _ in graphicEQChanged() }
         .onChange(of: profile.sampleRate) { _ in updateGraphResponses() }
+        .onChange(of: profile.processing) { _ in updateAutomaticSystemHeadroom() }
         .onChange(of: state.eqDraftRevision) { _ in updateAutomaticSystemHeadroom() }
         .onDisappear {
             state.setRuntimeVisuals(profileID: profile.id, active: false)
             commitProfileRename()
             liveApplyTask?.cancel()
+            graphResponseTask?.cancel()
+            headroomCalculationTask?.cancel()
             preserveUnsavedEQDraft()
             removeFocusClearingMonitor()
         }
@@ -887,7 +908,7 @@ struct ProfileEditorView: View {
                         Picker("", selection: Binding(
                             get: { profile.outputDeviceUID },
                             set: { newUID in
-                                if let device = state.coreAudio.device(uid: newUID) {
+                                if let device = state.coreAudio.cachedDevice(uid: newUID) {
                                     Task {
                                         await state.setOutputDevice(
                                             profileID: profile.id,
@@ -897,7 +918,7 @@ struct ProfileEditorView: View {
                                 }
                             }
                         )) {
-                            if coreAudio.device(uid: profile.outputDeviceUID) == nil {
+                            if coreAudio.cachedDevice(uid: profile.outputDeviceUID) == nil {
                                 Text("\(profile.outputDeviceName) (Disconnected)")
                                     .tag(profile.outputDeviceUID)
                             }
@@ -941,7 +962,7 @@ struct ProfileEditorView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(
                         !profileIsActive &&
-                            (!profile.isEnabled || coreAudio.device(uid: profile.outputDeviceUID) == nil)
+                            (!profile.isEnabled || coreAudio.cachedDevice(uid: profile.outputDeviceUID) == nil)
                     )
                 }
 
@@ -960,32 +981,30 @@ struct ProfileEditorView: View {
                         get: { profile.sampleRate },
                         set: { newRate in
                             guard newRate != profile.sampleRate else { return }
-                            guard state.processingSampleRateProblem(
-                                rate: newRate,
-                                outputUID: profile.outputDeviceUID
-                            ) == nil else {
-                                state.reportProcessingSampleRateProblem(
-                                    rate: newRate,
-                                    outputUID: profile.outputDeviceUID
-                                )
-                                return
-                            }
-                            profile.sampleRate = newRate
-                            updateGraphResponses()
-                            if profileIsActive {
-                                let updatedProfile = profileWithCurrentEQ()
-                                Task { await state.apply(profile: updatedProfile) }
+                            let profileID = profile.id
+                            let outputUID = profile.outputDeviceUID
+                            Task {
+                                if let problem = await state
+                                    .processingSampleRateProblemWithoutBlockingUI(
+                                        rate: newRate,
+                                        outputUID: outputUID
+                                    ) {
+                                    state.reportProcessingSampleRateProblem(problem)
+                                    return
+                                }
+                                guard profile.id == profileID else { return }
+                                profile.sampleRate = newRate
+                                updateGraphResponses()
+                                if profileIsActive {
+                                    let updatedProfile = profileWithCurrentEQ()
+                                    await state.apply(profile: updatedProfile)
+                                }
                             }
                         }
                     )) {
                         ForEach([44_100, 48_000, 88_200, 96_000, 176_400, 192_000], id: \.self) { rate in
-                            let unsupported = state.processingSampleRateProblem(
-                                rate: rate,
-                                outputUID: profile.outputDeviceUID
-                            ) != nil
-                            Text(unsupported ? "\(rateLabel(rate)) — Unsupported" : rateLabel(rate))
+                            Text(rateLabel(rate))
                                 .tag(rate)
-                                .disabled(unsupported)
                         }
                     }
                     .labelsHidden()
@@ -994,14 +1013,6 @@ struct ProfileEditorView: View {
                 Text("Higher rates increase CPU and bandwidth use but do not improve lower-rate source audio; 48 kHz is the recommended default.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                if let problem = state.processingSampleRateProblem(
-                    rate: profile.sampleRate,
-                    outputUID: profile.outputDeviceUID
-                ) {
-                    Label(problem, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                }
             }.padding(6)
         }
     }
@@ -1225,14 +1236,31 @@ struct ProfileEditorView: View {
            correction.isEnabled {
             combined.bands.insert(contentsOf: correction.filters, at: 0)
         }
-        responsePointsForGraph = calculator.calculate(
-            parsed: combined,
-            sampleRate: Double(profile.sampleRate)
+        let filterOnly = ParsedEQ(
+            preampDB: 0,
+            bands: graphicBands,
+            warnings: []
         )
-        filterResponsePointsForGraph = calculator.calculate(
-            parsed: ParsedEQ(preampDB: 0, bands: graphicBands, warnings: []),
-            sampleRate: Double(profile.sampleRate)
-        )
+        let combinedResponse = combined
+        let sampleRate = Double(profile.sampleRate)
+        let profileID = profile.id
+        graphResponseTask?.cancel()
+        graphResponseTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(25))
+            } catch {
+                return
+            }
+            let responses = await Task.detached(priority: .userInitiated) {
+                (
+                    calculator.calculate(parsed: combinedResponse, sampleRate: sampleRate),
+                    calculator.calculate(parsed: filterOnly, sampleRate: sampleRate)
+                )
+            }.value
+            guard !Task.isCancelled, profile.id == profileID else { return }
+            responsePointsForGraph = responses.0
+            filterResponsePointsForGraph = responses.1
+        }
         updateAutomaticSystemHeadroom()
     }
 
@@ -1260,6 +1288,7 @@ struct ProfileEditorView: View {
     }
 
     private func updateAutomaticSystemHeadroom() {
+        let candidate: DeviceProfile
         do {
             var current = profile
             current.setGlobalEqualizer(preampDB: preampDB, bands: graphicBands)
@@ -1267,11 +1296,27 @@ struct ProfileEditorView: View {
             // The visible editor is authoritative even before its draft write is
             // published; channel drafts still come from AppState.
             current.setGlobalEqualizer(preampDB: preampDB, bands: graphicBands)
-            automaticSystemHeadroomDB = try ProcessingGraphBuilder().build(
-                profile: current
-            ).automaticHeadroomDB
+            candidate = current
         } catch {
             automaticSystemHeadroomDB = 0
+            return
+        }
+        let profileID = profile.id
+        headroomCalculationTask?.cancel()
+        headroomCalculationTask = Task {
+            // Slider gestures and draft publication can request this several
+            // times in one run-loop turn. Calculate only the settled value.
+            do {
+                try await Task.sleep(for: .milliseconds(120))
+            } catch {
+                return
+            }
+            let headroom = await Task.detached(priority: .utility) {
+                (try? ProcessingGraphBuilder().build(profile: candidate)
+                    .automaticHeadroomDB) ?? 0
+            }.value
+            guard !Task.isCancelled, profile.id == profileID else { return }
+            automaticSystemHeadroomDB = headroom
         }
     }
 

@@ -16,6 +16,17 @@ enum CamiTunePaths {
         return current
     }()
 
+    /// Immutable, app-managed impulse responses referenced by ProcessingProfile.
+    /// Keeping these beside profiles prevents security-scoped import URLs from
+    /// expiring and gives future profile bundles a stable asset boundary.
+    static var impulseResponsesDirectory: URL {
+        supportDirectory.appendingPathComponent("ImpulseResponses", isDirectory: true)
+    }
+
+    static var perAppAudioSettingsURL: URL {
+        supportDirectory.appendingPathComponent("PerAppAudio.json")
+    }
+
     static func migrateLegacySupportDirectory(
         from legacy: URL,
         to current: URL,

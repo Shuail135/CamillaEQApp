@@ -2,15 +2,20 @@
 
 System Audio Bridge is an output-only Core Audio HAL device for macOS 13 and
 later. It is DSP-agnostic: any companion application that implements the
-versioned transport can consume its PCM stream. The current product profile
-exposes one stereo transport endpoint. It is hidden under the generic
+versioned transport can consume its PCM stream. Transport protocol version 3
+preserves Core Audio client ID, PID, bundle ID, lifecycle, cycle timing, and
+separate PCM blocks so the companion can apply per-application processing
+before mixing. Each packet also carries its Core Audio channel-layout tag so
+semantic roles survive the driver boundary. The current product profile
+exposes one 7.1 Float32 LPCM transport endpoint in ITU order
+(`L R C LFE Ls Rs Rls Rrs`). It is hidden under the generic
 `System Audio Bridge` name while idle and can be made visible under an active
 profile name by a companion app. It exposes no input stream and does not use
 macOS Microphone privacy APIs. A companion app can also publish per-profile
 Core Audio aggregate outputs as inactive selection entries.
 
-The driver is deliberately small. It receives the final interleaved Float32
-mix from Core Audio and copies it into a bounded shared ring. A companion
+The driver is deliberately small. It receives client-scoped interleaved Float32
+blocks from Core Audio and copies them into a bounded shared ring. A companion
 userspace process reads that ring and may analyze, record, route, or process
 the frames with any suitable audio engine.
 
@@ -55,22 +60,27 @@ That operation asks for an administrator password, installs only
 The corresponding removal script is `uninstall-driver.sh`. Neither operation
 is run as part of a normal build.
 
-## Extension contract
+## LPCM layout contract
 
-The shipped app remains stereo today, but the transport protocol reserves the
-pieces needed for larger layouts:
+The product build uses `SABR_CHANNELS=8`. Development builds may select only
+the standard layouts `2`, `6`, or `8`; the driver publishes the matching Core
+Audio labels and tags for stereo, 5.1, and 7.1 respectively.
+
+The transport protocol provides:
 
 - interleaved Float32 transport capacity up to 32 channels;
 - explicit active-channel count independent of allocated capacity;
+- an explicit channel-layout tag on every packet;
 - versioned direction, stream ID, and bus index fields;
 - monotonic 64-bit ring positions and observable drop/underrun counters;
-- a driver build setting, for example `SABR_CHANNELS=6`.
+- standard build settings such as `SABR_CHANNELS=6`.
 
-Shipping a multichannel profile requires changing all three ends together:
-the HAL device's channel count and labels, the client channel mapping, and the
-processing engine's capture and playback channel counts. Merely building
-the driver with six channels is useful for driver development, but the current
-app intentionally rejects it rather than silently downmixing a user's audio.
+CamiTune accepts all three layouts and preserves the source roles through its
+transport, per-application mixer, metering, and analysis paths. Until the
+FrontStageRenderer milestone replaces it, a bounded role-aware stereo fallback
+feeds the existing stereo DSP/output path. It passes stereo unchanged, maps
+center and surround beds conservatively, and excludes unfiltered LFE from small
+full-range speakers.
 
 Future microphone support should be a separate, explicit input stream or
 device using `SABR_TRANSPORT_DIRECTION_INPUT`. It will also need its own ring

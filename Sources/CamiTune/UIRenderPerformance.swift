@@ -38,14 +38,17 @@ enum UIRenderPerformance {
     }
 
     static func allowsSpectrumPublication(
-        since lastPublication: Date,
-        now: Date = Date()
+        since _: Date,
+        now _: Date = Date()
     ) -> Bool {
-        !isInteractionInProgress || now.timeIntervalSince(lastPublication) >= 0.10
+        // Spectrum redraws fan out to both canvases and every visible EQ band.
+        // Preserve the last frame while AppKit is tracking a scroll or resize;
+        // the next FFT frame is published as soon as interaction ends.
+        !isInteractionInProgress
     }
 
     static var meterPollMilliseconds: Int {
-        isInteractionInProgress ? 140 : 100
+        isInteractionInProgress ? 250 : 100
     }
 
     static var animatedLevelTransitionDuration: Double {

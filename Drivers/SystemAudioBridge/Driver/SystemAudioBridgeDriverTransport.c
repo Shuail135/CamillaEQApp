@@ -4,6 +4,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,12 +16,59 @@ typedef struct SABRDriverMappedTransport {
     void* mapping;
     size_t mappingBytes;
     SABRTransportHeader* header;
+    SABRTransportClient* clients;
+    SABRTransportPacket* packets;
     Float32* samples;
     SABRTransportConfiguration configuration;
 } SABRDriverMappedTransport;
 
 static _Atomic(SABRDriverMappedTransport*) gTransport = NULL;
 static _Atomic uint32_t gActiveWriters = 0;
+static atomic_flag gPacketWriter = ATOMIC_FLAG_INIT;
+
+typedef struct SABRDriverClient {
+    Boolean occupied;
+    Boolean active;
+    uint32_t useCount;
+    uint32_t clientID;
+    int32_t processID;
+    uint64_t generation;
+    char bundleID[SABR_TRANSPORT_BUNDLE_ID_CAPACITY];
+} SABRDriverClient;
+
+static SABRDriverClient gClients[SABR_TRANSPORT_CLIENT_CAPACITY];
+static uint64_t gClientGeneration = 0;
+static pthread_mutex_t gClientMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void sabr_publish_clients(SABRDriverMappedTransport* transport) {
+    if (transport == NULL) { return; }
+    pthread_mutex_lock(&gClientMutex);
+    atomic_store_explicit(
+        &transport->header->clientGeneration,
+        UINT64_MAX,
+        memory_order_release
+    );
+    for (uint32_t index = 0; index < SABR_TRANSPORT_CLIENT_CAPACITY; ++index) {
+        SABRTransportClient* destination = &transport->clients[index];
+        atomic_store_explicit(&destination->state, SABR_CLIENT_STATE_EMPTY, memory_order_relaxed);
+        if (!gClients[index].occupied) { continue; }
+        destination->clientID = gClients[index].clientID;
+        destination->processID = gClients[index].processID;
+        destination->generation = gClients[index].generation;
+        memcpy(destination->bundleID, gClients[index].bundleID, sizeof(destination->bundleID));
+        atomic_store_explicit(
+            &destination->state,
+            gClients[index].active ? SABR_CLIENT_STATE_ACTIVE : SABR_CLIENT_STATE_INACTIVE,
+            memory_order_release
+        );
+    }
+    atomic_store_explicit(
+        &transport->header->clientGeneration,
+        gClientGeneration,
+        memory_order_release
+    );
+    pthread_mutex_unlock(&gClientMutex);
+}
 
 static Boolean sabr_dictionary_get_uint64(
     CFDictionaryRef dictionary,
@@ -108,7 +156,9 @@ OSStatus sabr_driver_transport_connect(const SABRTransportConfiguration* configu
         header->streamID != configuration->streamID ||
         header->busIndex != configuration->busIndex ||
         header->channelCapacity != configuration->channelCapacity ||
-        header->frameCapacity != configuration->frameCapacity) {
+        header->frameCapacity != configuration->frameCapacity ||
+        header->packetCapacity != SABR_TRANSPORT_PACKET_CAPACITY ||
+        header->clientCapacity != SABR_TRANSPORT_CLIENT_CAPACITY) {
         munmap(mapping, requiredBytes);
         return kAudioHardwareIllegalOperationError;
     }
@@ -121,9 +171,12 @@ OSStatus sabr_driver_transport_connect(const SABRTransportConfiguration* configu
     transport->mapping = mapping;
     transport->mappingBytes = requiredBytes;
     transport->header = header;
-    transport->samples = (Float32*)((uint8_t*)mapping + sizeof(SABRTransportHeader));
+    transport->clients = sabr_transport_clients(header);
+    transport->packets = sabr_transport_packets(header);
+    transport->samples = sabr_transport_samples(header);
     transport->configuration = *configuration;
 
+    sabr_publish_clients(transport);
     sabr_replace_transport(transport);
     return noErr;
 }
@@ -201,6 +254,93 @@ void sabr_driver_transport_disconnect(void) {
     sabr_replace_transport(NULL);
 }
 
+void sabr_driver_transport_add_client(
+    uint32_t clientID,
+    int32_t processID,
+    CFStringRef bundleID
+) {
+    pthread_mutex_lock(&gClientMutex);
+    uint32_t slot = SABR_TRANSPORT_CLIENT_CAPACITY;
+    uint32_t emptySlot = SABR_TRANSPORT_CLIENT_CAPACITY;
+    uint32_t oldestInactiveSlot = SABR_TRANSPORT_CLIENT_CAPACITY;
+    uint64_t oldestInactiveGeneration = UINT64_MAX;
+    uint32_t oldestSlot = SABR_TRANSPORT_CLIENT_CAPACITY;
+    uint64_t oldestGeneration = UINT64_MAX;
+    for (uint32_t index = 0; index < SABR_TRANSPORT_CLIENT_CAPACITY; ++index) {
+        if (gClients[index].occupied && gClients[index].clientID == clientID) {
+            slot = index;
+            break;
+        }
+        if (!gClients[index].occupied) {
+            if (emptySlot == SABR_TRANSPORT_CLIENT_CAPACITY) { emptySlot = index; }
+            continue;
+        }
+        if (gClients[index].generation < oldestGeneration) {
+            oldestSlot = index;
+            oldestGeneration = gClients[index].generation;
+        }
+        if (!gClients[index].active &&
+            gClients[index].generation < oldestInactiveGeneration) {
+            oldestInactiveSlot = index;
+            oldestInactiveGeneration = gClients[index].generation;
+        }
+    }
+    if (slot == SABR_TRANSPORT_CLIENT_CAPACITY) {
+        // Core Audio can allocate fresh client IDs while rebuilding native
+        // profile endpoints without balancing every old RemoveDeviceClient
+        // callback. Keep this fixed-size real-time snapshot useful by
+        // preferring empty/inactive entries, then evicting the oldest stale
+        // active entry when all slots are otherwise occupied.
+        slot = emptySlot < SABR_TRANSPORT_CLIENT_CAPACITY
+            ? emptySlot
+            : (oldestInactiveSlot < SABR_TRANSPORT_CLIENT_CAPACITY
+                ? oldestInactiveSlot
+                : oldestSlot);
+    }
+    if (slot < SABR_TRANSPORT_CLIENT_CAPACITY) {
+        SABRDriverClient* client = &gClients[slot];
+        const Boolean existing = client->occupied && client->clientID == clientID;
+        if (!existing) { memset(client, 0, sizeof(*client)); }
+        client->occupied = true;
+        client->active = true;
+        client->useCount = existing ? client->useCount + 1 : 1;
+        client->clientID = clientID;
+        client->processID = processID;
+        client->generation = ++gClientGeneration;
+        if (bundleID != NULL) {
+            CFStringGetCString(
+                bundleID,
+                client->bundleID,
+                sizeof(client->bundleID),
+                kCFStringEncodingUTF8
+            );
+        }
+    }
+    pthread_mutex_unlock(&gClientMutex);
+
+    atomic_fetch_add_explicit(&gActiveWriters, 1, memory_order_acquire);
+    SABRDriverMappedTransport* transport = atomic_load_explicit(&gTransport, memory_order_acquire);
+    sabr_publish_clients(transport);
+    atomic_fetch_sub_explicit(&gActiveWriters, 1, memory_order_release);
+}
+
+void sabr_driver_transport_remove_client(uint32_t clientID) {
+    pthread_mutex_lock(&gClientMutex);
+    for (uint32_t index = 0; index < SABR_TRANSPORT_CLIENT_CAPACITY; ++index) {
+        if (!gClients[index].occupied || gClients[index].clientID != clientID) { continue; }
+        if (gClients[index].useCount > 0) { gClients[index].useCount -= 1; }
+        gClients[index].active = gClients[index].useCount > 0;
+        gClients[index].generation = ++gClientGeneration;
+        break;
+    }
+    pthread_mutex_unlock(&gClientMutex);
+
+    atomic_fetch_add_explicit(&gActiveWriters, 1, memory_order_acquire);
+    SABRDriverMappedTransport* transport = atomic_load_explicit(&gTransport, memory_order_acquire);
+    sabr_publish_clients(transport);
+    atomic_fetch_sub_explicit(&gActiveWriters, 1, memory_order_release);
+}
+
 void sabr_driver_transport_get_configuration(SABRTransportConfiguration* configuration) {
     if (configuration == NULL) { return; }
     memset(configuration, 0, sizeof(*configuration));
@@ -214,7 +354,11 @@ void sabr_driver_transport_write(
     const Float32* interleavedSamples,
     uint32_t frameCount,
     uint32_t channelCount,
-    double sampleRate
+    uint32_t channelLayoutTag,
+    double sampleRate,
+    uint32_t clientID,
+    uint64_t cycleCounter,
+    double sampleTime
 ) {
     if (interleavedSamples == NULL || frameCount == 0 || channelCount == 0) { return; }
 
@@ -225,20 +369,37 @@ void sabr_driver_transport_write(
         return;
     }
 
+    if (atomic_flag_test_and_set_explicit(&gPacketWriter, memory_order_acquire)) {
+        atomic_fetch_add_explicit(&transport->header->droppedFrames, frameCount, memory_order_relaxed);
+        atomic_fetch_add_explicit(&transport->header->droppedPackets, 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&gActiveWriters, 1, memory_order_release);
+        return;
+    }
+
     SABRTransportHeader* header = transport->header;
     const uint32_t capacity = header->frameCapacity;
     const uint32_t channelCapacity = header->channelCapacity;
     if (channelCount > channelCapacity || frameCount > capacity) {
         atomic_fetch_add_explicit(&header->droppedFrames, frameCount, memory_order_relaxed);
+        atomic_fetch_add_explicit(&header->droppedPackets, 1, memory_order_relaxed);
+        atomic_flag_clear_explicit(&gPacketWriter, memory_order_release);
         atomic_fetch_sub_explicit(&gActiveWriters, 1, memory_order_release);
         return;
     }
 
     const uint64_t writeFrame = atomic_load_explicit(&header->writeFrame, memory_order_relaxed);
     const uint64_t readFrame = atomic_load_explicit(&header->readFrame, memory_order_acquire);
+    const uint64_t writePacket = atomic_load_explicit(&header->writePacket, memory_order_relaxed);
+    const uint64_t readPacket = atomic_load_explicit(&header->readPacket, memory_order_acquire);
     const uint64_t usedFrames = writeFrame >= readFrame ? writeFrame - readFrame : capacity;
-    if (usedFrames > capacity || frameCount > capacity - usedFrames) {
+    const uint64_t usedPackets = writePacket >= readPacket
+        ? writePacket - readPacket
+        : header->packetCapacity;
+    if (usedFrames > capacity || frameCount > capacity - usedFrames ||
+        usedPackets >= header->packetCapacity) {
         atomic_fetch_add_explicit(&header->droppedFrames, frameCount, memory_order_relaxed);
+        atomic_fetch_add_explicit(&header->droppedPackets, 1, memory_order_relaxed);
+        atomic_flag_clear_explicit(&gPacketWriter, memory_order_release);
         atomic_fetch_sub_explicit(&gActiveWriters, 1, memory_order_release);
         return;
     }
@@ -282,8 +443,32 @@ void sabr_driver_transport_write(
     }
 
     atomic_store_explicit(&header->activeChannels, channelCount, memory_order_relaxed);
+    atomic_store_explicit(
+        &header->activeChannelLayoutTag,
+        channelLayoutTag,
+        memory_order_relaxed
+    );
     atomic_store_explicit(&header->sampleRateBits, sabr_double_to_bits(sampleRate), memory_order_relaxed);
     atomic_fetch_add_explicit(&header->sequence, 1, memory_order_relaxed);
+    SABRTransportPacket* packet = &transport->packets[writePacket % header->packetCapacity];
+    memset(packet, 0, sizeof(*packet));
+    packet->startFrame = writeFrame;
+    packet->cycleCounter = cycleCounter;
+    packet->sampleTimeBits = sabr_double_to_bits(sampleTime);
+    packet->clientID = clientID;
+    for (uint32_t index = 0; index < header->clientCapacity; ++index) {
+        const SABRTransportClient* client = &transport->clients[index];
+        const uint32_t state = atomic_load_explicit(&client->state, memory_order_acquire);
+        if (state != SABR_CLIENT_STATE_EMPTY && client->clientID == clientID) {
+            packet->processID = client->processID;
+            break;
+        }
+    }
+    packet->frameCount = frameCount;
+    packet->channelCount = channelCount;
+    packet->channelLayoutTag = channelLayoutTag;
     atomic_store_explicit(&header->writeFrame, writeFrame + frameCount, memory_order_release);
+    atomic_store_explicit(&header->writePacket, writePacket + 1, memory_order_release);
+    atomic_flag_clear_explicit(&gPacketWriter, memory_order_release);
     atomic_fetch_sub_explicit(&gActiveWriters, 1, memory_order_release);
 }

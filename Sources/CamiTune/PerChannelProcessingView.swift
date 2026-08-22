@@ -6,6 +6,7 @@ struct PerChannelProcessingView: View {
 
     @State private var selectedChannelIndex = 0
     @State private var gainDB = 0.0
+    @State private var delayMilliseconds = 0.0
     @State private var limiterEnabled = false
     // Per-channel EQ is opt-in; new and migrated profiles begin with zero bands.
     @State private var bands: [EQBand] = []
@@ -43,13 +44,16 @@ struct PerChannelProcessingView: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("Per-channel EQ & Gain").font(.title3.bold())
+                    Text("Per-channel EQ, Gain & Delay").font(.title3.bold())
                     Text(isSaved ? "Saved" : "Not saved")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(isSaved ? Color.green : Color.secondary)
                     Spacer()
                     Button("Reset channel") { resetSelectedChannel() }
-                        .disabled(gainDB == 0 && bands.isEmpty && !limiterEnabled)
+                        .disabled(
+                            gainDB == 0 && delayMilliseconds == 0
+                                && bands.isEmpty && !limiterEnabled
+                        )
                     Button { saveSelectedChannel() } label: {
                         Text("Save")
                             .foregroundStyle(Color.white)
@@ -94,6 +98,22 @@ struct PerChannelProcessingView: View {
                     channelIndex: selectedChannelIndex,
                     visualEffectsEnabled: runtimeVisualsActive
                 )
+
+                HStack(spacing: 12) {
+                    Text("Channel delay")
+                        .frame(width: 130, alignment: .leading)
+                    Slider(value: $delayMilliseconds, in: 0...100, step: 0.01)
+                    Text(
+                        delayMilliseconds.formatted(
+                            .number.precision(.fractionLength(2))
+                        ) + " ms"
+                    )
+                    .monospacedDigit()
+                    .frame(width: 76, alignment: .trailing)
+                }
+                Text("Use delay to time-align this channel. Fractional-sample values are supported.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                 VStack(alignment: .leading, spacing: 5) {
                     HStack {
@@ -176,6 +196,7 @@ struct PerChannelProcessingView: View {
             loadSelectedChannel()
         }
         .onChange(of: gainDB) { _ in channelSettingsChanged() }
+        .onChange(of: delayMilliseconds) { _ in channelSettingsChanged() }
         .onChange(of: limiterEnabled) { _ in channelSettingsChanged() }
         .onChange(of: bands) { _ in channelSettingsChanged() }
         .onChange(of: profile.sampleRate) { _ in updateResponses() }
@@ -230,9 +251,16 @@ struct PerChannelProcessingView: View {
             for: profile.id,
             channelIndex: selectedChannelIndex
         )
+        let delayDraft = state.channelDelayDraft(
+            for: profile.id,
+            channelIndex: selectedChannelIndex
+        )
         if let draft, let parsed = try? EqualizerAPOParser().parse(draft) {
             gainDB = parsed.preampDB
             bands = EQEditorSupport.organizedBands(parsed.bands)
+            delayMilliseconds = delayDraft
+                ?? profile.processing.settings(forChannel: selectedChannelIndex)?.delayMilliseconds
+                ?? 0
             limiterEnabled = limiterDraft
                 ?? profile.processing.settings(forChannel: selectedChannelIndex)?.limiterEnabled
                 ?? false
@@ -240,10 +268,11 @@ struct PerChannelProcessingView: View {
             let settings = profile.processing.settings(forChannel: selectedChannelIndex) ?? .identity
             gainDB = settings.gainDB
             bands = EQEditorSupport.organizedBands(settings.bands)
+            delayMilliseconds = delayDraft ?? settings.delayMilliseconds
             limiterEnabled = limiterDraft ?? settings.limiterEnabled
         }
         updateResponses()
-        isSaved = draft == nil && limiterDraft == nil
+        isSaved = draft == nil && limiterDraft == nil && delayDraft == nil
         DispatchQueue.main.async { suppressChanges = false }
     }
 
@@ -270,6 +299,7 @@ struct PerChannelProcessingView: View {
                 role: selectedChannel.role,
                 gainDB: gainDB,
                 bands: bands,
+                delayMilliseconds: delayMilliseconds,
                 limiterEnabled: limiterEnabled
             )
         } catch {
@@ -288,6 +318,7 @@ struct PerChannelProcessingView: View {
 
     private func resetSelectedChannel() {
         gainDB = 0
+        delayMilliseconds = 0
         bands = []
         limiterEnabled = false
     }
@@ -303,6 +334,11 @@ struct PerChannelProcessingView: View {
         )
         state.setChannelLimiterDraft(
             limiterEnabled,
+            for: profile.id,
+            channelIndex: selectedChannelIndex
+        )
+        state.setChannelDelayDraft(
+            delayMilliseconds,
             for: profile.id,
             channelIndex: selectedChannelIndex
         )

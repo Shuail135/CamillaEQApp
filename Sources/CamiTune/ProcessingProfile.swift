@@ -6,7 +6,7 @@ import Foundation
 /// belong to the device profile, while this value can later be reused by output,
 /// input, and offline processing runtimes.
 struct ProcessingProfile: Codable, Hashable, Sendable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 7
     static let userPreampStageID = UUID(uuid: (
         0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 3
@@ -15,12 +15,30 @@ struct ProcessingProfile: Codable, Hashable, Sendable {
         0, 0, 0, 0, 0, 0, 0, 0,
         0, 0, 0, 0, 0, 0, 0, 2
     ))
+    static let convolutionStageID = UUID(uuid: (
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 4
+    ))
+    static let crossfeedStageID = UUID(uuid: (
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 5
+    ))
 
     static func limiterStageID(forChannel index: Int) -> UUID {
         let value = UInt32(clamping: index)
         return UUID(uuid: (
             0x43, 0x41, 0x4d, 0x49, 0x54, 0x55, 0x4e, 0x45,
             0x43, 0x48, 0x00, 0x00,
+            UInt8((value >> 24) & 0xff), UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff), UInt8(value & 0xff)
+        ))
+    }
+
+    static func delayStageID(forChannel index: Int) -> UUID {
+        let value = UInt32(clamping: index)
+        return UUID(uuid: (
+            0x43, 0x41, 0x4d, 0x49, 0x54, 0x55, 0x4e, 0x45,
+            0x44, 0x4c, 0x00, 0x00,
             UInt8((value >> 24) & 0xff), UInt8((value >> 16) & 0xff),
             UInt8((value >> 8) & 0xff), UInt8(value & 0xff)
         ))
@@ -123,6 +141,14 @@ struct ProcessingProfile: Codable, Hashable, Sendable {
         global.stages.firstLimiterStage
     }
 
+    var convolution: (isEnabled: Bool, processor: ConvolutionProcessor)? {
+        global.stages.firstConvolutionStage
+    }
+
+    var crossfeed: (isEnabled: Bool, processor: CrossfeedProcessor)? {
+        global.stages.firstCrossfeedStage
+    }
+
     var limiterEnabled: Bool {
         limiter?.isEnabled ?? false
     }
@@ -175,6 +201,28 @@ struct ProcessingProfile: Codable, Hashable, Sendable {
         global.stages.upsertLimiter(enabled: enabled, stageID: Self.limiterStageID)
     }
 
+    mutating func setConvolution(
+        _ convolution: ConvolutionProcessor?,
+        enabled: Bool = true
+    ) {
+        global.stages.upsertConvolution(
+            convolution,
+            enabled: enabled,
+            stageID: Self.convolutionStageID
+        )
+    }
+
+    mutating func setCrossfeed(
+        _ crossfeed: CrossfeedProcessor?,
+        enabled: Bool = true
+    ) {
+        global.stages.upsertCrossfeed(
+            crossfeed,
+            enabled: enabled,
+            stageID: Self.crossfeedStageID
+        )
+    }
+
     func settings(forChannel index: Int) -> ChannelProcessingSettings? {
         guard let channel = channels.first(where: { $0.index == index }) else { return nil }
         return ChannelProcessingSettings(
@@ -184,6 +232,9 @@ struct ProcessingProfile: Codable, Hashable, Sendable {
             bands: channel.chain.stages.firstEqualizerStage.flatMap {
                 $0.isEnabled ? $0.bands : nil
             } ?? [],
+            delayMilliseconds: channel.chain.stages.firstDelayStage.flatMap {
+                $0.isEnabled ? $0.processor.milliseconds : nil
+            } ?? 0,
             limiterEnabled: channel.chain.stages.firstLimiterStage?.isEnabled ?? false
         )
     }
@@ -193,12 +244,19 @@ struct ProcessingProfile: Codable, Hashable, Sendable {
         role: ChannelRole,
         gainDB: Double,
         bands: [EQBand],
+        delayMilliseconds: Double? = nil,
         limiterEnabled: Bool? = nil
     ) {
         if let channelIndex = channels.firstIndex(where: { $0.index == index }) {
             channels[channelIndex].role = role
             channels[channelIndex].chain.stages.upsertGain(gainDB: gainDB)
             channels[channelIndex].chain.stages.upsertEqualizer(bands: bands)
+            if let delayMilliseconds {
+                channels[channelIndex].chain.stages.upsertDelay(
+                    milliseconds: delayMilliseconds,
+                    stageID: Self.delayStageID(forChannel: index)
+                )
+            }
             if let limiterEnabled {
                 channels[channelIndex].chain.stages.upsertLimiter(
                     enabled: limiterEnabled,
@@ -209,6 +267,12 @@ struct ProcessingProfile: Codable, Hashable, Sendable {
             var chain = ProcessingChain()
             chain.stages.upsertGain(gainDB: gainDB)
             chain.stages.upsertEqualizer(bands: bands)
+            if let delayMilliseconds {
+                chain.stages.upsertDelay(
+                    milliseconds: delayMilliseconds,
+                    stageID: Self.delayStageID(forChannel: index)
+                )
+            }
             if let limiterEnabled {
                 chain.stages.upsertLimiter(
                     enabled: limiterEnabled,
@@ -257,16 +321,19 @@ struct ChannelProcessing: Identifiable, Codable, Hashable, Sendable {
 struct ChannelProcessingSettings: Hashable, Sendable {
     var gainDB: Double
     var bands: [EQBand]
+    var delayMilliseconds: Double
     var limiterEnabled: Bool
 
     static let identity = ChannelProcessingSettings(
         gainDB: 0,
         bands: [],
+        delayMilliseconds: 0,
         limiterEnabled: false
     )
 
     var isIdentity: Bool {
-        gainDB == 0 && !bands.contains(where: \.enabled) && !limiterEnabled
+        gainDB == 0 && !bands.contains(where: \.enabled)
+            && delayMilliseconds == 0 && !limiterEnabled
     }
 }
 
@@ -299,6 +366,9 @@ struct ProcessingStage: Identifiable, Codable, Hashable, Sendable {
         case gain(GainProcessor)
         case equalizer(EqualizerProcessor)
         case deviceCorrection(DeviceCorrectionProfile)
+        case convolution(ConvolutionProcessor)
+        case crossfeed(CrossfeedProcessor)
+        case delay(DelayProcessor)
         case limiter(LimiterProcessor)
 
         private enum CodingKeys: String, CodingKey {
@@ -306,6 +376,9 @@ struct ProcessingStage: Identifiable, Codable, Hashable, Sendable {
             case gain
             case equalizer
             case deviceCorrection
+            case convolution
+            case crossfeed
+            case delay
             case limiter
         }
 
@@ -313,6 +386,9 @@ struct ProcessingStage: Identifiable, Codable, Hashable, Sendable {
             case gain
             case equalizer
             case deviceCorrection
+            case convolution
+            case crossfeed
+            case delay
             case limiter
         }
 
@@ -327,6 +403,16 @@ struct ProcessingStage: Identifiable, Codable, Hashable, Sendable {
                 self = .deviceCorrection(
                     try values.decode(DeviceCorrectionProfile.self, forKey: .deviceCorrection)
                 )
+            case .convolution:
+                self = .convolution(
+                    try values.decode(ConvolutionProcessor.self, forKey: .convolution)
+                )
+            case .crossfeed:
+                self = .crossfeed(
+                    try values.decode(CrossfeedProcessor.self, forKey: .crossfeed)
+                )
+            case .delay:
+                self = .delay(try values.decode(DelayProcessor.self, forKey: .delay))
             case .limiter:
                 self = .limiter(try values.decode(LimiterProcessor.self, forKey: .limiter))
             }
@@ -344,6 +430,15 @@ struct ProcessingStage: Identifiable, Codable, Hashable, Sendable {
             case .deviceCorrection(let correction):
                 try values.encode(Kind.deviceCorrection, forKey: .type)
                 try values.encode(correction, forKey: .deviceCorrection)
+            case .convolution(let processor):
+                try values.encode(Kind.convolution, forKey: .type)
+                try values.encode(processor, forKey: .convolution)
+            case .crossfeed(let processor):
+                try values.encode(Kind.crossfeed, forKey: .type)
+                try values.encode(processor, forKey: .crossfeed)
+            case .delay(let processor):
+                try values.encode(Kind.delay, forKey: .type)
+                try values.encode(processor, forKey: .delay)
             case .limiter(let processor):
                 try values.encode(Kind.limiter, forKey: .type)
                 try values.encode(processor, forKey: .limiter)
@@ -358,6 +453,47 @@ struct GainProcessor: Codable, Hashable, Sendable {
 
 struct EqualizerProcessor: Codable, Hashable, Sendable {
     var bands: [EQBand]
+}
+
+struct ConvolutionProcessor: Codable, Hashable, Sendable {
+    var asset: ImpulseResponseAsset
+    /// Zero-based channel selected from a mono or multichannel WAV.
+    var impulseChannel: Int
+
+    init(asset: ImpulseResponseAsset, impulseChannel: Int = 0) {
+        self.asset = asset
+        self.impulseChannel = impulseChannel
+    }
+}
+
+struct CrossfeedProcessor: Codable, Hashable, Sendable {
+    static let standard = CrossfeedProcessor(
+        amountPercent: 25,
+        delayMilliseconds: 0.3,
+        cutoffFrequency: 700
+    )
+
+    /// Opposite-channel low-frequency contribution, from 0% (none) to 100%
+    /// (equal-amplitude low-frequency contribution).
+    var amountPercent: Double
+    var delayMilliseconds: Double
+    var cutoffFrequency: Double
+
+    var crossfeedCoefficient: Double { amountPercent / 100 }
+
+    var crossfeedGainDB: Double {
+        let coefficient = crossfeedCoefficient
+        guard coefficient > 0 else { return -120 }
+        return 20 * log10(coefficient)
+    }
+
+    var maximumBoostDB: Double {
+        20 * log10(1 + max(0, crossfeedCoefficient))
+    }
+}
+
+struct DelayProcessor: Codable, Hashable, Sendable {
+    var milliseconds: Double
 }
 
 struct LimiterProcessor: Codable, Hashable, Sendable {
@@ -390,6 +526,33 @@ private extension Array where Element == ProcessingStage {
         for stage in self {
             if case .limiter(let limiter) = stage.processor {
                 return (stage.isEnabled, limiter)
+            }
+        }
+        return nil
+    }
+
+    var firstConvolutionStage: (isEnabled: Bool, processor: ConvolutionProcessor)? {
+        for stage in self {
+            if case .convolution(let convolution) = stage.processor {
+                return (stage.isEnabled, convolution)
+            }
+        }
+        return nil
+    }
+
+    var firstCrossfeedStage: (isEnabled: Bool, processor: CrossfeedProcessor)? {
+        for stage in self {
+            if case .crossfeed(let crossfeed) = stage.processor {
+                return (stage.isEnabled, crossfeed)
+            }
+        }
+        return nil
+    }
+
+    var firstDelayStage: (isEnabled: Bool, processor: DelayProcessor)? {
+        for stage in self {
+            if case .delay(let delay) = stage.processor {
+                return (stage.isEnabled, delay)
             }
         }
         return nil
@@ -468,6 +631,98 @@ private extension Array where Element == ProcessingStage {
                 processor: .limiter(.standard)
             ))
         }
+    }
+
+    mutating func upsertDelay(milliseconds: Double, stageID: UUID) {
+        if let index = firstIndex(where: {
+            if case .delay = $0.processor { return true }
+            return false
+        }) {
+            self[index].processor = .delay(DelayProcessor(milliseconds: milliseconds))
+            self[index].isEnabled = true
+            return
+        }
+        let insertionIndex = firstIndex(where: {
+            if case .limiter = $0.processor { return true }
+            return false
+        }) ?? endIndex
+        insert(
+            ProcessingStage(
+                id: stageID,
+                processor: .delay(DelayProcessor(milliseconds: milliseconds))
+            ),
+            at: insertionIndex
+        )
+    }
+
+    mutating func upsertConvolution(
+        _ convolution: ConvolutionProcessor?,
+        enabled: Bool,
+        stageID: UUID
+    ) {
+        let index = firstIndex(where: {
+            if case .convolution = $0.processor { return true }
+            return false
+        })
+        guard let convolution else {
+            if let index { remove(at: index) }
+            return
+        }
+        if let index {
+            self[index].processor = .convolution(convolution)
+            self[index].isEnabled = enabled
+            return
+        }
+
+        // FIR follows ordinary response shaping and remains before the terminal
+        // limiter even when an older profile's stages were hand-authored.
+        let insertionIndex = firstIndex(where: {
+            switch $0.processor {
+            case .crossfeed, .limiter: return true
+            default: return false
+            }
+        }) ?? endIndex
+        insert(
+            ProcessingStage(
+                id: stageID,
+                isEnabled: enabled,
+                processor: .convolution(convolution)
+            ),
+            at: insertionIndex
+        )
+    }
+
+
+    mutating func upsertCrossfeed(
+        _ crossfeed: CrossfeedProcessor?,
+        enabled: Bool,
+        stageID: UUID
+    ) {
+        let index = firstIndex(where: {
+            if case .crossfeed = $0.processor { return true }
+            return false
+        })
+        guard let crossfeed else {
+            if let index { remove(at: index) }
+            return
+        }
+        if let index {
+            self[index].processor = .crossfeed(crossfeed)
+            self[index].isEnabled = enabled
+            return
+        }
+        let insertionIndex = firstIndex(where: {
+            if case .limiter = $0.processor { return true }
+            return false
+        }) ?? endIndex
+        insert(
+            ProcessingStage(
+                id: stageID,
+                isEnabled: enabled,
+                processor: .crossfeed(crossfeed)
+            ),
+            at: insertionIndex
+        )
     }
 }
 

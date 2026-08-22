@@ -4,6 +4,7 @@ struct PCMFrame: Sendable {
     let interleaved: [Float]
     let channelCount: Int
     let sampleRate: Double
+    let channelLayout: LPCMChannelLayout
     let sourceBufferedFrames: Int
     let sourceCapacityFrames: Int
 
@@ -11,18 +12,29 @@ struct PCMFrame: Sendable {
         interleaved: [Float],
         channelCount: Int,
         sampleRate: Double,
+        channelLayout: LPCMChannelLayout? = nil,
         sourceBufferedFrames: Int = 0,
         sourceCapacityFrames: Int = 0
     ) {
         self.interleaved = interleaved
         self.channelCount = channelCount
         self.sampleRate = sampleRate
+        self.channelLayout = channelLayout
+            ?? LPCMChannelLayout.canonical(forChannelCount: channelCount)
+            ?? LPCMChannelLayout(
+                coreAudioTag: 0,
+                roles: [ChannelRole](repeating: .unknown, count: max(0, channelCount))
+            )
         self.sourceBufferedFrames = sourceBufferedFrames
         self.sourceCapacityFrames = sourceCapacityFrames
     }
 
     var frameCount: Int {
         channelCount > 0 ? interleaved.count / channelCount : 0
+    }
+
+    var sourceFormat: SpatialSourceFormat {
+        SpatialSourceFormat(layout: channelLayout)
     }
 }
 
@@ -358,6 +370,7 @@ private final class CamillaPCMBranch: @unchecked Sendable {
     private var needsRateMatcherReset = false
     private var rateController = AdaptiveRateController()
     private var resampler = AdaptivePCMResampler()
+    private let sourceRouter = SpatialSourceRouter()
 
     init(
         handle: FileHandle,
@@ -433,6 +446,10 @@ private final class CamillaPCMBranch: @unchecked Sendable {
                 rateController.reset()
                 resampler.reset()
             }
+            guard let routedFrame = sourceRouter.stereoFallback(for: frame) else {
+                recoveryHandler(frame.frameCount)
+                continue
+            }
             let bufferedFrames = frame.sourceBufferedFrames + queuedFrames
             let adjustmentPPM = rateController.update(
                 bufferedFrames: bufferedFrames,
@@ -441,7 +458,7 @@ private final class CamillaPCMBranch: @unchecked Sendable {
                 elapsedFrames: frame.frameCount
             )
             adjustmentHandler(adjustmentPPM, bufferedFrames)
-            let adjustedFrame = resampler.process(frame, adjustmentPPM: adjustmentPPM)
+            let adjustedFrame = resampler.process(routedFrame, adjustmentPPM: adjustmentPPM)
             guard !adjustedFrame.interleaved.isEmpty else { continue }
             do {
                 try adjustedFrame.interleaved.withUnsafeBytes { bytes in

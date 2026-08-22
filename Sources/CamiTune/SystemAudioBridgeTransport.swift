@@ -8,6 +8,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         var droppedFrames: UInt64 = 0
         var underrunCount: UInt64 = 0
         var activeChannels: UInt32 = 0
+        var channelLayoutTag: UInt32 = 0
         var sampleRate: Double = 0
         var ringCapacityFrames: UInt32 = 0
         var rateAdjustmentPPM: Double = 0
@@ -25,7 +26,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     private var stopping = false
     private var workerFinished = true
     private var pcmRouter: PCMRouter?
-    private var expectedChannelCount: UInt32 = 2
+    private var perAppAudio: PerAppAudioController?
     private var expectedSampleRate = 48_000.0
     private var generation: UInt64 = 0
 
@@ -34,15 +35,11 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     @MainActor
     func start(
         deviceObjectID: AudioObjectID,
-        expectedChannelCount: UInt32,
         expectedSampleRate: Double,
-        pcmRouter: PCMRouter
+        pcmRouter: PCMRouter,
+        perAppAudio: PerAppAudioController
     ) throws {
         stop()
-        guard expectedChannelCount > 0,
-              expectedChannelCount <= sabr_client_transport_max_channels() else {
-            throw TransportError.invalidChannelCount(expectedChannelCount)
-        }
         guard let transport = sabr_client_transport_create(
             sabr_client_transport_max_channels(),
             sabr_client_transport_default_frame_capacity()
@@ -60,7 +57,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         self.transport = transport
         self.deviceObjectID = deviceObjectID
         self.pcmRouter = pcmRouter
-        self.expectedChannelCount = expectedChannelCount
+        self.perAppAudio = perAppAudio
         self.expectedSampleRate = expectedSampleRate
         stopping = false
         workerFinished = false
@@ -92,6 +89,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         self.transport = nil
         self.deviceObjectID = nil
         self.pcmRouter = nil
+        self.perAppAudio = nil
         worker = nil
         state.unlock()
 
@@ -108,16 +106,22 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
     }
 
     private func run(generation runGeneration: UInt64) {
-        let maximumFrames: UInt32 = 2048
+        // Accept every packet size the negotiated shared ring can legally
+        // contain. A fixed 8,192-frame read ceiling left the consumer parked on
+        // the same unread descriptor forever if HAL selected a larger IO block,
+        // making an otherwise valid route produce no audio.
+        let maximumFrames = sabr_client_transport_default_frame_capacity()
         let channelCapacity = sabr_client_transport_max_channels()
         var samples = [Float](
             repeating: 0,
             count: Int(maximumFrames * channelCapacity)
         )
         var lastStatisticsUpdate = Date()
-        var reportedStreaming = false
-        var reportedMismatch: UInt32?
+        var reportedSourceFormat: SpatialSourceFormat?
+        var reportedUnsupportedLayoutTag: UInt32?
+        var reportedUnsupportedChannelCount: UInt32?
         var reportedSampleRateMismatch: Double?
+        var lastClientGeneration: UInt64 = .max
 
         while !shouldStop(generation: runGeneration) {
             guard let transport = currentTransport() else { break }
@@ -130,64 +134,83 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
                 availableFrames,
                 UInt64(occupancy.frameCapacity)
             ))
-            var channels: UInt32 = 0
-            var sampleRate = 0.0
+            if occupancy.clientGeneration != lastClientGeneration {
+                publishClients(transport)
+                lastClientGeneration = occupancy.clientGeneration
+            }
+            var packet = SABRClientAudioPacketInfo()
             let frames = samples.withUnsafeMutableBufferPointer { buffer in
-                sabr_client_transport_read(
+                sabr_client_transport_read_packet(
                     transport,
                     buffer.baseAddress,
                     channelCapacity,
                     maximumFrames,
-                    &channels,
-                    &sampleRate
+                    &packet
                 )
             }
             if frames == 0 {
-                usleep(1_000)
-            } else if channels == expectedChannelCount,
-                      abs(sampleRate - expectedSampleRate) < 0.5 {
-                let sampleCount = Int(frames * channels)
-                let reportedChannels = channels
-                let interleaved = Array(samples.prefix(sampleCount))
-                currentPCMRouter()?.route(PCMFrame(
-                    interleaved: interleaved,
-                    channelCount: Int(channels),
-                    sampleRate: sampleRate,
-                    sourceBufferedFrames: sourceBufferedFrames,
-                    sourceCapacityFrames: Int(occupancy.frameCapacity)
-                ))
-                if !reportedStreaming {
-                    reportedStreaming = true
-                    reportedMismatch = nil
-                    reportedSampleRateMismatch = nil
-                    Task { @MainActor [weak self] in
-                        guard self?.isCurrentGeneration(runGeneration) == true else { return }
-                        self?.status = "Streaming \(reportedChannels) channels from System Audio Bridge"
-                    }
-                }
-            } else if channels != expectedChannelCount {
-                let reportedChannels = channels
-                let expectedChannels = expectedChannelCount
-                if reportedMismatch != reportedChannels {
-                    reportedStreaming = false
-                    reportedMismatch = reportedChannels
-                    Task { @MainActor [weak self] in
-                        guard self?.isCurrentGeneration(runGeneration) == true else { return }
-                        self?.status = "Driver channel mismatch: received \(reportedChannels), expected \(expectedChannels)"
-                    }
+                if let mixed = currentPerAppAudio()?.flushExpiredMix() {
+                    currentPCMRouter()?.route(mixed)
                 }
                 usleep(1_000)
+            } else if let channelLayout = LPCMChannelLayout(
+                coreAudioTag: packet.channelLayoutTag,
+                channelCount: Int(packet.channelCount)
+            ) {
+                if abs(packet.sampleRate - expectedSampleRate) >= 0.5 {
+                    let actualRate = packet.sampleRate
+                    let requestedRate = expectedSampleRate
+                    if reportedSampleRateMismatch != actualRate {
+                        reportedSourceFormat = nil
+                        reportedSampleRateMismatch = actualRate
+                        let message = "System Audio Bridge is producing \(Self.rateDescription(actualRate)), but CamillaDSP expects \(Self.rateDescription(requestedRate)). Audio was stopped to prevent wrong-speed playback. Choose a rate supported by the physical output."
+                        Task { @MainActor [weak self] in
+                            guard self?.isCurrentGeneration(runGeneration) == true else { return }
+                            self?.status = "Sample-rate mismatch"
+                            self?.runtimeError = message
+                        }
+                    }
+                    usleep(1_000)
+                } else {
+                    let sampleCount = Int(frames * packet.channelCount)
+                    let interleaved = Array(samples.prefix(sampleCount))
+                    let mixed = currentPerAppAudio()?.ingest(PerAppAudioPacket(
+                        clientID: packet.clientID,
+                        cycleCounter: packet.cycleCounter,
+                        sampleTime: packet.sampleTime,
+                        interleaved: interleaved,
+                        channelCount: Int(packet.channelCount),
+                        sampleRate: packet.sampleRate,
+                        channelLayout: channelLayout,
+                        sourceBufferedFrames: sourceBufferedFrames,
+                        sourceCapacityFrames: Int(occupancy.frameCapacity)
+                    ))
+                    if let mixed { currentPCMRouter()?.route(mixed) }
+                    let sourceFormat = SpatialSourceFormat(layout: channelLayout)
+                    if reportedSourceFormat != sourceFormat {
+                        reportedSourceFormat = sourceFormat
+                        reportedUnsupportedLayoutTag = nil
+                        reportedUnsupportedChannelCount = nil
+                        reportedSampleRateMismatch = nil
+                        let formatName = sourceFormat.displayName
+                        Task { @MainActor [weak self] in
+                            guard self?.isCurrentGeneration(runGeneration) == true else { return }
+                            self?.status = "Streaming \(formatName) LPCM from System Audio Bridge"
+                            self?.runtimeError = nil
+                        }
+                    }
+                }
             } else {
-                let actualRate = sampleRate
-                let requestedRate = expectedSampleRate
-                if reportedSampleRateMismatch != actualRate {
-                    reportedStreaming = false
-                    reportedSampleRateMismatch = actualRate
-                    let message = "System Audio Bridge is producing \(Self.rateDescription(actualRate)), but CamillaDSP expects \(Self.rateDescription(requestedRate)). Audio was stopped to prevent wrong-speed playback. Choose a rate supported by the physical output."
+                let tag = packet.channelLayoutTag
+                let channelCount = packet.channelCount
+                if reportedUnsupportedLayoutTag != tag ||
+                    reportedUnsupportedChannelCount != channelCount {
+                    reportedSourceFormat = nil
+                    reportedUnsupportedLayoutTag = tag
+                    reportedUnsupportedChannelCount = channelCount
                     Task { @MainActor [weak self] in
                         guard self?.isCurrentGeneration(runGeneration) == true else { return }
-                        self?.status = "Sample-rate mismatch"
-                        self?.runtimeError = message
+                        self?.status = "Unsupported \(channelCount)-channel LPCM layout (tag \(tag))"
                     }
                 }
                 usleep(1_000)
@@ -217,6 +240,7 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
             droppedFrames: raw.droppedFrames,
             underrunCount: raw.underrunCount,
             activeChannels: raw.activeChannels,
+            channelLayoutTag: raw.activeChannelLayoutTag,
             sampleRate: raw.sampleRate,
             ringCapacityFrames: raw.frameCapacity,
             rateAdjustmentPPM: rateMatching?.rateAdjustmentPPM ?? 0,
@@ -252,19 +276,58 @@ final class SystemAudioBridgeTransport: ObservableObject, @unchecked Sendable {
         return pcmRouter
     }
 
+    private func currentPerAppAudio() -> PerAppAudioController? {
+        state.lock()
+        defer { state.unlock() }
+        return perAppAudio
+    }
+
+    private func publishClients(_ transport: SABRClientTransportRef) {
+        let capacity = Int(sabr_client_transport_max_clients())
+        var rawClients = [SABRClientIdentity](
+            repeating: SABRClientIdentity(),
+            count: capacity
+        )
+        let count = rawClients.withUnsafeMutableBufferPointer { buffer in
+            sabr_client_transport_copy_clients(
+                transport,
+                buffer.baseAddress,
+                UInt32(buffer.count)
+            )
+        }
+        guard count != UInt32.max else { return }
+        let clients = rawClients.prefix(Int(count)).map { raw -> PerAppDriverClient in
+            var raw = raw
+            let bundleID = withUnsafePointer(to: &raw.bundleID) { pointer in
+                pointer.withMemoryRebound(
+                    to: CChar.self,
+                    capacity: Int(SABR_CLIENT_BUNDLE_ID_CAPACITY)
+                ) { characters -> String? in
+                    let value = String(cString: characters)
+                    return value.isEmpty ? nil : value
+                }
+            }
+            return PerAppDriverClient(
+                clientID: raw.clientID,
+                processID: raw.processID,
+                bundleID: bundleID,
+                isActive: raw.isActive.boolValue,
+                generation: raw.generation
+            )
+        }
+        currentPerAppAudio()?.updateClients(clients)
+    }
+
     private static func rateDescription(_ rate: Double) -> String {
         String(format: "%.1f kHz", rate / 1_000)
     }
 
     enum TransportError: LocalizedError {
-        case invalidChannelCount(UInt32)
         case couldNotCreateSharedRegion
         case coreAudio(OSStatus)
 
         var errorDescription: String? {
             switch self {
-            case .invalidChannelCount(let count):
-                return "The driver transport does not support \(count) channels."
             case .couldNotCreateSharedRegion:
                 return "CamiTune could not create the private driver audio transport."
             case .coreAudio(let status):

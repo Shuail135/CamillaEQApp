@@ -91,7 +91,7 @@
 
 //        - provides a rate scalar of 1.0 via hard coding
 //    - a single output stream
-//        - supports 16 channels of 32 bit float LPCM samples
+//        - supports a standard 2.0, 5.1, or 7.1 build of 32 bit float LPCM samples
 //        - writes to ring buffer
 //    - a single input stream
 //        - supports 16 channels of 32 bit float LPCM samples
@@ -817,6 +817,47 @@ static bool is_valid_sample_rate(Float64 sample_rate)
     return false;
 }
 
+static AudioChannelLayoutTag device_channel_layout_tag(void)
+{
+    switch(kNumber_Of_Channels)
+    {
+        case 2: return kAudioChannelLayoutTag_Stereo;
+        case 6: return kAudioChannelLayoutTag_MPEG_5_1_A;
+        case 8: return kAudioChannelLayoutTag_MPEG_7_1_C;
+        default: return kAudioChannelLayoutTag_Unknown;
+    }
+}
+
+static AudioChannelLabel device_channel_label(UInt32 channelIndex)
+{
+    static const AudioChannelLabel stereo[] = {
+        kAudioChannelLabel_Left,
+        kAudioChannelLabel_Right
+    };
+    static const AudioChannelLabel fivePointOne[] = {
+        kAudioChannelLabel_Left,
+        kAudioChannelLabel_Right,
+        kAudioChannelLabel_Center,
+        kAudioChannelLabel_LFEScreen,
+        kAudioChannelLabel_LeftSurround,
+        kAudioChannelLabel_RightSurround
+    };
+    static const AudioChannelLabel sevenPointOne[] = {
+        kAudioChannelLabel_Left,
+        kAudioChannelLabel_Right,
+        kAudioChannelLabel_Center,
+        kAudioChannelLabel_LFEScreen,
+        kAudioChannelLabel_LeftSurround,
+        kAudioChannelLabel_RightSurround,
+        kAudioChannelLabel_RearSurroundLeft,
+        kAudioChannelLabel_RearSurroundRight
+    };
+    if(kNumber_Of_Channels == 2 && channelIndex < 2) { return stereo[channelIndex]; }
+    if(kNumber_Of_Channels == 6 && channelIndex < 6) { return fivePointOne[channelIndex]; }
+    if(kNumber_Of_Channels == 8 && channelIndex < 8) { return sevenPointOne[channelIndex]; }
+    return kAudioChannelLabel_Unknown;
+}
+
 #pragma mark Factory
 
 void*	SystemAudioBridge_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
@@ -1060,14 +1101,18 @@ static OSStatus	SystemAudioBridge_AddDeviceClient(AudioServerPlugInDriverRef inD
 	//	not need to track the clients using the device, so we just check the arguments and return
 	//	successfully.
 	
-	#pragma unused(inClientInfo)
-	
 	//	declare the local variables
 	OSStatus theAnswer = 0;
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_AddDeviceClient: bad driver reference");
 	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_AddDeviceClient: bad device ID");
+	FailWithAction(inClientInfo == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_AddDeviceClient: missing client info");
+	sabr_driver_transport_add_client(
+		inClientInfo->mClientID,
+		inClientInfo->mProcessID,
+		inClientInfo->mBundleID
+	);
 
 Done:
 	return theAnswer;
@@ -1079,14 +1124,14 @@ static OSStatus	SystemAudioBridge_RemoveDeviceClient(AudioServerPlugInDriverRef 
 	//	device. This driver does not track clients, so we just check the arguments and return
 	//	successfully.
 	
-	#pragma unused(inClientInfo)
-	
 	//	declare the local variables
 	OSStatus theAnswer = 0;
 	
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_RemoveDeviceClient: bad driver reference");
 	FailWithAction(!is_device_object(inDeviceObjectID), theAnswer = kAudioHardwareBadObjectError, Done, "SystemAudioBridge_RemoveDeviceClient: bad device ID");
+	FailWithAction(inClientInfo == NULL, theAnswer = kAudioHardwareIllegalOperationError, Done, "SystemAudioBridge_RemoveDeviceClient: missing client info");
+	sabr_driver_transport_remove_client(inClientInfo->mClientID);
 
 Done:
 	return theAnswer;
@@ -2998,8 +3043,8 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 			break;
 
 		case kAudioDevicePropertyPreferredChannelLayout:
-			//	This property returns the default AudioChannelLayout to use for the device
-			//	by default. For this device, we return a stereo ACL.
+			//	This property returns the semantic order for the device's
+			//	compiled 2.0, 5.1, or 7.1 LPCM layout.
 			{
 				//	calculate how big the
 				UInt32 theACLSize = offsetof(AudioChannelLayout, mChannelDescriptions) + (kNumber_Of_Channels * sizeof(AudioChannelDescription));
@@ -3009,7 +3054,7 @@ static OSStatus	SystemAudioBridge_GetDevicePropertyData(AudioServerPlugInDriverR
 				((AudioChannelLayout*)outData)->mNumberChannelDescriptions = kNumber_Of_Channels;
 				for(theItemIndex = 0; theItemIndex < kNumber_Of_Channels; ++theItemIndex)
 				{
-					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mChannelLabel = kAudioChannelLabel_Left + theItemIndex;
+					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mChannelLabel = device_channel_label(theItemIndex);
 					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mChannelFlags = 0;
 					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mCoordinates[0] = 0;
 					((AudioChannelLayout*)outData)->mChannelDescriptions[theItemIndex].mCoordinates[1] = 0;
@@ -3574,8 +3619,8 @@ static OSStatus	SystemAudioBridge_SetStreamPropertyData(AudioServerPlugInDriverR
 		case kAudioStreamPropertyPhysicalFormat:
 			//	Changing the stream format needs to be handled via the
 			//	RequestConfigChange/PerformConfigChange machinery. Note that because this
-			//	device only supports 2 channel 32 bit float data, the only thing that can
-			//	change is the sample rate.
+			//	The channel layout is fixed by the product build. The stream accepts
+			//	interleaved Float32 LPCM and can change only its sample rate at runtime.
 			FailWithAction(inDataSize != sizeof(AudioStreamBasicDescription), theAnswer = kAudioHardwareBadPropertySizeError, Done, "SystemAudioBridge_SetStreamPropertyData: wrong size for the data for kAudioStreamPropertyPhysicalFormat");
 			FailWithAction(((const AudioStreamBasicDescription*)inData)->mFormatID != kAudioFormatLinearPCM, theAnswer = kAudioDeviceUnsupportedFormatError, Done, "SystemAudioBridge_SetStreamPropertyData: unsupported format ID for kAudioStreamPropertyPhysicalFormat");
 			FailWithAction(((const AudioStreamBasicDescription*)inData)->mFormatFlags != (kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked), theAnswer = kAudioDeviceUnsupportedFormatError, Done, "SystemAudioBridge_SetStreamPropertyData: unsupported format flags for kAudioStreamPropertyPhysicalFormat");
@@ -4743,7 +4788,7 @@ Done:
 static OSStatus	SystemAudioBridge_WillDoIOOperation(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, UInt32 inClientID, UInt32 inOperationID, Boolean* outWillDo, Boolean* outWillDoInPlace)
 {
 	//	This method returns whether or not the device will do a given IO operation. For this device,
-	//	we only support reading input data and writing output data.
+	//	we support reading input data and mixing each output client separately.
 	
 	#pragma unused(inClientID, inDeviceObjectID)
 	
@@ -4766,7 +4811,7 @@ static OSStatus	SystemAudioBridge_WillDoIOOperation(AudioServerPlugInDriverRef i
 			break;
 		#endif
 			
-		case kAudioServerPlugInIOOperationWriteMix:
+		case kAudioServerPlugInIOOperationMixOutput:
 			willDo = true;
 			willDoInPlace = true;
 			break;
@@ -4809,7 +4854,7 @@ static OSStatus	SystemAudioBridge_DoIOOperation(AudioServerPlugInDriverRef inDri
 {
 	//	This is called to actually perform a given operation. 
 	
-	#pragma unused(inClientID, inIOCycleInfo, ioSecondaryBuffer, inDeviceObjectID)
+	#pragma unused(ioSecondaryBuffer, inDeviceObjectID)
 	
 	//	declare the local variables
 	OSStatus theAnswer = 0;
@@ -4836,6 +4881,7 @@ static OSStatus	SystemAudioBridge_DoIOOperation(AudioServerPlugInDriverRef inDri
     
     // Keep track of last outputSampleTime and the cleared buffer status.
     static Float64 lastOutputSampleTime = 0;
+    static Float64 lastMixOutputSampleTime = -1;
     static Boolean isBufferClear = true;
     
     // From SystemAudioBridge to Application
@@ -4870,32 +4916,70 @@ static OSStatus	SystemAudioBridge_DoIOOperation(AudioServerPlugInDriverRef inDri
     }
     
     // From Application to SystemAudioBridge
-	if(inOperationID == kAudioServerPlugInIOOperationWriteMix)
+	if(inOperationID == kAudioServerPlugInIOOperationMixOutput)
 	{
         
         // Overload error.
         if (inIOCycleInfo->mCurrentTime.mSampleTime > inIOCycleInfo->mOutputTime.mSampleTime + inIOBufferFrameSize + kLatency_Frame_Size)
         {
-            DebugMsg("SystemAudioBridge overload error. kAudioServerPlugInIOOperationWriteMix was unable to complete operation before the deadline. Try increasing the buffer frame size.");
+            DebugMsg("SystemAudioBridge overload error. kAudioServerPlugInIOOperationMixOutput was unable to complete operation before the deadline. Try increasing the buffer frame size.");
             return kAudioHardwareUnspecifiedError;
         }
-        // Known limitation: simultaneous writers currently replace the shared
-        // cycle buffer. Supporting multiple clients requires per-client buffers
-        // and deterministic real-time mixing/clearing, not an in-place add here.
-        // Issue with outputting from mirrored device and main device at the same time. Not currently mixing. 
-        
-        // Copy the buffers.
-        memcpy(gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels, ioMainBuffer, firstPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
-        memcpy(gRingBuffer, (Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels, secondPartFrameSize * kNumber_Of_Channels * sizeof(Float32));
 
-        // Publish the final interleaved output mix to the private transport.
-        // A companion userspace process can consume these exact frames without
-        // opening a Core Audio input stream or requesting microphone access.
+        // MixOutput is called with one client's block. Clear the destination
+        // once per cycle, then accumulate every client for the legacy loopback
+        // input. The private transport publishes the blocks separately below.
+        if (lastMixOutputSampleTime != inIOCycleInfo->mOutputTime.mSampleTime)
+        {
+            vDSP_vclr(
+                gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels,
+                1,
+                firstPartFrameSize * kNumber_Of_Channels
+            );
+            if (secondPartFrameSize > 0)
+            {
+                vDSP_vclr(
+                    gRingBuffer,
+                    1,
+                    secondPartFrameSize * kNumber_Of_Channels
+                );
+            }
+            lastMixOutputSampleTime = inIOCycleInfo->mOutputTime.mSampleTime;
+        }
+        vDSP_vadd(
+            (const Float32*)ioMainBuffer,
+            1,
+            gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels,
+            1,
+            gRingBuffer + ringBufferFrameLocationStart * kNumber_Of_Channels,
+            1,
+            firstPartFrameSize * kNumber_Of_Channels
+        );
+        if (secondPartFrameSize > 0)
+        {
+            vDSP_vadd(
+                (const Float32*)ioMainBuffer + firstPartFrameSize * kNumber_Of_Channels,
+                1,
+                gRingBuffer,
+                1,
+                gRingBuffer,
+                1,
+                secondPartFrameSize * kNumber_Of_Channels
+            );
+        }
+
+        // Publish this client's interleaved block before Core Audio combines it
+        // with other applications. The companion can now apply that client's
+        // controls and perform the deterministic cycle mix before global DSP.
         sabr_driver_transport_write(
             (const Float32*)ioMainBuffer,
             inIOBufferFrameSize,
             kNumber_Of_Channels,
-            gDevice_SampleRate
+            device_channel_layout_tag(),
+            gDevice_SampleRate,
+            inClientID,
+            inIOCycleInfo->mIOCycleCounter,
+            inIOCycleInfo->mOutputTime.mSampleTime
         );
         
         // Save the last output time.

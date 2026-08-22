@@ -21,7 +21,6 @@ final class DependencyManager: ObservableObject {
 
     init(coreAudio: CoreAudioManager) {
         self.coreAudio = coreAudio
-        refresh()
     }
 
     var supportDirectory: URL {
@@ -51,6 +50,31 @@ final class DependencyManager: ObservableObject {
 
     func refresh() {
         try? createSupportLayout()
+        refreshCamillaDSPStatus()
+        let bridgePresent = coreAudio.systemAudioBridge != nil
+        applyAudioDriverStatus(
+            supported: coreAudio.isSystemAudioBridgePresentationSupported,
+            bridgePresent: bridgePresent
+        )
+        finishRefreshMessage()
+    }
+
+    func refreshWithoutBlockingUI() async {
+        try? createSupportLayout()
+        refreshCamillaDSPStatus()
+        let supported = await coreAudio
+            .systemAudioBridgePresentationIsSupportedWithoutBlockingUI()
+        let bridgePresent: Bool
+        if supported {
+            bridgePresent = true
+        } else {
+            bridgePresent = await coreAudio.resolveSystemAudioBridgeWithoutBlockingUI() != nil
+        }
+        applyAudioDriverStatus(supported: supported, bridgePresent: bridgePresent)
+        finishRefreshMessage()
+    }
+
+    private func refreshCamillaDSPStatus() {
         if FileManager.default.isExecutableFile(atPath: camillaDSPBinary.path),
            (try? String(contentsOf: camillaDSPCapabilityMarker, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) == Self.coreAudioUIDCapability {
@@ -62,16 +86,21 @@ final class DependencyManager: ObservableObject {
         } else {
             camillaDSPStatus = .missing
         }
-        coreAudio.refresh()
-        if coreAudio.isSystemAudioBridgePresentationSupported {
+    }
+
+    private func applyAudioDriverStatus(supported: Bool, bridgePresent: Bool) {
+        if supported {
             let version = coreAudio.installedSystemAudioBridgeVersion ?? "unknown"
             audioDriverStatus = .installed("System Audio Bridge \(version)")
-        } else if coreAudio.systemAudioBridge != nil {
+        } else if bridgePresent {
             let version = coreAudio.installedSystemAudioBridgeVersion ?? "unknown"
             audioDriverStatus = .failed("Driver \(version) is outdated; select Install / Repair Everything.")
         } else {
             audioDriverStatus = .missing
         }
+    }
+
+    private func finishRefreshMessage() {
         if case .installed = camillaDSPStatus, case .installed = audioDriverStatus, setupMessage.isEmpty {
             setupMessage = "Dependencies are ready."
         }
@@ -87,8 +116,9 @@ final class DependencyManager: ObservableObject {
         defer { setupInProgress = false }
 
         for attempt in 0..<8 {
-            refresh()
-            if coreAudio.isSystemAudioBridgePresentationSupported { break }
+            await coreAudio.refreshWithoutBlockingUI()
+            await refreshWithoutBlockingUI()
+            if case .installed = audioDriverStatus { break }
             if attempt < 7 { try? await Task.sleep(for: .milliseconds(500)) }
         }
 
@@ -283,8 +313,10 @@ final class DependencyManager: ObservableObject {
 
     private func waitForAudioDriver() async -> Bool {
         for attempt in 0..<30 {
-            coreAudio.refresh()
-            if coreAudio.isSystemAudioBridgePresentationSupported { return true }
+            await coreAudio.refreshWithoutBlockingUI()
+            if await coreAudio.systemAudioBridgePresentationIsSupportedWithoutBlockingUI() {
+                return true
+            }
             if attempt < 29 { try? await Task.sleep(for: .milliseconds(500)) }
         }
         return false

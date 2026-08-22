@@ -20,6 +20,7 @@ struct ProcessingGraph: Hashable, Sendable {
     /// value is deliberately not part of the persisted processing profile.
     var automaticHeadroomDB: Double
     var processors: [Processor]
+    var mixers: [Mixer]
     var pipeline: [PipelineStep]
 
     struct CaptureEndpoint: Hashable, Sendable {
@@ -43,15 +44,49 @@ struct ProcessingGraph: Hashable, Sendable {
         enum Implementation: Hashable, Sendable {
             case gain(db: Double)
             case biquad(EQBand)
+            case convolution(Convolution)
+            case delay(milliseconds: Double, subsample: Bool)
+            case firstOrderLowpass(frequency: Double)
+            case crossfeedGain(db: Double, muted: Bool, maximumBoostDB: Double)
             case limiter(LimiterProcessor)
+
+            struct Convolution: Hashable, Sendable {
+                var filePath: String
+                var channel: Int
+                var maximumMagnitudeDB: Double
+            }
+        }
+    }
+
+    struct Mixer: Identifiable, Hashable, Sendable {
+        var id: String
+        var sourceStageID: UUID
+        var inputChannelCount: Int
+        var outputChannelCount: Int
+        var mappings: [Mapping]
+
+        struct Mapping: Hashable, Sendable {
+            var destination: Int
+            var sources: [Source]
+        }
+
+        struct Source: Hashable, Sendable {
+            var channel: Int
+            var gainDB: Double = 0
         }
     }
 
     struct PipelineStep: Identifiable, Hashable, Sendable {
         var id: UUID
+        var kind: Kind = .filter
         var scope: Scope
         var channels: [Int]
         var processorIDs: [String]
+
+        enum Kind: Hashable, Sendable {
+            case filter
+            case mixer(id: String)
+        }
 
         enum Scope: Hashable, Sendable {
             case global
@@ -62,9 +97,14 @@ struct ProcessingGraph: Hashable, Sendable {
 
 struct ProcessingGraphBuilder {
     let channelCount: Int
+    let impulseResponseStore: ImpulseResponseStore
 
-    init(channelCount: Int = 2) {
+    init(
+        channelCount: Int = 2,
+        impulseResponseDirectory: URL = CamiTunePaths.impulseResponsesDirectory
+    ) {
         self.channelCount = channelCount
+        self.impulseResponseStore = ImpulseResponseStore(directory: impulseResponseDirectory)
     }
 
     func build(profile: DeviceProfile) throws -> ProcessingGraph {
@@ -86,6 +126,7 @@ struct ProcessingGraphBuilder {
             playback: .init(deviceUID: profile.outputDeviceUID, exclusive: false),
             automaticHeadroomDB: 0,
             processors: [],
+            mixers: [],
             pipeline: []
         )
         var usedStageIDs = Set<UUID>()
@@ -265,6 +306,54 @@ struct ProcessingGraphBuilder {
                     ))
                 }
                 processors = correctionProcessors
+            case .convolution(let convolution):
+                let runtime = try validate(
+                    convolution: convolution,
+                    sampleRate: sampleRate
+                )
+                processors = [
+                    .init(
+                        id: processorID(
+                            scope: identifierScope,
+                            stageID: stage.id,
+                            suffix: "convolution"
+                        ),
+                        sourceStageID: stage.id,
+                        implementation: .convolution(runtime)
+                    )
+                ]
+            case .crossfeed(let crossfeed):
+                try appendCrossfeed(
+                    crossfeed,
+                    stageID: stage.id,
+                    identifierScope: identifierScope,
+                    pipelineScope: pipelineScope,
+                    sampleRate: sampleRate,
+                    to: &graph
+                )
+                continue
+            case .delay(let delay):
+                guard case .channel = pipelineScope else {
+                    throw ProcessingGraphError.delayMustBePerChannel
+                }
+                guard delay.milliseconds.isFinite,
+                      (0...100).contains(delay.milliseconds) else {
+                    throw ProcessingGraphError.invalidChannelDelay(delay.milliseconds)
+                }
+                processors = [
+                    .init(
+                        id: processorID(
+                            scope: identifierScope,
+                            stageID: stage.id,
+                            suffix: "delay"
+                        ),
+                        sourceStageID: stage.id,
+                        implementation: .delay(
+                            milliseconds: delay.milliseconds,
+                            subsample: true
+                        )
+                    )
+                ]
             case .limiter(let limiter):
                 guard limiter.clipLimitDB.isFinite,
                       limiter.clipLimitDB <= 0 else {
@@ -340,6 +429,186 @@ struct ProcessingGraphBuilder {
         }
     }
 
+    private func validate(
+        convolution: ConvolutionProcessor,
+        sampleRate: Int
+    ) throws -> ProcessingGraph.Processor.Implementation.Convolution {
+        let asset = convolution.asset
+        let expectedFileName = "\(asset.id.uuidString.lowercased()).wav"
+        guard asset.fileName == expectedFileName,
+              URL(fileURLWithPath: asset.fileName).lastPathComponent == asset.fileName else {
+            throw ProcessingGraphError.invalidImpulseResponseReference(asset.fileName)
+        }
+        guard asset.sampleRate == sampleRate else {
+            throw ProcessingGraphError.impulseResponseSampleRateMismatch(
+                asset.sampleRate,
+                sampleRate
+            )
+        }
+        guard asset.channelCount > 0,
+              asset.frameCount > 0,
+              asset.maximumMagnitudeDBByChannel.count == asset.channelCount,
+              asset.maximumMagnitudeDBByChannel.allSatisfy(\.isFinite) else {
+            throw ProcessingGraphError.invalidImpulseResponseMetadata
+        }
+        guard (0..<asset.channelCount).contains(convolution.impulseChannel) else {
+            throw ProcessingGraphError.impulseResponseChannelOutOfRange(
+                convolution.impulseChannel,
+                asset.channelCount
+            )
+        }
+        let url = impulseResponseStore.url(for: asset)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue,
+              FileManager.default.isReadableFile(atPath: url.path) else {
+            throw ProcessingGraphError.impulseResponseMissing(asset.displayName)
+        }
+        return .init(
+            filePath: url.path,
+            channel: convolution.impulseChannel,
+            maximumMagnitudeDB: asset.maximumMagnitudeDBByChannel[convolution.impulseChannel]
+        )
+    }
+
+    private func appendCrossfeed(
+        _ crossfeed: CrossfeedProcessor,
+        stageID: UUID,
+        identifierScope: String,
+        pipelineScope: ProcessingGraph.PipelineStep.Scope,
+        sampleRate: Int,
+        to graph: inout ProcessingGraph
+    ) throws {
+        guard case .global = pipelineScope else {
+            throw ProcessingGraphError.crossfeedMustBeGlobal
+        }
+        guard channelCount == 2 else {
+            throw ProcessingGraphError.crossfeedRequiresStereo(channelCount)
+        }
+        guard crossfeed.amountPercent.isFinite,
+              (0...100).contains(crossfeed.amountPercent) else {
+            throw ProcessingGraphError.invalidCrossfeedAmount(crossfeed.amountPercent)
+        }
+        guard crossfeed.delayMilliseconds.isFinite,
+              (0...5).contains(crossfeed.delayMilliseconds) else {
+            throw ProcessingGraphError.invalidCrossfeedDelay(crossfeed.delayMilliseconds)
+        }
+        guard crossfeed.cutoffFrequency.isFinite,
+              crossfeed.cutoffFrequency > 0,
+              crossfeed.cutoffFrequency < Double(sampleRate) / 2 else {
+            throw ProcessingGraphError.invalidCrossfeedFrequency(
+                crossfeed.cutoffFrequency,
+                sampleRate
+            )
+        }
+
+        let splitID = processorID(
+            scope: identifierScope,
+            stageID: stageID,
+            suffix: "crossfeed_split"
+        )
+        let mergeID = processorID(
+            scope: identifierScope,
+            stageID: stageID,
+            suffix: "crossfeed_merge"
+        )
+        let lowpassID = processorID(
+            scope: identifierScope,
+            stageID: stageID,
+            suffix: "crossfeed_lowpass"
+        )
+        let delayID = processorID(
+            scope: identifierScope,
+            stageID: stageID,
+            suffix: "crossfeed_delay"
+        )
+        let gainID = processorID(
+            scope: identifierScope,
+            stageID: stageID,
+            suffix: "crossfeed_gain"
+        )
+
+        graph.mixers.append(contentsOf: [
+            .init(
+                id: splitID,
+                sourceStageID: stageID,
+                inputChannelCount: 2,
+                outputChannelCount: 4,
+                mappings: [
+                    .init(destination: 0, sources: [.init(channel: 0)]),
+                    .init(destination: 1, sources: [.init(channel: 1)]),
+                    .init(destination: 2, sources: [.init(channel: 1)]),
+                    .init(destination: 3, sources: [.init(channel: 0)])
+                ]
+            ),
+            .init(
+                id: mergeID,
+                sourceStageID: stageID,
+                inputChannelCount: 4,
+                outputChannelCount: 2,
+                mappings: [
+                    .init(
+                        destination: 0,
+                        sources: [.init(channel: 0), .init(channel: 2)]
+                    ),
+                    .init(
+                        destination: 1,
+                        sources: [.init(channel: 1), .init(channel: 3)]
+                    )
+                ]
+            )
+        ])
+        let processors: [ProcessingGraph.Processor] = [
+            .init(
+                id: lowpassID,
+                sourceStageID: stageID,
+                implementation: .firstOrderLowpass(
+                    frequency: crossfeed.cutoffFrequency
+                )
+            ),
+            .init(
+                id: delayID,
+                sourceStageID: stageID,
+                implementation: .delay(
+                    milliseconds: crossfeed.delayMilliseconds,
+                    subsample: true
+                )
+            ),
+            .init(
+                id: gainID,
+                sourceStageID: stageID,
+                implementation: .crossfeedGain(
+                    db: crossfeed.crossfeedGainDB,
+                    muted: crossfeed.amountPercent == 0,
+                    maximumBoostDB: crossfeed.maximumBoostDB
+                )
+            )
+        ]
+        graph.processors.append(contentsOf: processors)
+        graph.pipeline.append(contentsOf: [
+            .init(
+                id: stageID,
+                kind: .mixer(id: splitID),
+                scope: pipelineScope,
+                channels: [],
+                processorIDs: []
+            ),
+            .init(
+                id: stageID,
+                scope: pipelineScope,
+                channels: [2, 3],
+                processorIDs: processors.map(\.id)
+            ),
+            .init(
+                id: stageID,
+                kind: .mixer(id: mergeID),
+                scope: pipelineScope,
+                channels: [],
+                processorIDs: []
+            )
+        ])
+    }
+
     private func processorID(scope: String, stageID: UUID, suffix: String) -> String {
         "\(scope)_\(compact(stageID))_\(suffix)"
     }
@@ -365,11 +634,18 @@ struct ProcessingGraphHeadroomCalculator {
             first, _ in first
         })
         let response = EQResponseCalculator()
+        let crossfeedBoostDB = graph.processors.reduce(0.0) { result, processor in
+            guard case .crossfeedGain(_, _, let maximumBoostDB) = processor.implementation else {
+                return result
+            }
+            return result + maximumBoostDB
+        }
         var largestBoost = 0.0
 
         for channel in 0..<graph.channelCount {
-            var parsed = ParsedEQ()
-            for step in graph.pipeline where step.channels.contains(channel) {
+            var parsed = ParsedEQ(preampDB: crossfeedBoostDB)
+            for step in graph.pipeline where step.kind == .filter
+                && step.channels.contains(channel) {
                 for processorID in step.processorIDs {
                     guard processorID != ProcessingGraph.automaticHeadroomProcessorID else {
                         continue
@@ -383,6 +659,12 @@ struct ProcessingGraphHeadroomCalculator {
                         parsed.preampDB += db
                     case .biquad(let band):
                         parsed.bands.append(band)
+                    case .convolution(let convolution):
+                        // Sum the FIR maximum with the exact IIR response as a
+                        // conservative bound for the cascaded response.
+                        parsed.preampDB += max(0, convolution.maximumMagnitudeDB)
+                    case .delay, .firstOrderLowpass, .crossfeedGain:
+                        break
                     case .limiter:
                         break
                     }
@@ -417,6 +699,18 @@ enum ProcessingGraphError: LocalizedError, Equatable {
     case invalidFilterBandwidth(Double)
     case missingFilterGain(EQBand.Kind)
     case missingFilterShape(EQBand.Kind)
+    case invalidImpulseResponseReference(String)
+    case invalidImpulseResponseMetadata
+    case impulseResponseSampleRateMismatch(Int, Int)
+    case impulseResponseChannelOutOfRange(Int, Int)
+    case impulseResponseMissing(String)
+    case crossfeedMustBeGlobal
+    case crossfeedRequiresStereo(Int)
+    case invalidCrossfeedAmount(Double)
+    case invalidCrossfeedDelay(Double)
+    case invalidCrossfeedFrequency(Double, Int)
+    case delayMustBePerChannel
+    case invalidChannelDelay(Double)
     case invalidLimiterCeiling(Double)
 
     var errorDescription: String? {
@@ -451,6 +745,30 @@ enum ProcessingGraphError: LocalizedError, Equatable {
             return "The \(kind.rawValue) filter requires a gain value."
         case .missingFilterShape(let kind):
             return "The \(kind.rawValue) filter requires Q or bandwidth."
+        case .invalidImpulseResponseReference(let fileName):
+            return "The impulse-response asset reference \(fileName) is invalid."
+        case .invalidImpulseResponseMetadata:
+            return "The impulse-response metadata is invalid. Import the WAV again."
+        case .impulseResponseSampleRateMismatch(let impulseRate, let processingRate):
+            return "The impulse response is \(impulseRate) Hz, but this profile processes at \(processingRate) Hz. Import a matching WAV to avoid changing the correction response."
+        case .impulseResponseChannelOutOfRange(let channel, let count):
+            return "Impulse-response channel \(channel + 1) is outside the \(count)-channel WAV."
+        case .impulseResponseMissing(let name):
+            return "The managed impulse response “\(name)” is missing. Import the WAV again."
+        case .crossfeedMustBeGlobal:
+            return "Headphone crossfeed must be a global processing stage."
+        case .crossfeedRequiresStereo(let channelCount):
+            return "Headphone crossfeed requires stereo audio, but this graph has \(channelCount) channels."
+        case .invalidCrossfeedAmount(let amount):
+            return "Crossfeed amount must be between 0% and 100% (received \(amount)%)."
+        case .invalidCrossfeedDelay(let delay):
+            return "Crossfeed delay must be between 0 and 5 ms (received \(delay) ms)."
+        case .invalidCrossfeedFrequency(let frequency, let sampleRate):
+            return "Crossfeed frequency \(frequency) Hz must be positive and below the Nyquist frequency for \(sampleRate) Hz audio."
+        case .delayMustBePerChannel:
+            return "Channel delay must belong to one physical channel."
+        case .invalidChannelDelay(let delay):
+            return "Channel delay must be between 0 and 100 ms (received \(delay) ms)."
         case .invalidLimiterCeiling(let ceiling):
             return "Limiter ceiling must be a finite value at or below 0 dBFS (received \(ceiling))."
         }

@@ -14,6 +14,7 @@ struct CamillaDSPRuntimePatch: Hashable, Sendable {
 
     enum Parameter: Hashable, Sendable {
         case number(Double)
+        case integer(Int)
         case boolean(Bool)
         case string(String)
         case null
@@ -21,6 +22,7 @@ struct CamillaDSPRuntimePatch: Hashable, Sendable {
         var foundationValue: Any {
             switch self {
             case .number(let value): return value
+            case .integer(let value): return value
             case .boolean(let value): return value
             case .string(let value): return value
             case .null: return NSNull()
@@ -49,18 +51,30 @@ struct CamillaDSPCompiler {
         let filterSection = filters.isEmpty
             ? "filters: {}"
             : "filters:\n" + filters.joined(separator: "\n")
+        let mixers = graph.mixers.map(yamlMixer)
+        let mixerSection = mixers.isEmpty
+            ? "mixers: {}"
+            : "mixers:\n" + mixers.joined(separator: "\n")
 
         let pipelineSection: String
         if graph.pipeline.isEmpty {
             pipelineSection = "pipeline: []"
         } else {
             pipelineSection = "pipeline:\n" + graph.pipeline.map { step in
-                """
+                switch step.kind {
+                case .filter:
+                    return """
   - type: Filter
     channels: [\(step.channels.map(String.init).joined(separator: ", "))]
     names:
 \(step.processorIDs.map { "      - \($0)" }.joined(separator: "\n"))
 """
+                case .mixer(let mixerID):
+                    return """
+  - type: Mixer
+    name: \(mixerID)
+"""
+                }
             }.joined(separator: "\n")
         }
 
@@ -80,7 +94,7 @@ devices:
     device: "\(yamlEscape(graph.playback.deviceUID))"
     exclusive: \(graph.playback.exclusive)
 \(filterSection)
-mixers: {}
+\(mixerSection)
 \(pipelineSection)
 """)
     }
@@ -123,6 +137,41 @@ mixers: {}
                 parameters["q"] = .number(0.70710678)
             }
             return .init(type: "Biquad", parameters: parameters)
+        case .convolution(let convolution):
+            return .init(
+                type: "Conv",
+                parameters: [
+                    "type": .string("Wav"),
+                    "filename": .string(convolution.filePath),
+                    "channel": .integer(convolution.channel)
+                ]
+            )
+        case .delay(let milliseconds, let subsample):
+            return .init(
+                type: "Delay",
+                parameters: [
+                    "delay": .number(milliseconds),
+                    "unit": .string("ms"),
+                    "subsample": .boolean(subsample)
+                ]
+            )
+        case .firstOrderLowpass(let frequency):
+            return .init(
+                type: "Biquad",
+                parameters: [
+                    "type": .string("LowpassFO"),
+                    "freq": .number(frequency)
+                ]
+            )
+        case .crossfeedGain(let db, let muted, _):
+            return .init(
+                type: "Gain",
+                parameters: [
+                    "gain": .number(db),
+                    "scale": .string("dB"),
+                    "mute": .boolean(muted)
+                ]
+            )
         case .limiter(let limiter):
             return .init(
                 type: "Limiter",
@@ -162,6 +211,41 @@ mixers: {}
                 lines.append("      q: 0.70710678")
             }
             return lines.joined(separator: "\n") + "\n"
+        case .convolution(let convolution):
+            return """
+  \(processor.id):
+    type: Conv
+    parameters:
+      type: Wav
+      filename: "\(yamlEscape(convolution.filePath))"
+      channel: \(convolution.channel)
+"""
+        case .delay(let milliseconds, let subsample):
+            return """
+  \(processor.id):
+    type: Delay
+    parameters:
+      delay: \(format(milliseconds))
+      unit: ms
+      subsample: \(subsample)
+"""
+        case .firstOrderLowpass(let frequency):
+            return """
+  \(processor.id):
+    type: Biquad
+    parameters:
+      type: LowpassFO
+      freq: \(format(frequency))
+"""
+        case .crossfeedGain(let db, let muted, _):
+            return """
+  \(processor.id):
+    type: Gain
+    parameters:
+      gain: \(format(db))
+      scale: dB
+      mute: \(muted)
+"""
         case .limiter(let limiter):
             return """
   \(processor.id):
@@ -171,6 +255,31 @@ mixers: {}
       clip_limit: \(format(limiter.clipLimitDB))
 """
         }
+    }
+
+    private func yamlMixer(_ mixer: ProcessingGraph.Mixer) -> String {
+        let mappings = mixer.mappings.map { mapping in
+            let sources = mapping.sources.map { source in
+                """
+          - channel: \(source.channel)
+            gain: \(format(source.gainDB))
+            scale: dB
+"""
+            }.joined(separator: "\n")
+            return """
+      - dest: \(mapping.destination)
+        sources:
+\(sources)
+"""
+        }.joined(separator: "\n")
+        return """
+  \(mixer.id):
+    channels:
+      in: \(mixer.inputChannelCount)
+      out: \(mixer.outputChannelCount)
+    mapping:
+\(mappings)
+"""
     }
 
     private func captureFormat(_ format: ProcessingGraph.SampleFormat) -> String {

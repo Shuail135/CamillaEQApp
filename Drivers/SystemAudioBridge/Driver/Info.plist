@@ -15,7 +15,7 @@
     <key>CFBundlePackageType</key>
     <string>BNDL</string>
     <key>CFBundleShortVersionString</key>
-	<string>0.2.1</string>
+	<string>0.4.0</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleVersion</key>
@@ -23,7 +23,7 @@
     <key>NSHumanReadableCopyright</key>
     <string>Copyright © 2019 Existential Audio Inc. and System Audio Bridge contributors. GPL-3.0-only.</string>
     <key>SystemAudioBridgeChannelCount</key>
-    <integer>2</integer>
+    <integer>8</integer>
     <key>CFPlugInFactories</key>
     <dict>
         <key>609B2F3F-8802-4D37-A42E-89499DDA191C</key>

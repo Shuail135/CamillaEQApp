@@ -41,6 +41,7 @@ struct ProcessingGraphDiffer {
             && current.channelCount == next.channelCount
             && current.capture == next.capture
             && current.playback == next.playback
+            && current.mixers == next.mixers
             && current.pipeline == next.pipeline
             && current.processors.map { ($0.id, $0.sourceStageID) }
                 .elementsEqual(next.processors.map { ($0.id, $0.sourceStageID) }) {

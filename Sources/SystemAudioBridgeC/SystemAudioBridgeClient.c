@@ -17,6 +17,8 @@ struct SABRClientTransport {
     void* mapping;
     size_t mappingBytes;
     SABRTransportHeader* header;
+    SABRTransportClient* clients;
+    SABRTransportPacket* packets;
     Float32* samples;
     SABRTransportConfiguration configuration;
     Boolean isLinked;
@@ -112,7 +114,9 @@ SABRClientTransportRef sabr_client_transport_create(
     transport->mapping = mapping;
     transport->mappingBytes = mappingBytes;
     transport->header = (SABRTransportHeader*)mapping;
-    transport->samples = (Float32*)((uint8_t*)mapping + sizeof(SABRTransportHeader));
+    transport->clients = sabr_transport_clients(transport->header);
+    transport->packets = sabr_transport_packets(transport->header);
+    transport->samples = sabr_transport_samples(transport->header);
 
     memset(mapping, 0, mappingBytes);
     transport->header->magic = SABR_TRANSPORT_MAGIC;
@@ -123,6 +127,8 @@ SABRClientTransportRef sabr_client_transport_create(
     transport->header->busIndex = 0;
     transport->header->channelCapacity = channelCapacity;
     transport->header->frameCapacity = frameCapacity;
+    transport->header->packetCapacity = SABR_TRANSPORT_PACKET_CAPACITY;
+    transport->header->clientCapacity = SABR_TRANSPORT_CLIENT_CAPACITY;
 
     transport->configuration.protocolVersion = SABR_TRANSPORT_PROTOCOL_VERSION;
     transport->configuration.direction = SABR_TRANSPORT_DIRECTION_OUTPUT;
@@ -310,40 +316,117 @@ uint32_t sabr_client_transport_read(
     uint32_t* activeChannels,
     double* sampleRate
 ) {
-    if (transport == NULL || interleavedDestination == NULL || maximumFrames == 0) { return 0; }
-    SABRTransportHeader* header = transport->header;
-    uint32_t channels = atomic_load_explicit(&header->activeChannels, memory_order_relaxed);
-    if (channels == 0 || channels > header->channelCapacity || channels > destinationChannelCapacity) {
+    SABRClientAudioPacketInfo packet;
+    const uint32_t frames = sabr_client_transport_read_packet(
+        transport,
+        interleavedDestination,
+        destinationChannelCapacity,
+        maximumFrames,
+        &packet
+    );
+    if (frames > 0 && activeChannels != NULL) { *activeChannels = packet.channelCount; }
+    if (frames > 0 && sampleRate != NULL) { *sampleRate = packet.sampleRate; }
+    return frames;
+}
+
+uint32_t sabr_client_transport_read_packet(
+    SABRClientTransportRef transport,
+    Float32* interleavedDestination,
+    uint32_t destinationChannelCapacity,
+    uint32_t maximumFrames,
+    SABRClientAudioPacketInfo* packetInfo
+) {
+    if (transport == NULL || interleavedDestination == NULL || packetInfo == NULL ||
+        maximumFrames == 0) {
         return 0;
     }
-
-    const uint64_t readFrame = atomic_load_explicit(&header->readFrame, memory_order_relaxed);
-    const uint64_t writeFrame = atomic_load_explicit(&header->writeFrame, memory_order_acquire);
-    if (writeFrame <= readFrame) { return 0; }
-    uint64_t available = writeFrame - readFrame;
-    if (available > header->frameCapacity) {
-        atomic_store_explicit(&header->readFrame, writeFrame, memory_order_release);
+    SABRTransportHeader* header = transport->header;
+    const uint64_t readPacket = atomic_load_explicit(&header->readPacket, memory_order_relaxed);
+    const uint64_t writePacket = atomic_load_explicit(&header->writePacket, memory_order_acquire);
+    if (writePacket <= readPacket) { return 0; }
+    if (writePacket - readPacket > header->packetCapacity) {
+        atomic_store_explicit(&header->readPacket, writePacket, memory_order_release);
+        atomic_store_explicit(
+            &header->readFrame,
+            atomic_load_explicit(&header->writeFrame, memory_order_acquire),
+            memory_order_release
+        );
         atomic_fetch_add_explicit(&header->underrunCount, 1, memory_order_relaxed);
         return 0;
     }
 
-    const uint32_t frameCount = (uint32_t)(available < maximumFrames ? available : maximumFrames);
-    for (uint32_t frame = 0; frame < frameCount; ++frame) {
-        const uint32_t sourceFrame = (uint32_t)((readFrame + frame) % header->frameCapacity);
+    const SABRTransportPacket packet = transport->packets[readPacket % header->packetCapacity];
+    if (packet.frameCount == 0 || packet.frameCount > maximumFrames ||
+        packet.channelCount == 0 || packet.channelCount > header->channelCapacity ||
+        packet.channelCount > destinationChannelCapacity) {
+        return 0;
+    }
+    const uint64_t readFrame = atomic_load_explicit(&header->readFrame, memory_order_relaxed);
+    if (packet.startFrame != readFrame) {
+        atomic_store_explicit(&header->readFrame, packet.startFrame, memory_order_relaxed);
+    }
+    for (uint32_t frame = 0; frame < packet.frameCount; ++frame) {
+        const uint32_t sourceFrame = (uint32_t)((packet.startFrame + frame) % header->frameCapacity);
         memcpy(
-            interleavedDestination + ((size_t)frame * channels),
+            interleavedDestination + ((size_t)frame * packet.channelCount),
             transport->samples + ((size_t)sourceFrame * header->channelCapacity),
-            (size_t)channels * sizeof(Float32)
+            (size_t)packet.channelCount * sizeof(Float32)
         );
     }
-    atomic_store_explicit(&header->readFrame, readFrame + frameCount, memory_order_release);
-    if (activeChannels != NULL) { *activeChannels = channels; }
-    if (sampleRate != NULL) {
-        *sampleRate = sabr_bits_to_double(
-            atomic_load_explicit(&header->sampleRateBits, memory_order_relaxed)
-        );
+
+    packetInfo->clientID = packet.clientID;
+    packetInfo->processID = packet.processID;
+    packetInfo->cycleCounter = packet.cycleCounter;
+    packetInfo->sampleTime = sabr_bits_to_double(packet.sampleTimeBits);
+    packetInfo->frameCount = packet.frameCount;
+    packetInfo->channelCount = packet.channelCount;
+    packetInfo->channelLayoutTag = packet.channelLayoutTag;
+    packetInfo->sampleRate = sabr_bits_to_double(
+        atomic_load_explicit(&header->sampleRateBits, memory_order_relaxed)
+    );
+    atomic_store_explicit(
+        &header->readFrame,
+        packet.startFrame + packet.frameCount,
+        memory_order_release
+    );
+    atomic_store_explicit(&header->readPacket, readPacket + 1, memory_order_release);
+    return packet.frameCount;
+}
+
+uint32_t sabr_client_transport_copy_clients(
+    SABRClientTransportRef transport,
+    SABRClientIdentity* destination,
+    uint32_t destinationCapacity
+) {
+    if (transport == NULL || destination == NULL || destinationCapacity == 0) { return 0; }
+    const uint64_t startingGeneration = atomic_load_explicit(
+        &transport->header->clientGeneration,
+        memory_order_acquire
+    );
+    if (startingGeneration == UINT64_MAX) { return UINT32_MAX; }
+    uint32_t count = 0;
+    for (uint32_t index = 0;
+         index < transport->header->clientCapacity && count < destinationCapacity;
+         ++index) {
+        SABRTransportClient* source = &transport->clients[index];
+        const uint32_t state = atomic_load_explicit(&source->state, memory_order_acquire);
+        if (state == SABR_CLIENT_STATE_EMPTY) { continue; }
+        destination[count].clientID = source->clientID;
+        destination[count].processID = source->processID;
+        destination[count].isActive = state == SABR_CLIENT_STATE_ACTIVE;
+        destination[count].generation = source->generation;
+        memcpy(destination[count].bundleID, source->bundleID, sizeof(destination[count].bundleID));
+        destination[count].bundleID[sizeof(destination[count].bundleID) - 1] = '\0';
+        count += 1;
     }
-    return frameCount;
+    const uint64_t endingGeneration = atomic_load_explicit(
+        &transport->header->clientGeneration,
+        memory_order_acquire
+    );
+    if (startingGeneration != endingGeneration || endingGeneration == UINT64_MAX) {
+        return UINT32_MAX;
+    }
+    return count;
 }
 
 void sabr_client_transport_get_statistics(
@@ -360,9 +443,20 @@ void sabr_client_transport_get_statistics(
     statistics->underrunCount = atomic_load_explicit(&header->underrunCount, memory_order_relaxed);
     statistics->sequence = atomic_load_explicit(&header->sequence, memory_order_relaxed);
     statistics->activeChannels = atomic_load_explicit(&header->activeChannels, memory_order_relaxed);
+    statistics->activeChannelLayoutTag = atomic_load_explicit(
+        &header->activeChannelLayoutTag,
+        memory_order_relaxed
+    );
     statistics->frameCapacity = header->frameCapacity;
     statistics->sampleRate = sabr_bits_to_double(
         atomic_load_explicit(&header->sampleRateBits, memory_order_relaxed)
+    );
+    statistics->writePacket = atomic_load_explicit(&header->writePacket, memory_order_acquire);
+    statistics->readPacket = atomic_load_explicit(&header->readPacket, memory_order_acquire);
+    statistics->droppedPackets = atomic_load_explicit(&header->droppedPackets, memory_order_relaxed);
+    statistics->clientGeneration = atomic_load_explicit(
+        &header->clientGeneration,
+        memory_order_acquire
     );
 }
 
@@ -382,6 +476,10 @@ uint32_t sabr_client_transport_max_channels(void) {
 
 uint32_t sabr_client_transport_default_frame_capacity(void) {
     return SABR_TRANSPORT_DEFAULT_FRAME_CAPACITY;
+}
+
+uint32_t sabr_client_transport_max_clients(void) {
+    return SABR_TRANSPORT_CLIENT_CAPACITY;
 }
 
 Boolean sabr_client_transport_is_supported(AudioObjectID deviceObjectID) {

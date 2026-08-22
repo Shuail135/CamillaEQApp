@@ -1,6 +1,6 @@
 import Foundation
 
-struct EQResponsePoint: Identifiable {
+struct EQResponsePoint: Identifiable, Sendable {
     let frequency: Double
     let gainDB: Double
     var id: Double { frequency }

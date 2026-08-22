@@ -101,6 +101,7 @@ struct AdaptivePCMResampler {
             interleaved: output,
             channelCount: frame.channelCount,
             sampleRate: frame.sampleRate,
+            channelLayout: frame.channelLayout,
             sourceBufferedFrames: frame.sourceBufferedFrames,
             sourceCapacityFrames: frame.sourceCapacityFrames
         )

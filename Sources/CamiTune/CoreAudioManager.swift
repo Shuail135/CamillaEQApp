@@ -5,19 +5,30 @@ import SystemAudioBridgeC
 
 @MainActor
 final class CoreAudioManager: ObservableObject {
-    static let minimumPresentationDriverVersion = "0.2.1"
+    static let minimumPresentationDriverVersion = "0.4.0"
 
     @Published private(set) var outputDevices: [AudioDeviceInfo] = []
     @Published private(set) var defaultOutputUID: String?
+    @Published private(set) var hasCompletedInitialRefresh = false
+
+    private struct SampleRateCapabilities: Sendable {
+        var currentRate: Double?
+        var ranges: [ClosedRange<Double>]
+        var isSettable: Bool
+    }
 
     private var timer: Timer?
+    private var periodicRefreshInFlight = false
+    private var sampleRateCapabilitiesByUID: [String: SampleRateCapabilities] = [:]
+    private var cachedHiddenSystemAudioBridge: AudioDeviceInfo?
+    private var hasResolvedHiddenSystemAudioBridge = false
 
     init() {
-        refresh()
+        schedulePeriodicRefresh()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                self.refresh()
+                self.schedulePeriodicRefresh()
             }
         }
     }
@@ -25,20 +36,129 @@ final class CoreAudioManager: ObservableObject {
     deinit { timer?.invalidate() }
 
     func refresh() {
+        // An explicit refresh is also the escape hatch after driver repair or a
+        // coreaudiod restart, when the hidden bridge may receive a new object ID.
+        cachedHiddenSystemAudioBridge = nil
+        hasResolvedHiddenSystemAudioBridge = false
+        let snapshot = Self.readDeviceSnapshot()
+        apply(devices: snapshot.devices, defaultUID: snapshot.defaultUID)
+    }
+
+    func refreshWithoutBlockingUI() async {
+        cachedHiddenSystemAudioBridge = nil
+        hasResolvedHiddenSystemAudioBridge = false
+        let snapshot = await Task.detached(priority: .utility) {
+            Self.readDeviceSnapshot()
+        }.value
+        apply(devices: snapshot.devices, defaultUID: snapshot.defaultUID)
+    }
+
+    private func schedulePeriodicRefresh() {
+        guard !periodicRefreshInFlight else { return }
+        periodicRefreshInFlight = true
+        Task.detached(priority: .utility) {
+            let snapshot = Self.readDeviceSnapshot()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.periodicRefreshInFlight = false
+                self.apply(devices: snapshot.devices, defaultUID: snapshot.defaultUID)
+            }
+        }
+    }
+
+    private func apply(devices: [AudioDeviceInfo], defaultUID: String?) {
+        if outputDevices != devices {
+            outputDevices = devices
+            sampleRateCapabilitiesByUID.removeAll()
+        }
+        // Retry a previously missing hidden bridge on the next periodic HAL
+        // snapshot, while still coalescing all lookups made by one UI render.
+        if cachedHiddenSystemAudioBridge == nil {
+            hasResolvedHiddenSystemAudioBridge = false
+        }
+        if defaultOutputUID != defaultUID { defaultOutputUID = defaultUID }
+        if !hasCompletedInitialRefresh {
+            hasCompletedInitialRefresh = true
+        }
+    }
+
+    nonisolated private static func readDeviceSnapshot() -> (
+        devices: [AudioDeviceInfo],
+        defaultUID: String?
+    ) {
         let devices = enumerateOutputDevices().sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
-        let defaultUID = defaultOutputDevice().flatMap { deviceUID($0) }
-        if outputDevices != devices { outputDevices = devices }
-        if defaultOutputUID != defaultUID { defaultOutputUID = defaultUID }
+        let defaultUID = defaultOutputDevice().flatMap(deviceUID)
+        return (devices, defaultUID)
     }
 
     var physicalOutputDevices: [AudioDeviceInfo] {
         outputDevices.filter { !$0.isRoutingDevice }
     }
 
+    /// A render-safe lookup that never enters Core Audio. SwiftUI body
+    /// evaluation and periodic policy checks must use this snapshot rather than
+    /// synchronously translating a UID through HAL on the main actor.
+    func cachedDevice(uid: String) -> AudioDeviceInfo? {
+        if uid == AudioDeviceInfo.systemAudioBridgeUID {
+            return outputDevices.first(where: { $0.id == uid })
+                ?? cachedHiddenSystemAudioBridge
+        }
+        return outputDevices.first(where: { $0.id == uid })
+    }
+
     var systemAudioBridge: AudioDeviceInfo? {
-        deviceInfo(forUID: AudioDeviceInfo.systemAudioBridgeUID)
+        // CamiTune hides the base transport after publishing the profile
+        // endpoints. Hidden devices are omitted from the hardware device list
+        // on some macOS releases, but they remain addressable by UID. Always
+        // fall back to UID translation so Setup does not report its own hidden
+        // bridge as uninstalled after a restart or recheck.
+        if let visible = cachedDevice(uid: AudioDeviceInfo.systemAudioBridgeUID) {
+            cachedHiddenSystemAudioBridge = visible
+            hasResolvedHiddenSystemAudioBridge = true
+            return visible
+        }
+        if hasResolvedHiddenSystemAudioBridge { return cachedHiddenSystemAudioBridge }
+        let resolved = Self.deviceInfo(forUID: AudioDeviceInfo.systemAudioBridgeUID)
+        cachedHiddenSystemAudioBridge = resolved
+        hasResolvedHiddenSystemAudioBridge = true
+        return resolved
+    }
+
+    func resolveSystemAudioBridgeWithoutBlockingUI() async -> AudioDeviceInfo? {
+        await resolveDeviceWithoutBlockingUI(uid: AudioDeviceInfo.systemAudioBridgeUID)
+    }
+
+    func resolveDeviceWithoutBlockingUI(uid: String) async -> AudioDeviceInfo? {
+        if let cached = cachedDevice(uid: uid) { return cached }
+        if uid == AudioDeviceInfo.systemAudioBridgeUID,
+           hasResolvedHiddenSystemAudioBridge {
+            return cachedHiddenSystemAudioBridge
+        }
+        let resolved = await Task.detached(priority: .utility) {
+            Self.deviceInfo(forUID: uid)
+        }.value
+        if uid == AudioDeviceInfo.systemAudioBridgeUID {
+            cachedHiddenSystemAudioBridge = resolved
+            hasResolvedHiddenSystemAudioBridge = true
+        }
+        return resolved
+    }
+
+    /// Driver endpoint publication can rebuild Core Audio's object graph while
+    /// preserving device UIDs. Resolve the base bridge from its UID again
+    /// before opening a transport instead of trusting a cached object ID.
+    func freshlyResolvedSystemAudioBridge() -> AudioDeviceInfo? {
+        let resolved = Self.deviceInfo(forUID: AudioDeviceInfo.systemAudioBridgeUID)
+        cachedHiddenSystemAudioBridge = resolved
+        hasResolvedHiddenSystemAudioBridge = true
+        return resolved
+    }
+
+    private func invalidateSystemAudioBridgeReference() {
+        cachedHiddenSystemAudioBridge = nil
+        hasResolvedHiddenSystemAudioBridge = false
     }
 
     var isSystemAudioBridgeTransportSupported: Bool {
@@ -52,10 +172,31 @@ final class CoreAudioManager: ObservableObject {
         return dictionary["CFBundleShortVersionString"] as? String
     }
 
+    var installedSystemAudioBridgeChannelLayout: LPCMChannelLayout? {
+        let path = "/Library/Audio/Plug-Ins/HAL/CamillaAudio.driver/Contents/Info.plist"
+        guard let dictionary = NSDictionary(contentsOfFile: path),
+              let channelCount = dictionary["SystemAudioBridgeChannelCount"] as? Int else {
+            return nil
+        }
+        return LPCMChannelLayout.canonical(forChannelCount: channelCount)
+    }
+
     var isSystemAudioBridgePresentationSupported: Bool {
         guard isSystemAudioBridgeTransportSupported,
               let version = installedSystemAudioBridgeVersion else { return false }
         return Self.version(version, isAtLeast: Self.minimumPresentationDriverVersion)
+    }
+
+    func systemAudioBridgePresentationIsSupportedWithoutBlockingUI() async -> Bool {
+        guard let version = installedSystemAudioBridgeVersion,
+              Self.version(version, isAtLeast: Self.minimumPresentationDriverVersion),
+              let bridge = await resolveSystemAudioBridgeWithoutBlockingUI() else {
+            return false
+        }
+        let objectID = bridge.objectID
+        return await Task.detached(priority: .utility) {
+            sabr_client_transport_is_supported(objectID)
+        }.value
     }
 
     private static func version(_ candidate: String, isAtLeast minimum: String) -> Bool {
@@ -79,7 +220,25 @@ final class CoreAudioManager: ObservableObject {
             visible: visible
         )
         guard status == noErr else { throw AudioError.osStatus(status) }
-        refresh()
+    }
+
+    /// Core Audio plug-in property setters can wait for HAL to rebuild its
+    /// device graph. Startup uses this form so that work never holds the main
+    /// actor while the first window is being rendered.
+    func setSystemAudioBridgePresentationWithoutBlockingUI(
+        name: String,
+        visible: Bool
+    ) async throws {
+        guard let bridge = await resolveSystemAudioBridgeWithoutBlockingUI() else {
+            throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID)
+        }
+        let objectID = bridge.objectID
+        let status = await Task.detached(priority: .utility) {
+            name.withCString { displayName in
+                sabr_client_set_presentation(objectID, displayName, visible)
+            }
+        }.value
+        guard status == noErr else { throw AudioError.osStatus(status) }
     }
 
     private func setSystemAudioBridgePresentation(
@@ -93,8 +252,9 @@ final class CoreAudioManager: ObservableObject {
     }
 
     func device(uid: String) -> AudioDeviceInfo? {
-        outputDevices.first(where: { $0.id == uid }) ??
-            deviceInfo(forUID: uid)
+        if let cached = cachedDevice(uid: uid) { return cached }
+        if uid == AudioDeviceInfo.systemAudioBridgeUID { return systemAudioBridge }
+        return Self.deviceInfo(forUID: uid)
     }
 
     func profileRoutingDevice(profileID: UUID) -> AudioDeviceInfo? {
@@ -102,11 +262,19 @@ final class CoreAudioManager: ObservableObject {
     }
 
     func waitForProfileRoutingDevice(profileID: UUID) async -> AudioDeviceInfo? {
+        let uid = ProfileRoutingDescriptor.uid(for: profileID)
         for attempt in 0..<40 {
-            refresh()
-            if let device = profileRoutingDevice(profileID: profileID) {
+            if let device = outputDevices.first(where: { $0.id == uid }) {
                 return device
             }
+            // Publishing a native profile endpoint is asynchronous inside HAL.
+            // Poll only the requested UID and keep that Core Audio lookup off the
+            // main actor; enumerating every device here made activation and the
+            // entire UI stall repeatedly while the endpoint appeared.
+            let resolved = await Task.detached(priority: .userInitiated) {
+                Self.deviceInfo(forUID: uid)
+            }.value
+            if let resolved { return resolved }
             guard attempt < 39, !Task.isCancelled else { return nil }
             try? await Task.sleep(for: .milliseconds(50))
         }
@@ -148,7 +316,6 @@ final class CoreAudioManager: ObservableObject {
         activeProfileID: UUID?,
         additionallyVisible: Set<UUID> = []
     ) throws -> [UUID: ProfileRoutingDescriptor] {
-        refresh()
         guard let bridge = systemAudioBridge else { throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID) }
 
         let descriptors = ProfileRoutingDescriptor.descriptors(for: profiles)
@@ -188,18 +355,128 @@ final class CoreAudioManager: ObservableObject {
         guard status == noErr else {
             throw AudioError.profileDeviceConfigurationFailed(status)
         }
-        refresh()
+        invalidateSystemAudioBridgeReference()
+        if migratedDefaultUID != nil {
+            refresh()
+        }
         if let migratedDefaultUID, device(uid: migratedDefaultUID) != nil {
             try setDefaultOutput(uid: migratedDefaultUID)
         }
         return descriptors
     }
 
+    /// Publishes already-migrated native profile endpoints without blocking
+    /// the first window on a HAL device-graph rebuild. Legacy aggregate
+    /// migration remains on the synchronous maintenance path above.
+    @discardableResult
+    func synchronizeProfileRoutingDevicesWithoutBlockingUI(
+        profiles: [DeviceProfile],
+        activeProfileID: UUID?,
+        additionallyVisible: Set<UUID> = []
+    ) async throws -> [UUID: ProfileRoutingDescriptor] {
+        if outputDevices.contains(where: {
+            ProfileRoutingDescriptor.isProfileRoutingUID($0.id)
+                && isAggregateDevice($0.objectID)
+        }) {
+            return try synchronizeProfileRoutingDevices(
+                profiles: profiles,
+                activeProfileID: activeProfileID,
+                additionallyVisible: additionallyVisible
+            )
+        }
+
+        guard let bridge = await resolveSystemAudioBridgeWithoutBlockingUI() else {
+            throw AudioError.deviceNotFound(AudioDeviceInfo.systemAudioBridgeUID)
+        }
+        let descriptors = ProfileRoutingDescriptor.descriptors(for: profiles)
+        let desired = ProfileRoutingDescriptor.visibleProfileIDs(
+            profiles: profiles,
+            activeProfileID: activeProfileID,
+            defaultOutputUID: defaultOutputUID,
+            additionallyVisible: additionallyVisible
+        )
+        let profileDevices: [[String: String]] = desired
+            .sorted(by: { $0.uuidString < $1.uuidString })
+            .compactMap { profileID in
+                guard let descriptor = descriptors[profileID] else { return nil }
+                return [
+                    "deviceUID": descriptor.uid,
+                    "displayName": descriptor.name
+                ]
+            }
+        let objectID = bridge.objectID
+        let status = await Task.detached(priority: .utility) {
+            sabr_client_set_profile_devices(objectID, profileDevices as CFArray)
+        }.value
+        guard status == noErr else {
+            throw AudioError.profileDeviceConfigurationFailed(status)
+        }
+        invalidateSystemAudioBridgeReference()
+        return descriptors
+    }
+
     func supportsSampleRate(uid: String, rate: Double) -> Bool {
-        guard rate.isFinite, rate > 0, let device = device(uid: uid) else { return false }
-        if let current = nominalSampleRate(uid: uid), abs(current - rate) < 0.5 {
+        guard rate.isFinite, rate > 0 else { return false }
+        let capabilities: SampleRateCapabilities
+        if let cached = sampleRateCapabilitiesByUID[uid] {
+            capabilities = cached
+        } else {
+            // This method is queried repeatedly while SwiftUI builds the profile
+            // editor. Prefer the already-refreshed snapshot so each device's HAL
+            // capabilities are read only once. The base bridge is deliberately
+            // hidden after native profile endpoints are published, however, and
+            // some macOS releases omit hidden devices from that snapshot. Resolve
+            // that one known transport by UID instead of treating every rate as
+            // unsupported.
+            let device = outputDevices.first(where: { $0.id == uid })
+                ?? (uid == AudioDeviceInfo.systemAudioBridgeUID
+                    ? systemAudioBridge
+                    : nil)
+            guard let device else {
+                return false
+            }
+            capabilities = readSampleRateCapabilities(device: device)
+            sampleRateCapabilitiesByUID[uid] = capabilities
+        }
+        if let current = capabilities.currentRate, abs(current - rate) < 0.5 {
             return true
         }
+        return capabilities.isSettable && capabilities.ranges.contains {
+            $0.contains(rate)
+        }
+    }
+
+    func supportsSampleRateWithoutBlockingUI(uid: String, rate: Double) async -> Bool {
+        guard rate.isFinite, rate > 0 else { return false }
+        let capabilities: SampleRateCapabilities
+        if let cached = sampleRateCapabilitiesByUID[uid] {
+            capabilities = cached
+        } else {
+            guard let device = await resolveDeviceWithoutBlockingUI(uid: uid) else {
+                return false
+            }
+            capabilities = await Task.detached(priority: .utility) {
+                Self.readSampleRateCapabilities(device: device)
+            }.value
+            sampleRateCapabilitiesByUID[uid] = capabilities
+        }
+        if let current = capabilities.currentRate, abs(current - rate) < 0.5 {
+            return true
+        }
+        return capabilities.isSettable && capabilities.ranges.contains {
+            $0.contains(rate)
+        }
+    }
+
+    private func readSampleRateCapabilities(
+        device: AudioDeviceInfo
+    ) -> SampleRateCapabilities {
+        Self.readSampleRateCapabilities(device: device)
+    }
+
+    nonisolated private static func readSampleRateCapabilities(
+        device: AudioDeviceInfo
+    ) -> SampleRateCapabilities {
         var availableRatesAddress = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyAvailableNominalSampleRates,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -212,21 +489,30 @@ final class CoreAudioManager: ObservableObject {
             0,
             nil,
             &size
-        ) == noErr else { return false }
+        ) == noErr else {
+            return SampleRateCapabilities(
+                currentRate: nominalSampleRate(deviceID: device.objectID),
+                ranges: [],
+                isSettable: false
+            )
+        }
         let count = Int(size) / MemoryLayout<AudioValueRange>.size
-        guard count > 0 else { return false }
+        guard count > 0 else {
+            return SampleRateCapabilities(
+                currentRate: nominalSampleRate(deviceID: device.objectID),
+                ranges: [],
+                isSettable: false
+            )
+        }
         var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
-        guard AudioObjectGetPropertyData(
+        let didReadRanges = AudioObjectGetPropertyData(
             device.objectID,
             &availableRatesAddress,
             0,
             nil,
             &size,
             &ranges
-        ) == noErr,
-        ranges.contains(where: { rate >= $0.mMinimum && rate <= $0.mMaximum }) else {
-            return false
-        }
+        ) == noErr
 
         var nominalRateAddress = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
@@ -234,15 +520,39 @@ final class CoreAudioManager: ObservableObject {
             mElement: kAudioObjectPropertyElementMain
         )
         var settable: DarwinBoolean = false
-        return AudioObjectIsPropertySettable(
+        let isSettable = AudioObjectIsPropertySettable(
             device.objectID,
             &nominalRateAddress,
             &settable
         ) == noErr && settable.boolValue
+        return SampleRateCapabilities(
+            currentRate: nominalSampleRate(deviceID: device.objectID),
+            ranges: didReadRanges
+                ? ranges.map { $0.mMinimum...$0.mMaximum }
+                : [],
+            isSettable: isSettable
+        )
     }
 
     func nominalSampleRate(uid: String) -> Double? {
         guard let device = device(uid: uid) else { return nil }
+        return Self.nominalSampleRate(deviceID: device.objectID)
+    }
+
+    /// Runtime health monitoring awaits this detached read, keeping a slow HAL
+    /// device from blocking input handling and SwiftUI rendering.
+    func nominalSampleRateWithoutBlockingUI(uid: String) async -> Double? {
+        let cachedObjectID = cachedDevice(uid: uid)?.objectID
+        return await Task.detached(priority: .utility) {
+            let objectID = cachedObjectID ?? Self.deviceObjectID(forUID: uid)
+            guard let objectID else { return nil }
+            return Self.nominalSampleRate(deviceID: objectID)
+        }.value
+    }
+
+    nonisolated private static func nominalSampleRate(
+        deviceID: AudioDeviceID
+    ) -> Double? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyNominalSampleRate,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -251,7 +561,7 @@ final class CoreAudioManager: ObservableObject {
         var value = 0.0
         var size = UInt32(MemoryLayout<Double>.size)
         guard AudioObjectGetPropertyData(
-            device.objectID,
+            deviceID,
             &address,
             0,
             nil,
@@ -279,6 +589,7 @@ final class CoreAudioManager: ObservableObject {
         guard status == noErr else { throw AudioError.osStatus(status) }
         for _ in 0..<20 {
             if let actual = nominalSampleRate(uid: uid), abs(actual - rate) < 0.5 {
+                sampleRateCapabilitiesByUID.removeValue(forKey: uid)
                 return
             }
             try await Task.sleep(for: .milliseconds(25))
@@ -303,15 +614,21 @@ final class CoreAudioManager: ObservableObject {
             UInt32(MemoryLayout<AudioDeviceID>.size), &id
         )
         guard status == noErr else { throw AudioError.osStatus(status) }
-        refresh()
+        // A successful HAL setter is authoritative. Updating this snapshot
+        // directly avoids a full device enumeration on every activation; the
+        // periodic refresh still reconciles external changes.
+        defaultOutputUID = uid
     }
 
     func setDefaultOutputAndWait(uid: String) async throws {
         let deviceName = device(uid: uid)?.name ?? uid
         try setDefaultOutput(uid: uid)
         for attempt in 0..<40 {
-            refresh()
-            if defaultOutputUID == uid { return }
+            let current = await Task.detached(priority: .userInitiated) {
+                Self.defaultOutputDevice().flatMap(Self.deviceUID)
+            }.value
+            if defaultOutputUID != current { defaultOutputUID = current }
+            if current == uid { return }
             guard attempt < 39 else { break }
             try await Task.sleep(for: .milliseconds(25))
         }
@@ -406,7 +723,7 @@ final class CoreAudioManager: ObservableObject {
         return nil
     }
 
-    private func enumerateOutputDevices() -> [AudioDeviceInfo] {
+    nonisolated private static func enumerateOutputDevices() -> [AudioDeviceInfo] {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -429,19 +746,19 @@ final class CoreAudioManager: ObservableObject {
         }
     }
 
-    private func deviceInfo(forUID uid: String) -> AudioDeviceInfo? {
+    nonisolated private static func deviceInfo(forUID uid: String) -> AudioDeviceInfo? {
         guard let objectID = deviceObjectID(forUID: uid),
-              hasOutputStreams(objectID),
-              let name = deviceName(objectID) else { return nil }
+              Self.hasOutputStreams(objectID),
+              let name = Self.deviceName(objectID) else { return nil }
         return AudioDeviceInfo(
             id: uid,
             objectID: objectID,
             name: name,
-            transportType: uint32Property(objectID, selector: kAudioDevicePropertyTransportType) ?? 0
+            transportType: Self.uint32Property(objectID, selector: kAudioDevicePropertyTransportType) ?? 0
         )
     }
 
-    private func deviceObjectID(forUID uid: String) -> AudioDeviceID? {
+    nonisolated private static func deviceObjectID(forUID uid: String) -> AudioDeviceID? {
         var uidValue = uid as CFString
         var objectID = AudioDeviceID(kAudioObjectUnknown)
         let status = withUnsafePointer(to: &uidValue) { uidPointer in
@@ -473,10 +790,10 @@ final class CoreAudioManager: ObservableObject {
     }
 
     private func isAggregateDevice(_ objectID: AudioObjectID) -> Bool {
-        uint32Property(objectID, selector: kAudioObjectPropertyClass) == kAudioAggregateDeviceClassID
+        Self.uint32Property(objectID, selector: kAudioObjectPropertyClass) == kAudioAggregateDeviceClassID
     }
 
-    private func defaultOutputDevice() -> AudioDeviceID? {
+    nonisolated private static func defaultOutputDevice() -> AudioDeviceID? {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultOutputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -488,7 +805,7 @@ final class CoreAudioManager: ObservableObject {
         return id
     }
 
-    private func hasOutputStreams(_ id: AudioDeviceID) -> Bool {
+    nonisolated private static func hasOutputStreams(_ id: AudioDeviceID) -> Bool {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreams,
             mScope: kAudioDevicePropertyScopeOutput,
@@ -498,15 +815,15 @@ final class CoreAudioManager: ObservableObject {
         return AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr && size > 0
     }
 
-    private func deviceName(_ id: AudioDeviceID) -> String? {
+    nonisolated private static func deviceName(_ id: AudioDeviceID) -> String? {
         stringProperty(id, selector: kAudioObjectPropertyName)
     }
 
-    private func deviceUID(_ id: AudioDeviceID) -> String? {
+    nonisolated private static func deviceUID(_ id: AudioDeviceID) -> String? {
         stringProperty(id, selector: kAudioDevicePropertyDeviceUID)
     }
 
-    private func stringProperty(_ id: AudioObjectID, selector: AudioObjectPropertySelector) -> String? {
+    nonisolated private static func stringProperty(_ id: AudioObjectID, selector: AudioObjectPropertySelector) -> String? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -521,7 +838,7 @@ final class CoreAudioManager: ObservableObject {
         return value.takeUnretainedValue() as String
     }
 
-    private func uint32Property(_ id: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
+    nonisolated private static func uint32Property(_ id: AudioObjectID, selector: AudioObjectPropertySelector) -> UInt32? {
         var address = AudioObjectPropertyAddress(
             mSelector: selector,
             mScope: kAudioObjectPropertyScopeGlobal,

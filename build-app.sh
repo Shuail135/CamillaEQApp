@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="CamiTune"
-APP_VERSION="${APP_VERSION:-0.2.1}"
+APP_VERSION="${APP_VERSION:-0.3.0}"
 # GitHub Actions exposes the pushed tag through these variables. A release tag
 # such as v0.1.2 therefore produces an app whose bundle version is 0.1.2
 # without requiring a manual source edit for every patch release.
@@ -99,7 +99,7 @@ echo "Target: $TARGET"
 BIN="$BIN_OUT"
 
 echo "Building bundled System Audio Bridge driver…"
-SABR_CHANNELS=2 SABR_MIN_MACOS="$MIN_MACOS" Drivers/SystemAudioBridge/build-driver.sh
+SABR_CHANNELS=8 SABR_MIN_MACOS="$MIN_MACOS" Drivers/SystemAudioBridge/build-driver.sh
 
 echo "Building UID-capable CamillaDSP…"
 if [[ -n "${CAMITUNE_CAMILLADSP_BINARY:-}" ]]; then
